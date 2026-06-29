@@ -11,13 +11,8 @@
 - **예산표, 성과지표, 통계표 등 표와 숫자 중심의 문서를 빠르게 분석하여 업무 효율성 향상**
 - **향후 AI Agent와 Tool Calling을 연계하여 문서 분석, 요약, 질의응답, 보고서 작성까지 자동화하기 위한 기반 기술 확보**
 
-## 설치 및 실행
-
-
-
-```bash
-streamlit run app.py
-```
+<img width="1820" height="771" alt="image" src="https://github.com/user-attachments/assets/02ce6981-37bd-4538-b2e9-2a99b8538b20" />
+<img width="549" height="231" alt="image" src="https://github.com/user-attachments/assets/c1e8d1c0-9404-4f7d-8015-b1adf038b778" />
 
 ## 파일 구조
 
@@ -28,9 +23,6 @@ HWP analysis/
 ├── table_extractor.py  # 표 추출 및 숫자 분석
 ├── qa_engine.py        # 질의응답 (rule-based + Ollama)
 ├── requirements.txt    # 의존성 목록
-├── README.md           # 이 문서
-├── sample_docs/        # 테스트용 샘플 문서
-└── outputs/            # 분석 결과 저장
 ```
 
 ## 주요 기능
