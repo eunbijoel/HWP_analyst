@@ -16,8 +16,6 @@
 
 
 ```bash
-cd "/home/eunbi/HWP analysis"
-pip install -r requirements.txt
 streamlit run app.py
 ```
 
