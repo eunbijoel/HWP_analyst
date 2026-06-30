@@ -23,6 +23,7 @@ class NumberInfo:
     table_index: int = -1
     row: int = -1
     col: int = -1
+    document_id: str = ""
 
 
 @dataclass
@@ -41,6 +42,7 @@ class TableSummary:
     total_row_index: int = -1
     dataframe: Optional[pd.DataFrame] = None
     preview: str = ""
+    document_id: str = ""
 
 
 # 숫자 탐지 패턴
@@ -82,7 +84,7 @@ UNIT_MULTIPLIERS = {
 UNIT_ROW_PATTERN = re.compile(r'[\(\（]?\s*단위\s*[:：]\s*([^)\）]+)', re.IGNORECASE)
 
 
-def extract_tables(parsed_doc) -> list[TableSummary]:
+def extract_tables(parsed_doc, document_id: str = "") -> list[TableSummary]:
     """ParsedDocument에서 표를 추출하고 요약"""
     summaries = []
 
@@ -101,6 +103,7 @@ def extract_tables(parsed_doc) -> list[TableSummary]:
             unit=unit,
             num_rows=df.shape[0] if df is not None else len(rows),
             num_cols=df.shape[1] if df is not None else (max(len(r) for r in rows) if rows else 0),
+            document_id=document_id,
         )
 
         summary.dataframe = df
@@ -241,7 +244,7 @@ def _is_number(s: str) -> bool:
         return False
 
 
-def detect_numbers_in_text(text: str) -> list[NumberInfo]:
+def detect_numbers_in_text(text: str, document_id: str = "") -> list[NumberInfo]:
     """텍스트에서 숫자/금액/비율/연도 탐지"""
     results = []
 
@@ -262,6 +265,7 @@ def detect_numbers_in_text(text: str) -> list[NumberInfo]:
             unit=unit,
             context=text[start:end].strip(),
             source='text',
+            document_id=document_id,
         ))
 
     for match in PATTERNS['percentage'].finditer(text):
@@ -279,6 +283,7 @@ def detect_numbers_in_text(text: str) -> list[NumberInfo]:
             unit='%',
             context=text[start:end].strip(),
             source='text',
+            document_id=document_id,
         ))
 
     for match in PATTERNS['period'].finditer(text):
@@ -291,6 +296,7 @@ def detect_numbers_in_text(text: str) -> list[NumberInfo]:
             unit='년',
             context=text[start:end].strip(),
             source='text',
+            document_id=document_id,
         ))
 
     for match in PATTERNS['year'].finditer(text):
@@ -308,12 +314,13 @@ def detect_numbers_in_text(text: str) -> list[NumberInfo]:
                 unit='년',
                 context=text[start:end].strip(),
                 source='text',
+                document_id=document_id,
             ))
 
     return results
 
 
-def detect_numbers_in_tables(table_summaries: list[TableSummary]) -> list[NumberInfo]:
+def detect_numbers_in_tables(table_summaries: list[TableSummary], document_id: str = "") -> list[NumberInfo]:
     """표에서 숫자/금액 탐지"""
     results = []
 
@@ -344,6 +351,7 @@ def detect_numbers_in_tables(table_summaries: list[TableSummary]) -> list[Number
                         table_index=ts.index,
                         row=int(row_idx),
                         col=col_idx,
+                        document_id=document_id or ts.document_id,
                     ))
 
                 if not PATTERNS['money_with_unit'].search(cell):
@@ -365,6 +373,7 @@ def detect_numbers_in_tables(table_summaries: list[TableSummary]) -> list[Number
                             table_index=ts.index,
                             row=int(row_idx),
                             col=col_idx,
+                            document_id=document_id or ts.document_id,
                         ))
 
                 for match in PATTERNS['percentage'].finditer(cell):
@@ -383,6 +392,7 @@ def detect_numbers_in_tables(table_summaries: list[TableSummary]) -> list[Number
                         table_index=ts.index,
                         row=int(row_idx),
                         col=col_idx,
+                        document_id=document_id or ts.document_id,
                     ))
 
     return results

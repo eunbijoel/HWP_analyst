@@ -1,11 +1,14 @@
 """
 질의응답 엔진
+- 2-Stage LLM 아키텍처: Stage 1 (소형 모델 intent/entity 추출) + Stage 2 (대형 모델 해석)
 - 표 데이터 기반 자동 계산 (엔티티+지표 교차 조회, 합계/비교 등)
 - Rule-based 분석
-- Ollama LLM 연결 (gemma4 기본)
+- Ollama LLM 연결 (Stage 1: gemma3:4b, Stage 2: gemma4 기본)
+- 다중 문서 지원
 """
 
 import re
+import json
 import time
 import requests
 import pandas as pd
@@ -30,7 +33,6 @@ SYSTEM_PROMPT = """당신은 한글(HWP) 문서 분석 전문가입니다.
 
 
 def _parse_number(s: str) -> Optional[float]:
-    """문자열에서 숫자 파싱"""
     if not s or s.strip() in ('-', '', '*자본잠식', '해당없음', '산출 불가'):
         return None
     cleaned = str(s).replace(',', '').replace(' ', '').strip()
@@ -42,25 +44,60 @@ def _parse_number(s: str) -> Optional[float]:
 
 
 class QAEngine:
-    def __init__(self, paragraphs: list, table_summaries: list[TableSummary],
-                 text_numbers: list[NumberInfo], table_numbers: list[NumberInfo]):
-        self.paragraphs = paragraphs
-        self.tables = table_summaries
-        self.text_numbers = text_numbers
-        self.table_numbers = table_numbers
-        self.all_numbers = text_numbers + table_numbers
+    def __init__(self, paragraphs: list = None, table_summaries: list[TableSummary] = None,
+                 text_numbers: list[NumberInfo] = None, table_numbers: list[NumberInfo] = None,
+                 documents: list[dict] = None):
+        if documents:
+            self.multi_doc = True
+            self.documents = documents
+            self.paragraphs = []
+            self.tables = []
+            self.text_numbers = []
+            self.table_numbers = []
+            for doc_data in documents:
+                self.paragraphs.extend(doc_data.get('paragraphs', []))
+                self.tables.extend(doc_data.get('tables', []))
+                self.text_numbers.extend(doc_data.get('text_numbers', []))
+                self.table_numbers.extend(doc_data.get('table_numbers', []))
+        else:
+            self.multi_doc = False
+            self.documents = []
+            self.paragraphs = paragraphs or []
+            self.tables = table_summaries or []
+            self.text_numbers = text_numbers or []
+            self.table_numbers = table_numbers or []
+
+        self.all_numbers = self.text_numbers + self.table_numbers
 
     def answer(self, question: str, use_llm: bool = False,
-               model: str = "gemma4", ollama_url: str = "http://localhost:11434") -> dict:
-        # 1) 표 데이터 기반 자동 계산
-        pre_computed = self._pre_compute_analysis(question)
-
-        # 2) Rule-based 답변
-        rule_result = self._rule_based_answer(question)
-
-        # 3) LLM 답변
+               model: str = "gemma4", ollama_url: str = "http://localhost:11434",
+               stream: bool = False, stage1_model: str = "gemma3:4b") -> dict:
+        # Stage 1: LLM 기반 intent/entity 추출
+        stage1_result = None
         if use_llm:
-            return self._llm_answer(question, model, ollama_url, rule_result, pre_computed)
+            stage1_result = self._stage1_analyze(question, model=stage1_model,
+                                                  ollama_url=ollama_url)
+
+        # Stage 1 결과로 정밀 사전 계산, 또는 regex fallback
+        if stage1_result and (stage1_result['entities'] or stage1_result['metrics']):
+            pre_computed = self._pre_compute_with_stage1(question, stage1_result)
+        else:
+            pre_computed = self._pre_compute_analysis(question)
+
+        # Rule-based 답변
+        if stage1_result and stage1_result.get('intent'):
+            rule_result = self._rule_based_with_intent(question, stage1_result['intent'])
+        else:
+            rule_result = self._rule_based_answer(question)
+
+        # Stage 2: LLM 해석
+        if use_llm:
+            if stream:
+                return self._llm_answer_stream(question, model, ollama_url,
+                                               rule_result, pre_computed)
+            else:
+                return self._llm_answer(question, model, ollama_url,
+                                        rule_result, pre_computed)
 
         if pre_computed:
             return {
@@ -72,20 +109,212 @@ class QAEngine:
         return rule_result
 
     # =========================================================
-    # 표 데이터 기반 자동 계산 (핵심 신규 기능)
+    # Stage 1: 소형 모델 의도/엔티티 추출
     # =========================================================
 
+    def _stage1_analyze(self, question: str, model: str = "gemma3:4b",
+                        ollama_url: str = "http://localhost:11434") -> Optional[dict]:
+        header_names = []
+        for ts in self.tables:
+            for h in ts.headers:
+                h_str = str(h).strip()
+                if len(h_str) >= 2 and not h_str.startswith('열'):
+                    header_names.append(h_str)
+        header_names = list(dict.fromkeys(header_names))[:40]
+
+        metric_list = [
+            '매출액', '영업이익', '자본총계', '자본금', '부채비율', '유동비율',
+            '연구개발비', '사업비', '예산', '이자보상비율', '종업원수',
+        ]
+
+        prompt = f"""질문에서 엔티티와 지표를 추출하세요.
+
+규칙:
+- entities: 질문에 직접 언급된 기관명/회사명만. 반드시 아래 헤더 목록에 있는 이름만 사용.
+- metrics: 질문에 직접 언급된 지표만. 질문에 없는 지표는 절대 추가하지 마세요.
+- intent: 반드시 하나만 선택 (lookup, sum, max, filter, compare, summary 중 하나)
+- years: 질문에 명시된 연도 숫자만. "1년차"는 연도가 아닙니다.
+
+헤더 목록: {header_names[:30]}
+지표 목록: {', '.join(metric_list)}
+
+질문: {question}
+
+JSON만 출력:
+{{"intent": "lookup", "entities": [], "metrics": [], "years": []}}"""
+
+        try:
+            response = requests.post(
+                f"{ollama_url}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 256,
+                        "num_ctx": 4096,
+                    }
+                },
+                timeout=15,
+            )
+            if response.status_code != 200:
+                return None
+
+            text = response.json().get('response', '').strip()
+            json_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+            if not json_match:
+                return None
+
+            parsed = json.loads(json_match.group())
+
+            raw_intent = str(parsed.get('intent', 'lookup'))
+            valid_intents = {'lookup', 'sum', 'max', 'filter', 'compare', 'summary'}
+            intent = 'lookup'
+            for vi in raw_intent.replace('|', ',').replace(' ', '').split(','):
+                if vi.strip() in valid_intents:
+                    intent = vi.strip()
+                    break
+
+            result = {
+                'intent': intent,
+                'entities': parsed.get('entities', []),
+                'metrics': parsed.get('metrics', []),
+                'years': [],
+            }
+
+            if not isinstance(result['entities'], list):
+                result['entities'] = []
+            if not isinstance(result['metrics'], list):
+                result['metrics'] = []
+
+            raw_years = parsed.get('years', [])
+            if isinstance(raw_years, list):
+                for y in raw_years:
+                    try:
+                        yi = int(y)
+                        if 1900 <= yi <= 2100:
+                            result['years'].append(yi)
+                    except (ValueError, TypeError):
+                        pass
+
+            result['entities'] = self._validate_stage1_entities(result['entities'])
+            result['metrics'] = self._validate_stage1_metrics(result['metrics'], question)
+
+            return result
+        except Exception:
+            return None
+
+    def _validate_stage1_entities(self, entities: list) -> list:
+        """Stage 1이 추출한 엔티티가 실제 표 헤더에 존재하는지 검증"""
+        if not entities:
+            return []
+
+        valid_names = set()
+        for ts in self.tables:
+            for h in ts.headers:
+                h_str = str(h).strip()
+                if len(h_str) >= 2 and not h_str.startswith('열'):
+                    valid_names.add(h_str)
+
+        validated = []
+        for entity in entities:
+            if not entity or len(entity) < 2:
+                continue
+            if re.match(r'^\d+$', entity.strip()):
+                continue
+            if entity.startswith('표') and entity[1:].isdigit():
+                continue
+            entity_clean = entity.replace(' ', '')
+            for name in valid_names:
+                name_clean = name.replace(' ', '')
+                if len(entity_clean) >= 3 and len(name_clean) >= 3:
+                    if entity_clean == name_clean or entity_clean in name_clean or name_clean in entity_clean:
+                        validated.append(name)
+                        break
+        return validated
+
+    def _validate_stage1_metrics(self, metrics: list, question: str) -> list:
+        """Stage 1이 추출한 지표가 질문에 실제로 언급되었는지 검증"""
+        if not metrics:
+            return []
+        q_clean = question.replace(' ', '')
+        validated = []
+        for metric in metrics:
+            metric_clean = metric.replace(' ', '')
+            if metric_clean in q_clean:
+                validated.append(metric)
+            else:
+                for keyword in metric_clean:
+                    pass
+                short_forms = [metric_clean[:3], metric_clean[:4]]
+                if any(sf in q_clean for sf in short_forms if len(sf) >= 2):
+                    validated.append(metric)
+        return validated
+
+    # =========================================================
+    # 표 데이터 기반 자동 계산
+    # =========================================================
+
+    def _pre_compute_with_stage1(self, question: str, stage1: dict) -> str:
+        q = question.strip()
+        entities = stage1.get('entities', [])
+        metrics = stage1.get('metrics', [])
+        target_years = []
+        for y in stage1.get('years', []):
+            try:
+                target_years.append(int(y))
+            except (ValueError, TypeError):
+                pass
+        wants_sum = stage1.get('intent') == 'sum' or any(kw in q for kw in SUM_KEYWORDS)
+
+        results = []
+
+        if entities and metrics:
+            for entity in entities:
+                for metric in metrics:
+                    lookup = self._lookup_entity_metric(entity, metric, target_years)
+                    if lookup:
+                        results.append(lookup)
+
+        if not results and entities:
+            for entity in entities:
+                lookup = self._lookup_entity_all(entity, target_years)
+                if lookup:
+                    results.append(lookup)
+
+        if not results and metrics:
+            for metric in metrics:
+                lookup = self._lookup_metric_all(metric, target_years)
+                if lookup:
+                    results.append(lookup)
+
+        if not results:
+            return self._pre_compute_analysis(question)
+
+        parts = ["[사전 계산 결과 (Stage 1 LLM 추출)]"]
+        for r in results:
+            parts.append(r['description'])
+            if r.get('values'):
+                for v in r['values']:
+                    parts.append(f"  - {v['label']}: {v['raw']}")
+                if wants_sum:
+                    nums = [v['numeric'] for v in r['values'] if v['numeric'] is not None]
+                    if nums:
+                        total = sum(nums)
+                        unit = r.get('unit', '')
+                        unit_text = f" ({unit})" if unit else ""
+                        parts.append(f"  → 합계: {total:,.0f}{unit_text}")
+                        parts.append(f"  → 계산: {' + '.join(f'{n:,.0f}' for n in nums)} = {total:,.0f}")
+
+        return '\n'.join(parts)
+
     def _pre_compute_analysis(self, question: str) -> str:
-        """질문에서 엔티티·지표를 추출하고, DataFrame에서 값을 조회·계산"""
         q = question.strip()
 
-        # 질문에서 엔티티(기관명 등) 찾기
         entities = self._find_entities_in_question(q)
-        # 질문에서 지표(매출액, 자본총계 등) 찾기
         metrics = self._find_metrics_in_question(q)
-        # 합계 연산 요청 여부
         wants_sum = any(kw in q for kw in SUM_KEYWORDS)
-        # 특정 연도 필터
         year_matches = re.findall(r'((?:19|20)\d{2})', q)
         target_years = [int(y) for y in year_matches] if year_matches else []
 
@@ -131,7 +360,6 @@ class QAEngine:
         return '\n'.join(parts)
 
     def _find_entities_in_question(self, question: str) -> list:
-        """질문에서 표 컬럼 헤더와 매칭되는 엔티티(기관명 등) 찾기"""
         found = []
         q_clean = question.replace(' ', '')
         skip_headers = {'순번', '구분', '열2', '열3', '열4', '열5', '열6', '열7', '열8',
@@ -154,7 +382,6 @@ class QAEngine:
         return found
 
     def _find_metrics_in_question(self, question: str) -> list:
-        """질문에서 지표 키워드 매칭"""
         q_clean = question.replace(' ', '')
         metric_keywords = [
             '전년도 매출액', '매출액 대비 연구개발비 비율', '연구개발비 비율', '연구개발비',
@@ -167,11 +394,10 @@ class QAEngine:
         for kw in metric_keywords:
             if kw.replace(' ', '') in q_clean and kw not in found:
                 found.append(kw)
-                break  # 가장 구체적인 것 하나만
+                break
         return found
 
     def _find_year_label_col(self, df: pd.DataFrame, label_cols: list) -> Optional[str]:
-        """연도(2023, 2024 등)가 들어있는 레이블 컬럼 찾기"""
         for col in df.columns[:6]:
             if col in label_cols:
                 continue
@@ -182,7 +408,6 @@ class QAEngine:
         return None
 
     def _get_label_columns(self, df: pd.DataFrame) -> list:
-        """표에서 레이블(행 이름) 역할을 하는 컬럼 식별"""
         label_cols = []
         for col in df.columns[:4]:
             col_str = str(col)
@@ -193,7 +418,6 @@ class QAEngine:
         return label_cols if label_cols else [df.columns[0]]
 
     def _lookup_entity_metric(self, entity: str, metric: str, target_years: list) -> Optional[dict]:
-        """특정 엔티티의 특정 지표 값을 표에서 조회"""
         entity_clean = entity.replace(' ', '')
         metric_clean = metric.replace(' ', '')
 
@@ -244,7 +468,6 @@ class QAEngine:
                 continue
 
             expanded_rows = self._expand_sub_rows(df, matching_rows, label_cols)
-
             year_col = self._find_year_label_col(df, label_cols)
 
             values = []
@@ -276,16 +499,17 @@ class QAEngine:
                 if filtered:
                     values = filtered
 
+            doc_tag = f" [{ts.document_id}]" if ts.document_id and self.multi_doc else ""
             if values:
                 return {
-                    'description': f"표 {ts.index+1}에서 [{entity}]의 [{metric}] 조회:",
+                    'description': f"표 {ts.index+1}{doc_tag}에서 [{entity}]의 [{metric}] 조회:",
                     'values': values,
                     'unit': ts.unit,
                     'table_index': ts.index,
                 }
             elif matching_rows:
                 return {
-                    'description': f"표 {ts.index+1}에서 [{entity}]의 [{metric}]: 해당 데이터 없음 ('-')",
+                    'description': f"표 {ts.index+1}{doc_tag}에서 [{entity}]의 [{metric}]: 해당 데이터 없음 ('-')",
                     'values': [],
                     'unit': ts.unit,
                     'table_index': ts.index,
@@ -294,7 +518,6 @@ class QAEngine:
         return None
 
     def _lookup_entity_all(self, entity: str, target_years: list) -> Optional[dict]:
-        """특정 엔티티의 모든 데이터 조회"""
         entity_clean = entity.replace(' ', '')
 
         for ts in self.tables:
@@ -325,8 +548,9 @@ class QAEngine:
                 })
 
             if values:
+                doc_tag = f" [{ts.document_id}]" if ts.document_id and self.multi_doc else ""
                 return {
-                    'description': f"표 {ts.index+1}에서 [{entity}]의 전체 데이터:",
+                    'description': f"표 {ts.index+1}{doc_tag}에서 [{entity}]의 전체 데이터:",
                     'values': values[:30],
                     'unit': ts.unit,
                     'table_index': ts.index,
@@ -335,7 +559,6 @@ class QAEngine:
         return None
 
     def _lookup_metric_all(self, metric: str, target_years: list) -> Optional[dict]:
-        """특정 지표의 모든 엔티티 데이터 조회"""
         metric_clean = metric.replace(' ', '')
 
         for ts in self.tables:
@@ -374,8 +597,9 @@ class QAEngine:
                     })
 
             if values:
+                doc_tag = f" [{ts.document_id}]" if ts.document_id and self.multi_doc else ""
                 return {
-                    'description': f"표 {ts.index+1}에서 [{metric}] 관련 전체 데이터:",
+                    'description': f"표 {ts.index+1}{doc_tag}에서 [{metric}] 관련 전체 데이터:",
                     'values': values[:40],
                     'unit': ts.unit,
                     'table_index': ts.index,
@@ -384,7 +608,6 @@ class QAEngine:
         return None
 
     def _expand_sub_rows(self, df: pd.DataFrame, matching_rows: list, label_cols: list) -> list:
-        """매칭된 행의 하위 행(연도별 데이터 등) 포함"""
         expanded = []
         for idx in matching_rows:
             expanded.append(idx)
@@ -408,6 +631,26 @@ class QAEngine:
     # =========================================================
     # Rule-based 답변
     # =========================================================
+
+    def _rule_based_with_intent(self, question: str, intent: str) -> dict:
+        intent_map = {
+            'sum': self._compute_sums,
+            'max': self._find_max_item,
+            'summary': self._list_tables,
+        }
+
+        if intent == 'filter':
+            year_match = re.search(r'(20\d{2})', question)
+            if year_match:
+                return self._filter_by_year(int(year_match.group(1)))
+
+        if intent == 'compare':
+            return self._general_search(question)
+
+        if intent in intent_map:
+            return intent_map[intent]()
+
+        return self._rule_based_answer(question)
 
     def _rule_based_answer(self, question: str) -> dict:
         q = question.lower().strip()
@@ -450,7 +693,8 @@ class QAEngine:
         parts = [f"예산 관련 표 {len(budget_tables)}개:\n"]
         for ts in budget_tables:
             unit_info = f" [단위: {ts.unit}]" if ts.unit else ""
-            parts.append(f"- 표 {ts.index+1}: {ts.num_rows}행 x {ts.num_cols}열{unit_info} (헤더: {', '.join(ts.headers[:5])})")
+            doc_tag = f" [{ts.document_id}]" if ts.document_id and self.multi_doc else ""
+            parts.append(f"- 표 {ts.index+1}{doc_tag}: {ts.num_rows}행 x {ts.num_cols}열{unit_info} (헤더: {', '.join(ts.headers[:5])})")
         return {'answer': '\n'.join(parts), 'source': '표 분석', 'tables': budget_tables, 'confidence': 'high'}
 
     def _find_total_budget(self) -> dict:
@@ -548,6 +792,8 @@ class QAEngine:
         parts = [f"문서 내 표 {len(self.tables)}개:\n"]
         for ts in self.tables:
             info = f"- 표 {ts.index+1}: {ts.num_rows}행 x {ts.num_cols}열"
+            if ts.document_id and self.multi_doc:
+                info += f" [{ts.document_id}]"
             if ts.caption:
                 info += f" ({ts.caption})"
             if ts.unit:
@@ -558,7 +804,9 @@ class QAEngine:
     def _general_search(self, question: str) -> dict:
         keywords = [k for k in re.findall(r'[가-힣a-zA-Z0-9]+', question) if len(k) > 1]
         paras = [p for p in self.paragraphs if any(kw in p for kw in keywords)]
-        tbls = [ts for ts in self.tables if ts.dataframe is not None and any(kw in ts.dataframe.to_string() for kw in keywords)]
+        tbls = [ts for ts in self.tables if ts.dataframe is not None
+                and any(kw in (ts.caption + ' ' + ' '.join(str(h) for h in ts.headers))
+                        for kw in keywords)]
         parts = []
         if paras:
             parts.append(f"관련 문단 {len(paras)}개:")
@@ -573,7 +821,7 @@ class QAEngine:
         return {'answer': '\n'.join(parts), 'source': '키워드 검색', 'confidence': 'medium'}
 
     # =========================================================
-    # LLM
+    # LLM (Stage 2)
     # =========================================================
 
     def _llm_answer(self, question: str, model: str, ollama_url: str,
@@ -611,7 +859,7 @@ class QAEngine:
                     "options": {
                         "temperature": 0.2,
                         "num_predict": 2048,
-                        "num_ctx": 16384,
+                        "num_ctx": 32768,
                     }
                 },
                 timeout=180,
@@ -666,34 +914,140 @@ class QAEngine:
                 'elapsed': round(time.time() - start_time, 1),
             }
 
+    def _llm_answer_stream(self, question: str, model: str, ollama_url: str,
+                           rule_result: dict, pre_computed: str) -> dict:
+        context = self._build_context(question)
+        rule_hint = rule_result.get('answer', '')
+
+        pre_section = ""
+        if pre_computed:
+            pre_section = f"\n## 사전 계산 결과 (프로그래밍으로 정확히 계산됨 — 이 결과를 신뢰하세요):\n{pre_computed}\n"
+
+        prompt = f"""{SYSTEM_PROMPT}
+
+## 문서에서 추출된 데이터:
+
+{context}
+{pre_section}
+## Rule-based 사전 분석:
+{rule_hint}
+
+## 사용자 질문:
+{question}
+
+## 답변 (근거 표시 필수):"""
+
+        start_time = time.time()
+
+        try:
+            response = requests.post(
+                f"{ollama_url}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": True,
+                    "options": {
+                        "temperature": 0.2,
+                        "num_predict": 2048,
+                        "num_ctx": 32768,
+                    }
+                },
+                timeout=180,
+                stream=True,
+            )
+
+            if response.status_code != 200:
+                return {
+                    'answer': f"LLM 오류 (HTTP {response.status_code}).\n\nRule-based:\n{rule_hint}",
+                    'source': rule_result.get('source', ''),
+                    'confidence': rule_result.get('confidence', 'low'),
+                    'error': response.text[:200],
+                    'elapsed': round(time.time() - start_time, 1),
+                }
+
+            def token_generator():
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                        token = chunk.get('response', '')
+                        if token:
+                            yield token
+                    except json.JSONDecodeError:
+                        continue
+
+            return {
+                'answer_stream': token_generator(),
+                'source': f'LLM ({model}) + 문서 분석',
+                'confidence': 'llm',
+                'model': model,
+                'start_time': start_time,
+            }
+
+        except requests.ConnectionError:
+            return {
+                'answer': f"Ollama 미연결.\n\nRule-based:\n{rule_hint}",
+                'source': rule_result.get('source', ''),
+                'confidence': rule_result.get('confidence', 'low'),
+                'error': 'Ollama 연결 실패',
+                'elapsed': round(time.time() - start_time, 1),
+            }
+        except requests.Timeout:
+            return {
+                'answer': f"LLM 시간 초과.\n\nRule-based:\n{rule_hint}",
+                'source': rule_result.get('source', ''),
+                'confidence': rule_result.get('confidence', 'low'),
+                'error': 'Timeout',
+                'elapsed': round(time.time() - start_time, 1),
+            }
+        except Exception as e:
+            return {
+                'answer': f"LLM 오류: {e}\n\nRule-based:\n{rule_hint}",
+                'source': rule_result.get('source', ''),
+                'confidence': rule_result.get('confidence', 'low'),
+                'error': str(e),
+                'elapsed': round(time.time() - start_time, 1),
+            }
+
     def _build_context(self, question: str) -> str:
+        max_context = 8000
+        max_per_table = 3000
+
         keywords = [k for k in re.findall(r'[가-힣a-zA-Z0-9]+', question) if len(k) > 1]
         relevant, other = self._rank_tables_by_relevance(keywords)
 
         parts = []
+        total = 0
         for ts in relevant:
-            parts.append(self._format_table_for_llm(ts))
-        for ts in other:
-            parts.append(self._format_table_for_llm(ts))
+            formatted = self._format_table_for_llm(ts)
+            if len(formatted) > max_per_table:
+                formatted = formatted[:max_per_table] + '\n... (이하 생략)'
+            if total + len(formatted) > max_context:
+                break
+            parts.append(formatted)
+            total += len(formatted)
+
+        if total < max_context * 0.5:
+            for ts in other[:3]:
+                formatted = self._format_table_for_llm(ts)
+                if len(formatted) > max_per_table:
+                    formatted = formatted[:max_per_table] + '\n... (이하 생략)'
+                if total + len(formatted) > max_context:
+                    break
+                parts.append(formatted)
+                total += len(formatted)
 
         rel_paras = [p for p in self.paragraphs if any(kw in p for kw in keywords)]
-        if rel_paras:
-            parts.append("\n---\n### 질문 관련 텍스트:")
-            for p in rel_paras[:30]:
-                parts.append(p)
-
-        remaining = 16000 - sum(len(p) for p in parts)
-        if remaining > 500:
-            other_paras = [p for p in self.paragraphs if not any(kw in p for kw in keywords)]
-            parts.append("\n---\n### 기타 텍스트:")
-            for p in other_paras[:20]:
-                if remaining <= 0:
+        if rel_paras and total < max_context:
+            parts.append("\n---\n### 관련 텍스트:")
+            for p in rel_paras[:10]:
+                if total + len(p) > max_context:
                     break
                 parts.append(p)
-                remaining -= len(p)
+                total += len(p)
 
-        context = '\n'.join(parts)
-        return context[:20000] if len(context) > 20000 else context
+        return '\n'.join(parts)
 
     def _rank_tables_by_relevance(self, keywords: list) -> tuple:
         scored = []
@@ -702,9 +1056,13 @@ class QAEngine:
                 scored.append((0, ts))
                 continue
             score = 0
-            text = ts.dataframe.to_string() + ' ' + ts.caption + ' ' + ' '.join(ts.headers)
+            searchable = ts.caption + ' ' + ' '.join(str(h) for h in ts.headers)
+            if ts.dataframe is not None and len(ts.dataframe.columns) > 0:
+                label_cols = ts.dataframe.columns[:2]
+                for lc in label_cols:
+                    searchable += ' ' + ' '.join(ts.dataframe[lc].astype(str).tolist()[:20])
             for kw in keywords:
-                if kw in text:
+                if kw in searchable:
                     score += 10
                 for col in ts.headers:
                     if kw in str(col):
@@ -717,6 +1075,8 @@ class QAEngine:
         if ts.dataframe is None:
             return ""
         header = f"\n### 표 {ts.index+1}"
+        if ts.document_id and self.multi_doc:
+            header += f" [{ts.document_id}]"
         if ts.caption:
             header += f" - {ts.caption}"
         if ts.unit:

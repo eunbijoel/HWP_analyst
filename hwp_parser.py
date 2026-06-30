@@ -10,6 +10,8 @@ import io
 import re
 import struct
 import zlib
+import subprocess
+import tempfile
 from xml.etree import ElementTree as ET
 from typing import Optional
 from dataclasses import dataclass, field
@@ -301,7 +303,52 @@ def _get_cell_text(tc_elem) -> str:
     return result
 
 
+def _try_hwp_to_hwpx_conversion(file_bytes: bytes, filename: str) -> Optional[ParsedDocument]:
+    """LibreOffice를 사용하여 HWP를 HWPX로 변환 시도"""
+    soffice_path = "/usr/bin/soffice"
+    if not os.path.exists(soffice_path):
+        return None
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="hwp_convert_") as tmpdir:
+            hwp_path = os.path.join(tmpdir, filename)
+            with open(hwp_path, 'wb') as f:
+                f.write(file_bytes)
+
+            result = subprocess.run(
+                [soffice_path, "--headless", "--convert-to", "hwpx",
+                 "--outdir", tmpdir, hwp_path],
+                capture_output=True, timeout=30, text=True,
+            )
+
+            if result.returncode != 0:
+                return None
+
+            base_name = os.path.splitext(filename)[0]
+            hwpx_path = os.path.join(tmpdir, base_name + ".hwpx")
+
+            if not os.path.exists(hwpx_path):
+                hwpx_candidates = [f for f in os.listdir(tmpdir)
+                                   if f.endswith('.hwpx') and f != filename]
+                if not hwpx_candidates:
+                    return None
+                hwpx_path = os.path.join(tmpdir, hwpx_candidates[0])
+
+            with open(hwpx_path, 'rb') as f:
+                hwpx_bytes = f.read()
+
+            doc = parse_hwpx(hwpx_bytes, filename)
+            doc.file_type = "hwp (converted)"
+            return doc
+    except (subprocess.TimeoutExpired, OSError, Exception):
+        return None
+
+
 def parse_hwp(file_bytes: bytes, filename: str) -> ParsedDocument:
+    converted_doc = _try_hwp_to_hwpx_conversion(file_bytes, filename)
+    if converted_doc is not None:
+        return converted_doc
+
     doc = ParsedDocument(filename=filename, file_type="hwp")
 
     try:
