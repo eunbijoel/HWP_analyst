@@ -24,12 +24,23 @@ HWP analysis/
 업로드된 파일은 Streamlit UI에서 **한 번 파싱되면 세션에 캐시**됩니다. 이후 질문마다 아래 3단계가 실행됩니다.
 
 ```
-┌─────────────┐    ┌──────────────────┐    ┌─────────────────────┐
-│  HWP/HWPX   │───▶│  구조화·수치 분석  │───▶│  질의응답 (QAEngine)  │
-│  hwp_parser │    │  table_extractor  │    │  ① 사전 계산         │
-└─────────────┘    └──────────────────┘    │  ② Rule-based       │
-                                            │  ③ Ollama (선택)    │
-                                            └─────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                         app.py (Streamlit UI)                          │
+│  file upload → session cache → metrics display → chat interface        │
+└──────────┬──────────────────────┬──────────────────────┬───────────────┘
+     ┌─────▼─────┐    ┌──────────▼──────────┐   ┌───────▼──────────────┐
+     │ hwp_parser │    │  table_extractor   │   │     qa_engine        │
+     │            │    │                    │   │                      │
+     │ HWPX:      │    │ rows→DataFrame     │   │ Tier1: Pre-compute   │
+     │  ZIP→XML   │    │ NumberInfo 탐지     │   │  entity×metric lookup│
+     │  cellAddr  │──▶│ TableSummary 생성   │──▶│                      │
+     │  병합셀    │    │  numeric_columns    │   │ Tier2: Rule-based    │
+     │            │    │  money_columns     │   │  12개 키워드 패턴      │
+     │ HWP:       │    │  year_columns      │   │                      │
+     │  OLE→zlib  │    │  total_row         │   │ Tier3: Ollama LLM    │
+     │  텍스트만   │    │                     │   │  gemma4, temp=0.2    │
+     └────────────┘    └─────────────────────┘   │  context ≤8K chars   │
+                                                 └──────────────────────┘
 ```
 
 ### Stage 1 — 문서 파싱 (`hwp_parser.py`)
