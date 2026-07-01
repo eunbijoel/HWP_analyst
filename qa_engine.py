@@ -15,11 +15,13 @@ import pandas as pd
 from typing import Optional
 from table_extractor import (
     TableSummary, NumberInfo, BUDGET_KEYWORDS, TOTAL_KEYWORDS,
+    UNIT_MULTIPLIERS,
     compute_column_sum, find_max_value_in_table, filter_table_by_year,
 )
 
 
 SUM_KEYWORDS = ['합계', '합산', '총합', '합', '더해', '합쳐', '총', '전체 합', '다 더', 'sum', '합을']
+CHART_KEYWORDS = ['그래프', '차트', '시각화', '막대', '그려', '그림', '도표', 'chart', 'graph', '비교 그래프', '바 차트']
 SYSTEM_PROMPT = """당신은 한글(HWP) 문서 분석 전문가입니다.
 
 ## 핵심 규칙:
@@ -30,6 +32,29 @@ SYSTEM_PROMPT = """당신은 한글(HWP) 문서 분석 전문가입니다.
 5. **사전 계산 결과가 제공되면 그 결과를 신뢰하고 활용하세요.** 사전 계산은 표 데이터를 프로그래밍으로 정확히 추출·계산한 것입니다.
 6. 계산이 필요하면 과정을 단계별로 보여주세요.
 7. 확실하지 않으면 "문서에서 명확히 확인되지 않음"이라고 표시하세요."""
+
+
+def _format_value_with_unit(raw_val: str, numeric_val: Optional[float], unit: str) -> str:
+    """단위가 있으면 실제값을 병기. 예: '120,000 (천원 = 1억 2,000만원)'"""
+    multiplier = UNIT_MULTIPLIERS.get(unit, 1)
+    if numeric_val is None or multiplier <= 1:
+        return raw_val
+
+    actual = numeric_val * multiplier
+    if actual >= 1_0000_0000:
+        eok = int(actual // 1_0000_0000)
+        remainder = int((actual % 1_0000_0000) // 10000)
+        if remainder > 0:
+            actual_str = f"{eok}억 {remainder:,}만원"
+        else:
+            actual_str = f"{eok}억원"
+    elif actual >= 10000:
+        man = int(actual // 10000)
+        actual_str = f"{man:,}만원"
+    else:
+        actual_str = f"{actual:,.0f}원"
+
+    return f"{raw_val} ({unit} = {actual_str})"
 
 
 def _parse_number(s: str) -> Optional[float]:
@@ -78,11 +103,22 @@ class QAEngine:
             stage1_result = self._stage1_analyze(question, model=stage1_model,
                                                   ollama_url=ollama_url)
 
-        # Stage 1 결과로 정밀 사전 계산, 또는 regex fallback
-        if stage1_result and (stage1_result['entities'] or stage1_result['metrics']):
-            pre_computed = self._pre_compute_with_stage1(question, stage1_result)
+        # 차트 요청 여부 확인
+        wants_chart = any(kw in question for kw in CHART_KEYWORDS)
+
+        # LLM pandas 코드 생성 시도 → 실패시 기존 pre-compute fallback
+        chart_data = None
+        pandas_result = None
+        if use_llm:
+            pandas_result = self._try_pandas_code_gen(question, model=stage1_model,
+                                                       ollama_url=ollama_url)
+
+        if pandas_result:
+            pre_computed = pandas_result
+        elif stage1_result and (stage1_result['entities'] or stage1_result['metrics']):
+            pre_computed, chart_data = self._pre_compute_with_stage1(question, stage1_result)
         else:
-            pre_computed = self._pre_compute_analysis(question)
+            pre_computed, chart_data = self._pre_compute_analysis(question)
 
         # Rule-based 답변
         if stage1_result and stage1_result.get('intent'):
@@ -90,22 +126,36 @@ class QAEngine:
         else:
             rule_result = self._rule_based_answer(question)
 
+        if chart_data is None and rule_result.get('chart_data'):
+            chart_data = rule_result['chart_data']
+
+        if not wants_chart:
+            chart_data = None
+
         # Stage 2: LLM 해석
         if use_llm:
             if stream:
-                return self._llm_answer_stream(question, model, ollama_url,
-                                               rule_result, pre_computed)
+                result = self._llm_answer_stream(question, model, ollama_url,
+                                                 rule_result, pre_computed)
             else:
-                return self._llm_answer(question, model, ollama_url,
-                                        rule_result, pre_computed)
+                result = self._llm_answer(question, model, ollama_url,
+                                          rule_result, pre_computed)
+            if chart_data:
+                result['chart_data'] = chart_data
+            return result
 
         if pre_computed:
-            return {
+            result = {
                 'answer': pre_computed,
                 'source': '표 데이터 자동 계산',
                 'confidence': 'high',
             }
+            if chart_data:
+                result['chart_data'] = chart_data
+            return result
 
+        if chart_data:
+            rule_result['chart_data'] = chart_data
         return rule_result
 
     # =========================================================
@@ -253,10 +303,168 @@ JSON만 출력:
         return validated
 
     # =========================================================
-    # 표 데이터 기반 자동 계산
+    # 차트 데이터 생성
     # =========================================================
 
-    def _pre_compute_with_stage1(self, question: str, stage1: dict) -> str:
+    def _make_chart_data(self, values: list, title: str, unit: str = "") -> Optional[dict]:
+        items = [(v['label'][:20], v['numeric']) for v in values
+                 if v.get('numeric') is not None]
+        if len(items) < 2:
+            return None
+        items = items[:15]
+        labels, nums = zip(*items)
+        df = pd.DataFrame({'값': list(nums)}, index=list(labels))
+        return {'data': df, 'title': title, 'unit': unit}
+
+    # =========================================================
+    # LLM Pandas 코드 생성
+    # =========================================================
+
+    def _build_table_schema(self, question: str) -> str:
+        keywords = [k for k in re.findall(r'[가-힣a-zA-Z0-9]+', question) if len(k) > 1]
+        relevant, other = self._rank_tables_by_relevance(keywords)
+        ordered = (relevant + other)[:5]
+
+        parts = []
+        total_len = 0
+        for ts in ordered:
+            if ts.dataframe is None or ts.dataframe.empty:
+                continue
+            df = ts.dataframe
+            unit_info = f" [단위: {ts.unit}]" if ts.unit else ""
+            caption_info = f" - {ts.caption}" if ts.caption else ""
+            header = f"tables[{ts.index}]: 표 {ts.index+1}{caption_info}{unit_info} ({df.shape[0]}행 x {df.shape[1]}열)"
+            cols = f"  컬럼: {list(df.columns)}"
+            sample_rows = []
+            for i in range(min(3, len(df))):
+                row_vals = [str(df.iloc[i, j])[:30] for j in range(len(df.columns))]
+                sample_rows.append("    " + " | ".join(row_vals))
+            sample = "  샘플:\n" + "\n".join(sample_rows) if sample_rows else ""
+            block = f"{header}\n{cols}\n{sample}\n"
+            if total_len + len(block) > 4000:
+                break
+            parts.append(block)
+            total_len += len(block)
+
+        return "\n".join(parts)
+
+    def _generate_pandas_code(self, question: str, schema: str,
+                              model: str, ollama_url: str) -> Optional[str]:
+        prompt = f"""당신은 pandas 전문가입니다. DataFrame에서 질문에 답하는 Python 코드를 작성하세요.
+
+## 사용 가능한 변수
+- tables: dict[int, pd.DataFrame]  (키는 표 번호, 0부터 시작)
+- pd: pandas 모듈
+
+## 규칙
+1. 결과를 반드시 `result` 변수에 문자열로 저장하세요.
+2. 행/열 이름으로 찾을 때는 str.contains()로 부분 매칭하세요.
+3. 숫자가 문자열이면: .str.replace(',','').astype(float) 로 변환하세요.
+4. 코드만 출력하세요. 설명이나 마크다운 블록(```)은 쓰지 마세요.
+5. 에러가 나지 않도록 .empty 체크, try/except를 사용하세요.
+
+## DataFrame 스키마
+{schema}
+
+## 질문
+{question}
+
+## Python 코드:
+"""
+        try:
+            response = requests.post(
+                f"{ollama_url}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 512,
+                        "num_ctx": 8192,
+                    }
+                },
+                timeout=30,
+            )
+            if response.status_code != 200:
+                return None
+
+            text = response.json().get('response', '').strip()
+            code_match = re.search(r'```(?:python)?\s*\n?(.*?)```', text, re.DOTALL)
+            if code_match:
+                return code_match.group(1).strip()
+            if 'result' in text and ('tables' in text or 'df' in text):
+                return text.strip()
+            return None
+        except Exception:
+            return None
+
+    def _safe_execute_pandas(self, code: str, tables_dict: dict) -> Optional[str]:
+        forbidden = ['import ', 'open(', 'exec(', 'eval(', '__', 'os.', 'sys.',
+                      'subprocess', 'shutil', 'globals(', 'locals(', 'compile(']
+        for f in forbidden:
+            if f in code:
+                return None
+
+        safe_builtins = {
+            'len': len, 'range': range, 'sum': sum, 'min': min, 'max': max,
+            'round': round, 'str': str, 'int': int, 'float': float,
+            'list': list, 'dict': dict, 'tuple': tuple, 'set': set,
+            'sorted': sorted, 'enumerate': enumerate, 'zip': zip,
+            'map': map, 'filter': filter, 'print': print,
+            'isinstance': isinstance, 'type': type, 'abs': abs,
+            'any': any, 'all': all, 'bool': bool, 'ValueError': ValueError,
+            'KeyError': KeyError, 'IndexError': IndexError, 'TypeError': TypeError,
+        }
+
+        namespace = {
+            '__builtins__': safe_builtins,
+            'tables': tables_dict,
+            'pd': pd,
+            're': re,
+        }
+
+        try:
+            exec(code, namespace)
+            result = namespace.get('result')
+            if result is not None:
+                return str(result)
+            return None
+        except Exception:
+            return None
+
+    def _try_pandas_code_gen(self, question: str, model: str,
+                             ollama_url: str) -> Optional[str]:
+        if not self.tables:
+            return None
+
+        schema = self._build_table_schema(question)
+        if not schema:
+            return None
+
+        code = self._generate_pandas_code(question, schema, model, ollama_url)
+        if not code:
+            return None
+
+        tables_dict = {}
+        for ts in self.tables:
+            if ts.dataframe is not None:
+                tables_dict[ts.index] = ts.dataframe
+
+        if not tables_dict:
+            return None
+
+        result = self._safe_execute_pandas(code, tables_dict)
+        if result and len(result) > 5:
+            return f"[사전 계산 결과 (pandas 코드 실행)]\n{result}"
+
+        return None
+
+    # =========================================================
+    # 표 데이터 기반 자동 계산 (fallback)
+    # =========================================================
+
+    def _pre_compute_with_stage1(self, question: str, stage1: dict) -> tuple:
         q = question.strip()
         entities = stage1.get('entities', [])
         metrics = stage1.get('metrics', [])
@@ -292,24 +500,32 @@ JSON만 출력:
         if not results:
             return self._pre_compute_analysis(question)
 
+        chart_data = None
         parts = ["[사전 계산 결과 (Stage 1 LLM 추출)]"]
         for r in results:
             parts.append(r['description'])
+            r_unit = r.get('unit', '')
             if r.get('values'):
                 for v in r['values']:
-                    parts.append(f"  - {v['label']}: {v['raw']}")
+                    display = _format_value_with_unit(v['raw'], v.get('numeric'), r_unit)
+                    parts.append(f"  - {v['label']}: {display}")
+                if chart_data is None:
+                    chart_data = self._make_chart_data(
+                        r['values'], r.get('description', ''), r_unit)
                 if wants_sum:
                     nums = [v['numeric'] for v in r['values'] if v['numeric'] is not None]
                     if nums:
                         total = sum(nums)
-                        unit = r.get('unit', '')
-                        unit_text = f" ({unit})" if unit else ""
+                        unit_text = f" ({r_unit})" if r_unit else ""
                         parts.append(f"  → 합계: {total:,.0f}{unit_text}")
-                        parts.append(f"  → 계산: {' + '.join(f'{n:,.0f}' for n in nums)} = {total:,.0f}")
+                        multiplier = UNIT_MULTIPLIERS.get(r_unit, 1)
+                        if multiplier > 1:
+                            actual_total = total * multiplier
+                            parts.append(f"  → 실제 합계: {_format_value_with_unit(f'{total:,.0f}', total, r_unit)}")
 
-        return '\n'.join(parts)
+        return '\n'.join(parts), chart_data
 
-    def _pre_compute_analysis(self, question: str) -> str:
+    def _pre_compute_analysis(self, question: str) -> tuple:
         q = question.strip()
 
         entities = self._find_entities_in_question(q)
@@ -340,24 +556,31 @@ JSON만 출력:
                     results.append(lookup)
 
         if not results:
-            return ""
+            return "", None
 
+        chart_data = None
         parts = ["[사전 계산 결과]"]
         for r in results:
             parts.append(r['description'])
+            r_unit = r.get('unit', '')
             if r.get('values'):
                 for v in r['values']:
-                    parts.append(f"  - {v['label']}: {v['raw']}")
+                    display = _format_value_with_unit(v['raw'], v.get('numeric'), r_unit)
+                    parts.append(f"  - {v['label']}: {display}")
+                if chart_data is None:
+                    chart_data = self._make_chart_data(
+                        r['values'], r.get('description', ''), r_unit)
             if wants_sum and r.get('values'):
                 nums = [v['numeric'] for v in r['values'] if v['numeric'] is not None]
                 if nums:
                     total = sum(nums)
-                    unit = r.get('unit', '')
-                    unit_text = f" ({unit})" if unit else ""
+                    unit_text = f" ({r_unit})" if r_unit else ""
                     parts.append(f"  → 합계: {total:,.0f}{unit_text}")
-                    parts.append(f"  → 계산: {' + '.join(f'{n:,.0f}' for n in nums)} = {total:,.0f}")
+                    multiplier = UNIT_MULTIPLIERS.get(r_unit, 1)
+                    if multiplier > 1:
+                        parts.append(f"  → 실제 합계: {_format_value_with_unit(f'{total:,.0f}', total, r_unit)}")
 
-        return '\n'.join(parts)
+        return '\n'.join(parts), chart_data
 
     def _find_entities_in_question(self, question: str) -> list:
         found = []
@@ -737,13 +960,24 @@ JSON만 출력:
 
     def _find_max_item(self) -> dict:
         max_info = None
+        all_items = []
         for ts in self.tables:
             result = find_max_value_in_table(ts)
-            if result and (max_info is None or result['numeric_value'] > max_info['numeric_value']):
-                max_info = result
+            if result:
+                all_items.append(result)
+                if max_info is None or result['numeric_value'] > max_info['numeric_value']:
+                    max_info = result
         if max_info:
             label = f" (항목: {max_info['label']})" if max_info['label'] else ""
-            return {'answer': f"가장 큰 금액: {max_info['value']}{label}\n위치: 표 {max_info['table_index']+1}, '{max_info['column']}' 컬럼", 'source': f"표 {max_info['table_index']+1}", 'confidence': 'high'}
+            answer_result = {'answer': f"가장 큰 금액: {max_info['value']}{label}\n위치: 표 {max_info['table_index']+1}, '{max_info['column']}' 컬럼", 'source': f"표 {max_info['table_index']+1}", 'confidence': 'high'}
+            if len(all_items) >= 2:
+                chart_values = [{'label': r.get('label', f"표{r['table_index']+1}") or f"표{r['table_index']+1}",
+                                 'numeric': r['numeric_value']} for r in
+                                sorted(all_items, key=lambda x: x['numeric_value'], reverse=True)]
+                chart = self._make_chart_data(chart_values, '표별 최댓값 비교')
+                if chart:
+                    answer_result['chart_data'] = chart
+            return answer_result
         return {'answer': '금액 정보를 찾지 못했습니다.', 'source': '전체 검색', 'confidence': 'low'}
 
     def _filter_by_year(self, year: int) -> dict:
@@ -771,10 +1005,16 @@ JSON만 출력:
                         results.append((ts.index, col, total, ts.unit))
         if results:
             parts = ["표별 숫자 합계:\n"]
+            chart_values = []
             for idx, col, s, unit in results:
                 u = f" ({unit})" if unit else ""
                 parts.append(f"- 표 {idx+1} [{col}]: {s:,.0f}{u}")
-            return {'answer': '\n'.join(parts), 'source': '표 합산', 'confidence': 'high'}
+                chart_values.append({'label': f"표{idx+1} {col}", 'numeric': s})
+            result = {'answer': '\n'.join(parts), 'source': '표 합산', 'confidence': 'high'}
+            chart = self._make_chart_data(chart_values, '표별 합계', results[0][3] if results else '')
+            if chart:
+                result['chart_data'] = chart
+            return result
         return {'answer': '합계를 계산할 데이터를 찾지 못했습니다.', 'source': '전체 검색', 'confidence': 'low'}
 
     def _find_percentages(self) -> dict:

@@ -72,20 +72,6 @@ with st.sidebar:
     else:
         stage1_model = "gemma3:4b"
 
-    st.divider()
-    st.markdown("**예시 질문**")
-    examples = [
-        "이 문서에서 예산 관련 표만 찾아줘",
-        "총 사업비가 얼마야?",
-        "연차별 예산을 표로 정리해줘",
-        "기관별 예산 합계를 알려줘",
-        "가장 큰 금액이 들어간 항목은 뭐야?",
-        "2026년 예산만 뽑아줘",
-        "표 안의 숫자 합계를 계산해줘",
-        "비율이나 퍼센트가 들어간 항목을 찾아줘",
-    ]
-    for q in examples:
-        st.code(q, language=None)
 
 
 # --- 파일 업로드 ---
@@ -153,9 +139,9 @@ if uploaded_files:
     with col4:
         st.metric("탐지된 숫자", total_numbers)
 
-    # 추출된 표 미리보기
+    # 추출된 표 진단
     if total_tables > 0:
-        with st.expander(f"추출된 표 미리보기 ({total_tables}개)", expanded=False):
+        with st.expander(f"추출된 표 진단 ({total_tables}개)", expanded=False):
             for doc_data in all_documents:
                 if len(all_documents) > 1:
                     st.subheader(f"{doc_data['id']}")
@@ -163,6 +149,27 @@ if uploaded_files:
                     unit_info = f" [단위: {ts.unit}]" if ts.unit else ""
                     caption_info = f" - {ts.caption}" if ts.caption else ""
                     st.markdown(f"**표 {ts.index+1}{caption_info}{unit_info}** ({ts.num_rows}행 x {ts.num_cols}열)")
+
+                    if ts.confidence >= 0.7:
+                        badge = f"🟢 신뢰도: 높음 ({ts.confidence})"
+                    elif ts.confidence >= 0.4:
+                        badge = f"🟡 신뢰도: 보통 ({ts.confidence})"
+                    else:
+                        badge = f"🔴 신뢰도: 낮음 ({ts.confidence})"
+
+                    meta = [badge]
+                    meta.append(f"헤더: {ts.header_row_count}행")
+                    if ts.numeric_columns:
+                        meta.append(f"숫자 컬럼: {len(ts.numeric_columns)}개")
+                    if ts.has_total_row:
+                        meta.append(f"합계 행: {ts.total_row_index + 1}행")
+                    if ts.unit_multiplier > 1:
+                        meta.append(f"단위 배수: x{ts.unit_multiplier:,.0f}")
+                    st.caption(" | ".join(meta))
+
+                    for w in ts.warnings:
+                        st.warning(w, icon="⚠️")
+
                     if ts.dataframe is not None:
                         st.dataframe(ts.dataframe, use_container_width=True, height=min(200, 35 * (ts.num_rows + 1)))
                     st.divider()
@@ -190,6 +197,14 @@ if uploaded_files:
             st.write(chat['question'])
         with st.chat_message("assistant"):
             st.markdown(chat['answer'])
+            if chat.get('chart_data'):
+                chart = chat['chart_data']
+                title = chart.get('title', '')
+                unit = chart.get('unit', '')
+                caption = f"{title} ({unit})" if unit else title
+                if caption:
+                    st.caption(caption)
+                st.bar_chart(chart['data'])
             meta_parts = []
             if chat.get('source'):
                 meta_parts.append(chat['source'])
@@ -248,6 +263,15 @@ if uploaded_files:
             else:
                 st.markdown(result.get('answer', '답변을 생성하지 못했습니다.'))
 
+            if result.get('chart_data'):
+                chart = result['chart_data']
+                title = chart.get('title', '')
+                unit = chart.get('unit', '')
+                caption = f"{title} ({unit})" if unit else title
+                if caption:
+                    st.caption(caption)
+                st.bar_chart(chart['data'])
+
             meta_parts = []
             if result.get('source'):
                 meta_parts.append(result['source'])
@@ -267,6 +291,7 @@ if uploaded_files:
             'elapsed': result.get('elapsed'),
             'prompt_tokens': result.get('prompt_tokens'),
             'completion_tokens': result.get('completion_tokens'),
+            'chart_data': result.get('chart_data'),
         })
 
     if st.session_state.chat_history:

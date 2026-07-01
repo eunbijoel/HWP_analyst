@@ -43,6 +43,10 @@ class TableSummary:
     dataframe: Optional[pd.DataFrame] = None
     preview: str = ""
     document_id: str = ""
+    confidence: float = 1.0
+    warnings: list = field(default_factory=list)
+    header_row_count: int = 1
+    unit_multiplier: float = 1.0
 
 
 # 숫자 탐지 패턴
@@ -93,9 +97,10 @@ def extract_tables(parsed_doc, document_id: str = "") -> list[TableSummary]:
         if not rows:
             continue
 
-        df, unit_from_row = _rows_to_dataframe(rows)
+        df, unit_from_row, header_count = _rows_to_dataframe(rows)
 
         unit = raw_table.get('unit', '') or unit_from_row
+        multiplier = UNIT_MULTIPLIERS.get(unit, 1.0)
 
         summary = TableSummary(
             index=idx,
@@ -104,6 +109,8 @@ def extract_tables(parsed_doc, document_id: str = "") -> list[TableSummary]:
             num_rows=df.shape[0] if df is not None else len(rows),
             num_cols=df.shape[1] if df is not None else (max(len(r) for r in rows) if rows else 0),
             document_id=document_id,
+            header_row_count=header_count,
+            unit_multiplier=float(multiplier),
         )
 
         summary.dataframe = df
@@ -115,6 +122,9 @@ def extract_tables(parsed_doc, document_id: str = "") -> list[TableSummary]:
             summary.year_columns = _find_year_columns(df)
             summary.has_total_row, summary.total_row_index = _find_total_row(df)
             summary.preview = df.head(5).to_string(index=False)
+
+        summary.confidence, summary.warnings = _calculate_confidence(
+            df, summary.headers, summary.numeric_columns)
 
         summaries.append(summary)
 
@@ -132,10 +142,98 @@ def _is_unit_row(row: list) -> tuple[bool, str]:
     return False, ""
 
 
-def _rows_to_dataframe(rows: list) -> tuple[Optional[pd.DataFrame], str]:
-    """표 행 데이터를 DataFrame으로 변환. (df, unit_from_row) 반환"""
+def _detect_header_rows(normalized: list, header_start: int) -> int:
+    """다중 헤더 행 감지. 연속으로 헤더 조건을 만족하는 행 수 반환."""
+    remaining_data = len(normalized) - header_start
+    if remaining_data < 3:
+        return 1
+
+    count = 0
+    for i in range(header_start, min(header_start + 3, len(normalized))):
+        row = normalized[i]
+        non_empty = [str(c).strip() for c in row if str(c).strip()]
+        if not non_empty:
+            break
+        numeric_count = sum(1 for c in non_empty
+                           if _is_number(c.replace(',', '').replace(' ', '')))
+        avg_len = sum(len(c) for c in non_empty) / len(non_empty)
+        if numeric_count / len(non_empty) < 0.3 and avg_len < 20:
+            count += 1
+        else:
+            break
+
+    if len(normalized) - header_start - count < 1:
+        return 1
+
+    return max(1, count)
+
+
+def _merge_header_rows(header_rows: list) -> list[str]:
+    """다중 헤더 행을 '_'로 병합.
+    최상위 행: 빈 셀은 왼쪽 값으로 forward-fill (병합 셀 복원).
+    하위 행: 상위 행이 같은 그룹(같은 값)일 때만 forward-fill."""
+    num_cols = len(header_rows[0])
+
+    top_row = [str(c).strip() for c in header_rows[0]]
+    for i in range(1, num_cols):
+        if not top_row[i]:
+            top_row[i] = top_row[i - 1]
+
+    filled_rows = [top_row]
+    for row in header_rows[1:]:
+        filled = [str(c).strip() for c in row]
+        for i in range(1, min(num_cols, len(filled))):
+            if not filled[i] and top_row[i] == top_row[i - 1]:
+                filled[i] = filled[i - 1]
+        filled_rows.append(filled)
+
+    merged = []
+    for col_idx in range(num_cols):
+        parts = []
+        for filled in filled_rows:
+            val = filled[col_idx] if col_idx < len(filled) else ''
+            if val and val not in parts:
+                parts.append(val)
+        merged.append('_'.join(parts) if parts else f'열{col_idx + 1}')
+
+    return merged
+
+
+def _calculate_confidence(df: Optional[pd.DataFrame], headers: list,
+                          numeric_cols: list) -> tuple[float, list]:
+    """표 품질 신뢰도 계산. (score, warnings) 반환."""
+    score = 1.0
+    warnings = []
+
+    auto_count = sum(1 for h in headers if re.match(r'^열\d+$', str(h)))
+    if headers and auto_count / len(headers) > 0.5:
+        score -= 0.3
+        warnings.append("헤더 인식 실패 가능성 (자동 생성 헤더 많음)")
+
+    if df is not None and not df.empty:
+        total_cells = df.shape[0] * df.shape[1]
+        if total_cells > 0:
+            empty = sum(1 for col in df.columns
+                        for val in df[col] if not str(val).strip())
+            if empty / total_cells > 0.5:
+                score -= 0.2
+                warnings.append("빈 셀 비율 높음 (50% 이상)")
+
+        if df.shape[0] <= 1:
+            score -= 0.1
+            warnings.append("데이터 행 부족 (1행 이하)")
+
+    if not numeric_cols:
+        score -= 0.1
+        warnings.append("숫자 컬럼 없음")
+
+    return round(max(0.0, min(1.0, score)), 2), warnings
+
+
+def _rows_to_dataframe(rows: list) -> tuple[Optional[pd.DataFrame], str, int]:
+    """표 행 데이터를 DataFrame으로 변환. (df, unit_from_row, header_count) 반환"""
     if not rows:
-        return None, ""
+        return None, "", 1
 
     unit_from_row = ""
 
@@ -145,7 +243,6 @@ def _rows_to_dataframe(rows: list) -> tuple[Optional[pd.DataFrame], str]:
         padded = r + [''] * (max_cols - len(r))
         normalized.append(padded)
 
-    # 첫 행이 단위 정보만 담고 있으면 건너뛰기
     header_start = 0
     is_unit, unit_val = _is_unit_row(normalized[0])
     if is_unit and len(normalized) >= 3:
@@ -153,11 +250,17 @@ def _rows_to_dataframe(rows: list) -> tuple[Optional[pd.DataFrame], str]:
         header_start = 1
 
     if len(normalized) - header_start >= 2:
-        headers = normalized[header_start]
+        header_count = _detect_header_rows(normalized, header_start)
+
+        if header_count > 1:
+            header_rows = normalized[header_start:header_start + header_count]
+            raw_headers = _merge_header_rows(header_rows)
+        else:
+            raw_headers = [str(h).strip() if h else '' for h in normalized[header_start]]
+
         seen = {}
         unique_headers = []
-        for h in headers:
-            h = str(h).strip() if h else ''
+        for h in raw_headers:
             if not h:
                 h = f'열{len(unique_headers)+1}'
             if h in seen:
@@ -167,12 +270,13 @@ def _rows_to_dataframe(rows: list) -> tuple[Optional[pd.DataFrame], str]:
                 seen[h] = 0
             unique_headers.append(h)
 
-        data = normalized[header_start + 1:]
+        data = normalized[header_start + header_count:]
         df = pd.DataFrame(data, columns=unique_headers)
     else:
         df = pd.DataFrame(normalized)
+        header_count = 0
 
-    return df, unit_from_row
+    return df, unit_from_row, header_count
 
 
 def _find_numeric_columns(df: pd.DataFrame) -> list:
