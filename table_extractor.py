@@ -280,15 +280,12 @@ def _rows_to_dataframe(rows: list) -> tuple[Optional[pd.DataFrame], str, int]:
 
 
 def _find_numeric_columns(df: pd.DataFrame) -> list:
-    """숫자가 주로 들어있는 컬럼 찾기"""
     numeric_cols = []
     for col in df.columns:
         values = df[col].astype(str)
         numeric_count = 0
         for v in values:
-            cleaned = v.replace(',', '').replace(' ', '').strip()
-            cleaned = re.sub(r'[원천만백억조%]', '', cleaned)
-            if cleaned and _is_number(cleaned):
+            if v.strip() and _is_number(v):
                 numeric_count += 1
         if numeric_count > len(values) * 0.3:
             numeric_cols.append(str(col))
@@ -336,13 +333,32 @@ def _find_total_row(df: pd.DataFrame) -> tuple[bool, int]:
     return False, -1
 
 
+FULLWIDTH_TABLE = str.maketrans(
+    '０１２３４５６７８９．，　',
+    '0123456789., ',
+)
+
+
+def _normalize_number_str(s: str) -> str:
+    s = s.translate(FULLWIDTH_TABLE)
+    s = s.replace(' ', ' ').replace(' ', '').replace(' ', '')
+    s = s.replace(',', '').replace(' ', '').strip()
+    if s.startswith('(') and s.endswith(')'):
+        inner = s[1:-1].strip()
+        if inner and all(c in '0123456789.' for c in inner):
+            s = '-' + inner
+    s = re.sub(r'[원천만백억조%명개건호]', '', s)
+    if s.startswith('△') or s.startswith('▲'):
+        s = '-' + s[1:]
+    return s
+
+
 def _is_number(s: str) -> bool:
-    """문자열이 숫자인지 확인"""
     try:
-        s = s.replace(',', '').strip()
-        if s.endswith('%'):
-            s = s[:-1]
-        float(s)
+        cleaned = _normalize_number_str(s)
+        if not cleaned:
+            return False
+        float(cleaned)
         return True
     except ValueError:
         return False
@@ -502,14 +518,28 @@ def detect_numbers_in_tables(table_summaries: list[TableSummary], document_id: s
     return results
 
 
-def compute_column_sum(df: pd.DataFrame, col_name: str) -> Optional[float]:
-    """컬럼의 숫자 합계 계산"""
+TOTAL_ROW_PATTERN = re.compile(
+    r'^(' + '|'.join(TOTAL_KEYWORDS) + r')$', re.IGNORECASE
+)
+
+
+def _is_total_row(df: pd.DataFrame, row_idx: int) -> bool:
+    for col in df.columns[:3]:
+        val = str(df.at[row_idx, col]).strip()
+        if TOTAL_ROW_PATTERN.match(val):
+            return True
+    return False
+
+
+def compute_column_sum(df: pd.DataFrame, col_name: str,
+                       exclude_totals: bool = True) -> Optional[float]:
     total = 0.0
     count = 0
-    for val in df[col_name]:
-        cleaned = str(val).replace(',', '').strip()
-        cleaned = re.sub(r'[원천만백억조]', '', cleaned)
-        if _is_number(cleaned):
+    for idx, val in df[col_name].items():
+        if exclude_totals and _is_total_row(df, idx):
+            continue
+        cleaned = _normalize_number_str(str(val))
+        if cleaned:
             try:
                 total += float(cleaned)
                 count += 1
@@ -530,9 +560,8 @@ def find_max_value_in_table(ts: TableSummary) -> Optional[dict]:
         if col not in ts.dataframe.columns:
             continue
         for row_idx, val in ts.dataframe[col].items():
-            cleaned = str(val).replace(',', '').strip()
-            cleaned = re.sub(r'[원천만백억조]', '', cleaned)
-            if _is_number(cleaned):
+            cleaned = _normalize_number_str(str(val))
+            if cleaned:
                 try:
                     num = float(cleaned)
                     if max_val is None or num > max_val:

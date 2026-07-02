@@ -15,7 +15,7 @@ import pandas as pd
 from typing import Optional
 from table_extractor import (
     TableSummary, NumberInfo, BUDGET_KEYWORDS, TOTAL_KEYWORDS,
-    UNIT_MULTIPLIERS,
+    UNIT_MULTIPLIERS, _normalize_number_str,
     compute_column_sum, find_max_value_in_table, filter_table_by_year,
 )
 
@@ -60,8 +60,9 @@ def _format_value_with_unit(raw_val: str, numeric_val: Optional[float], unit: st
 def _parse_number(s: str) -> Optional[float]:
     if not s or s.strip() in ('-', '', '*자본잠식', '해당없음', '산출 불가'):
         return None
-    cleaned = str(s).replace(',', '').replace(' ', '').strip()
-    cleaned = re.sub(r'[천만백억조원%명개]', '', cleaned)
+    cleaned = _normalize_number_str(str(s))
+    if not cleaned:
+        return None
     try:
         return float(cleaned)
     except ValueError:
@@ -96,29 +97,34 @@ class QAEngine:
 
     def answer(self, question: str, use_llm: bool = False,
                model: str = "gemma4", ollama_url: str = "http://localhost:11434",
-               stream: bool = False, stage1_model: str = "gemma3:4b") -> dict:
+               stream: bool = False, stage1_model: str = "gemma3:4b",
+               history: list = None) -> dict:
         # Stage 1: LLM 기반 intent/entity 추출
         stage1_result = None
         if use_llm:
             stage1_result = self._stage1_analyze(question, model=stage1_model,
-                                                  ollama_url=ollama_url)
+                                                  ollama_url=ollama_url,
+                                                  history=history)
 
-        # 차트 요청 여부 확인
         wants_chart = any(kw in question for kw in CHART_KEYWORDS)
-
-        # LLM pandas 코드 생성 시도 → 실패시 기존 pre-compute fallback
         chart_data = None
-        pandas_result = None
-        if use_llm:
+        pre_computed = ""
+
+        # 신뢰도 순서: 직접 매칭 → 규칙기반 → pandas codegen
+        # Step 1: Stage1 엔티티 기반 직접 교차 조회 (가장 신뢰도 높음)
+        if stage1_result and (stage1_result['entities'] or stage1_result['metrics']):
+            pre_computed, chart_data = self._pre_compute_with_stage1(question, stage1_result)
+
+        # Step 2: 키워드 기반 규칙 매칭
+        if not pre_computed:
+            pre_computed, chart_data = self._pre_compute_analysis(question)
+
+        # Step 3: pandas 코드 생성 (복잡한 질문에 대한 최후 수단)
+        if not pre_computed and use_llm:
             pandas_result = self._try_pandas_code_gen(question, model=stage1_model,
                                                        ollama_url=ollama_url)
-
-        if pandas_result:
-            pre_computed = pandas_result
-        elif stage1_result and (stage1_result['entities'] or stage1_result['metrics']):
-            pre_computed, chart_data = self._pre_compute_with_stage1(question, stage1_result)
-        else:
-            pre_computed, chart_data = self._pre_compute_analysis(question)
+            if pandas_result:
+                pre_computed = pandas_result
 
         # Rule-based 답변
         if stage1_result and stage1_result.get('intent'):
@@ -136,10 +142,12 @@ class QAEngine:
         if use_llm:
             if stream:
                 result = self._llm_answer_stream(question, model, ollama_url,
-                                                 rule_result, pre_computed)
+                                                 rule_result, pre_computed,
+                                                 history=history)
             else:
                 result = self._llm_answer(question, model, ollama_url,
-                                          rule_result, pre_computed)
+                                          rule_result, pre_computed,
+                                          history=history)
             if chart_data:
                 result['chart_data'] = chart_data
             return result
@@ -162,8 +170,23 @@ class QAEngine:
     # Stage 1: 소형 모델 의도/엔티티 추출
     # =========================================================
 
+    def _format_history(self, history: list) -> str:
+        if not history:
+            return ""
+        recent = history[-3:]
+        lines = []
+        for chat in recent:
+            q = chat.get('question', '')
+            a = chat.get('answer', '')
+            if len(a) > 200:
+                a = a[:200] + '...'
+            lines.append(f"사용자: {q}")
+            lines.append(f"답변: {a}")
+        return '\n'.join(lines)
+
     def _stage1_analyze(self, question: str, model: str = "gemma3:4b",
-                        ollama_url: str = "http://localhost:11434") -> Optional[dict]:
+                        ollama_url: str = "http://localhost:11434",
+                        history: list = None) -> Optional[dict]:
         header_names = []
         for ts in self.tables:
             for h in ts.headers:
@@ -177,6 +200,11 @@ class QAEngine:
             '연구개발비', '사업비', '예산', '이자보상비율', '종업원수',
         ]
 
+        history_section = ""
+        if history:
+            history_text = self._format_history(history)
+            history_section = f"\n이전 대화:\n{history_text}\n"
+
         prompt = f"""질문에서 엔티티와 지표를 추출하세요.
 
 규칙:
@@ -184,10 +212,11 @@ class QAEngine:
 - metrics: 질문에 직접 언급된 지표만. 질문에 없는 지표는 절대 추가하지 마세요.
 - intent: 반드시 하나만 선택 (lookup, sum, max, filter, compare, summary 중 하나)
 - years: 질문에 명시된 연도 숫자만. "1년차"는 연도가 아닙니다.
+- 이전 대화에서 언급된 엔티티/지표가 현재 질문에서 생략("거기", "그것", "앞에서 말한")되었으면 이전 대화에서 찾아 포함하세요.
 
 헤더 목록: {header_names[:30]}
 지표 목록: {', '.join(metric_list)}
-
+{history_section}
 질문: {question}
 
 JSON만 출력:
@@ -1065,13 +1094,19 @@ JSON만 출력:
     # =========================================================
 
     def _llm_answer(self, question: str, model: str, ollama_url: str,
-                    rule_result: dict, pre_computed: str) -> dict:
+                    rule_result: dict, pre_computed: str,
+                    history: list = None) -> dict:
         context = self._build_context(question)
         rule_hint = rule_result.get('answer', '')
 
         pre_section = ""
         if pre_computed:
             pre_section = f"\n## 사전 계산 결과 (프로그래밍으로 정확히 계산됨 — 이 결과를 신뢰하세요):\n{pre_computed}\n"
+
+        history_section = ""
+        if history:
+            history_text = self._format_history(history)
+            history_section = f"\n## 이전 대화 (맥락 참고용):\n{history_text}\n"
 
         prompt = f"""{SYSTEM_PROMPT}
 
@@ -1081,7 +1116,7 @@ JSON만 출력:
 {pre_section}
 ## Rule-based 사전 분석:
 {rule_hint}
-
+{history_section}
 ## 사용자 질문:
 {question}
 
@@ -1155,13 +1190,19 @@ JSON만 출력:
             }
 
     def _llm_answer_stream(self, question: str, model: str, ollama_url: str,
-                           rule_result: dict, pre_computed: str) -> dict:
+                           rule_result: dict, pre_computed: str,
+                           history: list = None) -> dict:
         context = self._build_context(question)
         rule_hint = rule_result.get('answer', '')
 
         pre_section = ""
         if pre_computed:
             pre_section = f"\n## 사전 계산 결과 (프로그래밍으로 정확히 계산됨 — 이 결과를 신뢰하세요):\n{pre_computed}\n"
+
+        history_section = ""
+        if history:
+            history_text = self._format_history(history)
+            history_section = f"\n## 이전 대화 (맥락 참고용):\n{history_text}\n"
 
         prompt = f"""{SYSTEM_PROMPT}
 
@@ -1171,6 +1212,7 @@ JSON만 출력:
 {pre_section}
 ## Rule-based 사전 분석:
 {rule_hint}
+{history_section}
 
 ## 사용자 질문:
 {question}

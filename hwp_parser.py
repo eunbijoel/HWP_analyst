@@ -261,31 +261,78 @@ def _parse_table_element(tbl_elem) -> dict:
             max_row = max(max_row, row_cnt)
 
         grid = [[''] * max_col for _ in range(max_row)]
+        merge_owner = [[None] * max_col for _ in range(max_row)]
         for row_idx, col_idx, col_span, row_span, text in cells:
             if row_idx < max_row and col_idx < max_col:
                 grid[row_idx][col_idx] = text
-                # rowSpan > 1인 경우 병합 셀의 첫 열에 텍스트 전파
                 for r in range(row_idx, min(row_idx + row_span, max_row)):
                     for c in range(col_idx, min(col_idx + col_span, max_col)):
+                        merge_owner[r][c] = (row_idx, col_idx)
                         if r == row_idx and c == col_idx:
                             continue
                         if not grid[r][c]:
-                            grid[r][c] = ''
+                            grid[r][c] = text
 
         rows = [row for row in grid if any(cell.strip() for cell in row)]
         return {'rows': rows, 'caption': '', 'unit': ''}
 
-    # fallback: cellAddr가 없는 경우 기존 방식
-    rows = []
+    # fallback: cellAddr가 없는 경우 — span 속성 활용 그리드 구축
+    raw_cells = []
+    fb_row_idx = 0
     for child in tbl_elem:
         tag = _local_tag(child.tag)
-        if tag in ('tr', 'row'):
-            row = []
-            for cell_elem in child:
-                cell_tag = _local_tag(cell_elem.tag)
-                if cell_tag in ('tc', 'cell', 'td'):
-                    cell_text = _get_cell_text(cell_elem)
-                    row.append(cell_text)
+        if tag not in ('tr', 'row'):
+            continue
+        fb_col_idx = 0
+        for cell_elem in child:
+            cell_tag = _local_tag(cell_elem.tag)
+            if cell_tag not in ('tc', 'cell', 'td'):
+                continue
+            cell_text = _get_cell_text(cell_elem)
+            cs = int(cell_elem.get('colSpan', '1') or '1')
+            rs = int(cell_elem.get('rowSpan', '1') or '1')
+            raw_cells.append((fb_row_idx, fb_col_idx, cs, rs, cell_text))
+            fb_col_idx += 1
+        fb_row_idx += 1
+
+    if not raw_cells:
+        return {'rows': [], 'caption': '', 'unit': ''}
+
+    has_span = any(cs > 1 or rs > 1 for _, _, cs, rs, _ in raw_cells)
+    if has_span:
+        fb_max_row = max(r + rs for r, _, _, rs, _ in raw_cells)
+        fb_max_col = max(col_cnt, max(c + cs for _, c, cs, _, _ in raw_cells))
+        if row_cnt > 0:
+            fb_max_row = max(fb_max_row, row_cnt)
+        grid = [[''] * fb_max_col for _ in range(fb_max_row)]
+        occupied = [[False] * fb_max_col for _ in range(fb_max_row)]
+
+        cur_row = 0
+        row_cells = {}
+        for r, c, cs, rs, text in raw_cells:
+            row_cells.setdefault(r, []).append((c, cs, rs, text))
+
+        for r_idx in sorted(row_cells.keys()):
+            col_cursor = 0
+            for _, cs, rs, text in row_cells[r_idx]:
+                while col_cursor < fb_max_col and occupied[r_idx][col_cursor]:
+                    col_cursor += 1
+                if col_cursor >= fb_max_col:
+                    break
+                for dr in range(rs):
+                    for dc in range(cs):
+                        rr = r_idx + dr
+                        cc = col_cursor + dc
+                        if rr < fb_max_row and cc < fb_max_col:
+                            occupied[rr][cc] = True
+                            grid[rr][cc] = text
+                col_cursor += cs
+
+        rows = [row for row in grid if any(cell.strip() for cell in row)]
+    else:
+        rows = []
+        for r_idx in sorted(set(r for r, _, _, _, _ in raw_cells)):
+            row = [text for r, _, _, _, text in raw_cells if r == r_idx]
             if row:
                 rows.append(row)
 

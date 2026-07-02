@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hwp_parser import parse_document
 from table_extractor import extract_tables, detect_numbers_in_text, detect_numbers_in_tables
 from qa_engine import QAEngine, check_ollama_status
+from hwpx_editor import HWPXEditor
 
 
 st.set_page_config(page_title="HWP 문서 분석기", page_icon="📄", layout="wide")
@@ -139,40 +140,120 @@ if uploaded_files:
     with col4:
         st.metric("탐지된 숫자", total_numbers)
 
-    # 추출된 표 진단
-    if total_tables > 0:
-        with st.expander(f"추출된 표 진단 ({total_tables}개)", expanded=False):
-            for doc_data in all_documents:
-                if len(all_documents) > 1:
-                    st.subheader(f"{doc_data['id']}")
-                for ts in doc_data['tables']:
-                    unit_info = f" [단위: {ts.unit}]" if ts.unit else ""
-                    caption_info = f" - {ts.caption}" if ts.caption else ""
-                    st.markdown(f"**표 {ts.index+1}{caption_info}{unit_info}** ({ts.num_rows}행 x {ts.num_cols}열)")
+    # --- 문서 편집 (HWPX만) ---
+    hwpx_files = [(uf, uf.name) for uf in uploaded_files if uf.name.lower().endswith('.hwpx')]
 
-                    if ts.confidence >= 0.7:
-                        badge = f"🟢 신뢰도: 높음 ({ts.confidence})"
-                    elif ts.confidence >= 0.4:
-                        badge = f"🟡 신뢰도: 보통 ({ts.confidence})"
-                    else:
-                        badge = f"🔴 신뢰도: 낮음 ({ts.confidence})"
+    if hwpx_files:
+        with st.expander("문서 편집 (찾기/바꾸기, 표 수정)", expanded=False):
+            for uf, fname in hwpx_files:
+                uf.seek(0)
+                edit_file_bytes = uf.read()
+                editor_key = f"editor_{fname}"
+                if editor_key not in st.session_state:
+                    st.session_state[editor_key] = HWPXEditor(edit_file_bytes)
 
-                    meta = [badge]
-                    meta.append(f"헤더: {ts.header_row_count}행")
-                    if ts.numeric_columns:
-                        meta.append(f"숫자 컬럼: {len(ts.numeric_columns)}개")
-                    if ts.has_total_row:
-                        meta.append(f"합계 행: {ts.total_row_index + 1}행")
-                    if ts.unit_multiplier > 1:
-                        meta.append(f"단위 배수: x{ts.unit_multiplier:,.0f}")
-                    st.caption(" | ".join(meta))
+                editor = st.session_state[editor_key]
 
-                    for w in ts.warnings:
-                        st.warning(w, icon="⚠️")
+                if len(hwpx_files) > 1:
+                    st.subheader(fname)
 
-                    if ts.dataframe is not None:
-                        st.dataframe(ts.dataframe, use_container_width=True, height=min(200, 35 * (ts.num_rows + 1)))
+                # 찾기 / 바꾸기
+                col_find, col_replace, col_btn = st.columns([2, 2, 1])
+                with col_find:
+                    find_text = st.text_input("찾을 텍스트", key=f"find_{fname}")
+                with col_replace:
+                    replace_text = st.text_input("바꿀 텍스트", key=f"replace_{fname}")
+                with col_btn:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("전체 바꾸기", key=f"replaceall_{fname}", use_container_width=True):
+                        if find_text and replace_text:
+                            count = editor.replace_all(find_text, replace_text)
+                            if count > 0:
+                                st.success(f"{count}건 수정 (합계 자동 재계산 완료)")
+                            else:
+                                st.info("일치 항목 없음")
+                        else:
+                            st.warning("찾을/바꿀 텍스트를 입력하세요.")
+
+                # 표별 편집 (표마다 접을 수 있는 상세)
+                table_count = editor.get_table_count()
+                if table_count > 0:
                     st.divider()
+                    for t_idx in range(table_count):
+                        rows = editor.get_table_as_rows(t_idx)
+                        if not rows or len(rows) < 2:
+                            continue
+
+                        caption = ""
+                        for doc_data in all_documents:
+                            for ts in doc_data['tables']:
+                                if ts.index == t_idx:
+                                    caption = ts.caption or ""
+                                    break
+
+                        expander_label = f"표 {t_idx + 1}"
+                        if caption:
+                            expander_label += f" — {caption}"
+                        expander_label += f" ({len(rows) - 1}행)"
+
+                        with st.expander(expander_label, expanded=False):
+                            headers = list(rows[0])
+                            data_rows = rows[1:]
+                            seen = {}
+                            for i, h in enumerate(headers):
+                                h = h.strip() if h else ""
+                                if not h:
+                                    h = f"열{i+1}"
+                                if h in seen:
+                                    seen[h] += 1
+                                    headers[i] = f"{h}_{seen[h]}"
+                                else:
+                                    seen[h] = 0
+                                    headers[i] = h
+                            df = pd.DataFrame(data_rows, columns=headers)
+
+                            edited_df = st.data_editor(
+                                df, use_container_width=True, num_rows="fixed",
+                                key=f"edit_table_{fname}_{t_idx}",
+                            )
+
+                            if st.button("적용 + 합계 재계산", key=f"apply_{fname}_{t_idx}", use_container_width=True):
+                                changes = 0
+                                for r_idx in range(len(edited_df)):
+                                    for c_idx in range(len(edited_df.columns)):
+                                        new_val = str(edited_df.iloc[r_idx, c_idx])
+                                        old_val = data_rows[r_idx][c_idx] if r_idx < len(data_rows) and c_idx < len(data_rows[r_idx]) else ""
+                                        if new_val != old_val:
+                                            editor.edit_table_cell(t_idx, r_idx + 1, c_idx, new_val)
+                                            changes += 1
+                                if changes > 0:
+                                    editor.recalculate_totals(t_idx)
+                                    st.success(f"{changes}개 셀 수정 + 합계 재계산 완료")
+                                else:
+                                    st.info("변경된 셀이 없습니다.")
+
+                # 수정 이력 (접을 수 있는 드롭다운)
+                if editor.edit_log:
+                    with st.expander(f"변경 기록 ({len(editor.edit_log)}건)", expanded=False):
+                        for log in editor.edit_log:
+                            st.caption(f"[{log.action}] {log.detail}")
+
+        # 다운로드 버튼은 expander 바깥에 항상 노출
+        for uf, fname in hwpx_files:
+            editor_key = f"editor_{fname}"
+            if editor_key in st.session_state:
+                editor = st.session_state[editor_key]
+                edited_bytes = editor.save()
+                base_name = os.path.splitext(fname)[0]
+                btn_label = f"수정된 파일 다운로드: {base_name}_edited.hwpx" if editor.edit_log else f"현재 파일 다운로드: {fname}"
+                st.download_button(
+                    label=btn_label,
+                    data=edited_bytes,
+                    file_name=f"{base_name}_edited.hwpx",
+                    mime="application/octet-stream",
+                    key=f"download_{fname}",
+                    type="primary" if editor.edit_log else "secondary",
+                )
 
     # --- 채팅 ---
     st.divider()
@@ -224,6 +305,8 @@ if uploaded_files:
         with st.chat_message("assistant"):
             should_stream = use_llm and use_streaming
 
+            chat_history = st.session_state.get('chat_history', [])
+
             if use_llm and not should_stream:
                 with st.spinner(f"{model_name} 분석 중..."):
                     result = qa_engine.answer(
@@ -233,6 +316,7 @@ if uploaded_files:
                         ollama_url=ollama_url,
                         stream=False,
                         stage1_model=stage1_model,
+                        history=chat_history,
                     )
             else:
                 if not use_llm:
@@ -244,6 +328,7 @@ if uploaded_files:
                             ollama_url=ollama_url,
                             stream=False,
                             stage1_model=stage1_model,
+                            history=chat_history,
                         )
                 else:
                     result = qa_engine.answer(
@@ -253,6 +338,7 @@ if uploaded_files:
                         ollama_url=ollama_url,
                         stream=True,
                         stage1_model=stage1_model,
+                        history=chat_history,
                     )
 
             if 'answer_stream' in result:
