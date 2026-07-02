@@ -2,40 +2,72 @@
 HWPX 문서 편집 모듈
 - 원본 ZIP 내 section XML을 인플레이스 수정하여 서식 보존
 - 찾기/바꾸기, 표 셀 편집, 합계 재계산 지원
-- 수정된 셀은 빨간색 텍스트로 표시
+- AI 편집용: 빈칸 감지, 변경 제안(diff), Track Changes 스타일, 선택 영역 편집
 """
 
 import copy
 import io
 import re
+import uuid
 import zipfile
 from xml.etree import ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Optional
 
-
+from table_grid import (
+    parse_table_grid, is_inside_table, local_tag, build_element_grid,
+)
 TOTAL_KEYWORDS = ['합계', '총계', '소계', '계', '합', '총', 'total', 'sum', '전체']
-RED_COLOR = '#FF0000'  # HWPX RGBColorType: #RRGGBB (10진수 아님)
+RED_COLOR = '#FF0000'
+GREEN_COLOR = '#008800'
+PLACEHOLDER_RE = re.compile(
+    r'^[\s□○●◎◇◆▪▫·\-_=…\.…\(\)（）\[\]【】<>〈〉\'\"`~]*$'
+    r'|^(입력|기재|작성|해당\s*없음|n/?a|tbd|미정|예시|ex\)|예\))[\s\.]*$',
+    re.IGNORECASE,
+)
+PLACEHOLDER_SUBSTR = ('○○', '□□', '___', '...', '···', '　　', '  ')
 
 
 @dataclass
-class FindResult:
-    section_file: str
-    element_path: str
-    original_text: str
+class BlankField:
+    field_type: str  # 'cell' | 'paragraph'
+    location: str
     context: str
+    current_text: str
+    table_index: Optional[int] = None
+    row: Optional[int] = None
+    col: Optional[int] = None
+    paragraph_index: Optional[int] = None
+    section_file: Optional[str] = None
 
 
 @dataclass
-class EditLog:
-    action: str
-    detail: str
+class PendingChange:
+    id: str
+    change_type: str  # 'cell' | 'paragraph' | 'replace'
+    location: str
+    old_text: str
+    new_text: str
+    status: str = 'pending'  # pending | accepted | rejected
+    table_index: Optional[int] = None
+    row: Optional[int] = None
+    col: Optional[int] = None
+    paragraph_index: Optional[int] = None
+    section_file: Optional[str] = None
+    search_hint: str = ''
 
 
-def _local_tag(tag: str) -> str:
-    if '}' in tag:
-        return tag.split('}')[-1]
-    return tag
+@dataclass
+class AppliedHighlight:
+    """미리보기용 — 화면에 반영된 수정 위치 기록."""
+    change_type: str
+    location: str
+    old_text: str
+    new_text: str
+    table_index: Optional[int] = None
+    row: Optional[int] = None
+    col: Optional[int] = None
+    paragraph_index: Optional[int] = None
 
 
 def _register_namespaces(xml_bytes: bytes):
@@ -61,6 +93,35 @@ def _parse_number(s: str) -> Optional[float]:
         return float(s)
     except ValueError:
         return None
+
+
+def _normalize_value(s: str) -> str:
+    return re.sub(r'[\s,]', '', str(s).strip())
+
+
+def _cell_contains_value(cell: str, value: str) -> bool:
+    cv = _normalize_value(cell)
+    vv = _normalize_value(value)
+    if not vv:
+        return False
+    return cv == vv or vv in cv
+
+
+def _format_replacement(cell: str, old_val: str, new_val: str) -> str:
+    """셀 텍스트에서 old→new 치환. 숫자면 콤마 서식 유지."""
+    if _normalize_value(cell) == _normalize_value(old_val):
+        ref = cell if _normalize_value(cell) else old_val
+        if ',' in ref and re.fullmatch(r'[\d,\.]+', _normalize_value(new_val)):
+            try:
+                n = float(_normalize_value(new_val))
+                if n == int(n):
+                    return f"{int(n):,}"
+            except ValueError:
+                pass
+        return new_val
+    if old_val in cell:
+        return cell.replace(old_val, new_val, 1)
+    return new_val
 
 
 def _format_number(value: float, reference: str) -> str:
@@ -94,9 +155,17 @@ class HWPXEditor:
         self.zip_contents: dict[str, bytes] = {}
         self.section_trees: dict[str, ET.Element] = {}
         self.section_xml_bytes: dict[str, bytes] = {}
-        self.edit_log: list[EditLog] = []
+        self.pending_changes: list[PendingChange] = []
+        self.applied_highlights: list[AppliedHighlight] = []
+        self.preview_revision: int = 0
+        self._blocks_cache: Optional[list] = None
+        self._paragraphs_cache: Optional[list] = None
+        self._saved_bytes_cache: Optional[bytes] = None
+        self._saved_bytes_rev: int = -1
         self._modified_runs: set = set()
-        self._red_charpr_cache: dict[str, str] = {}  # base charPr id → red charPr id
+        self._red_charpr_cache: dict[str, str] = {}
+        self._green_charpr_cache: dict[str, str] = {}
+        self._strike_charpr_cache: dict[str, str] = {}
         self._header_modified: bool = False
         self._header_file: Optional[str] = None
         self._header_tree: Optional[ET.Element] = None
@@ -154,7 +223,7 @@ class HWPXEditor:
         if self._header_tree is None:
             return None
         for elem in self._header_tree.iter():
-            if _local_tag(elem.tag) == 'charProperties':
+            if local_tag(elem.tag) == 'charProperties':
                 return elem
         return None
 
@@ -162,7 +231,7 @@ class HWPXEditor:
         if self._header_tree is None:
             return None
         for elem in self._header_tree.iter():
-            if _local_tag(elem.tag) == 'charPr' and elem.get('id') == charpr_id:
+            if local_tag(elem.tag) == 'charPr' and elem.get('id') == charpr_id:
                 return elem
         return None
 
@@ -171,14 +240,17 @@ class HWPXEditor:
         if self._header_tree is None:
             return 0
         for elem in self._header_tree.iter():
-            if _local_tag(elem.tag) == 'charPr':
+            if local_tag(elem.tag) == 'charPr':
                 max_id = max(max_id, int(elem.get('id', '0')))
         return max_id
 
-    def _get_or_create_red_charpr(self, base_charpr_id: str) -> Optional[str]:
-        """원본 charPr를 복사해 textColor만 빨간색으로 — 폰트 등 나머지 서식 유지."""
-        if base_charpr_id in self._red_charpr_cache:
-            return self._red_charpr_cache[base_charpr_id]
+    def _get_or_create_styled_charpr(self, base_charpr_id: str, *,
+                                     color: Optional[str] = None,
+                                     strikeout: bool = False,
+                                     cache: dict) -> Optional[str]:
+        cache_key = f"{base_charpr_id}|{color}|{strikeout}"
+        if cache_key in cache:
+            return cache[cache_key]
 
         char_props_elem = self._char_properties_elem()
         base_cp = self._get_charpr_by_id(base_charpr_id)
@@ -188,7 +260,10 @@ class HWPXEditor:
         new_id = self._max_charpr_id() + 1
         new_cp = copy.deepcopy(base_cp)
         new_cp.set('id', str(new_id))
-        new_cp.set('textColor', RED_COLOR)
+        if color:
+            new_cp.set('textColor', color)
+        if strikeout:
+            new_cp.set('strikeout', 'SOLID')
         char_props_elem.append(new_cp)
 
         item_cnt = char_props_elem.get('itemCnt')
@@ -198,57 +273,54 @@ class HWPXEditor:
             except ValueError:
                 pass
 
-        self._red_charpr_cache[base_charpr_id] = str(new_id)
+        cache[cache_key] = str(new_id)
         self._header_modified = True
         return str(new_id)
 
-    def _mark_runs_red(self, tc_elem: ET.Element):
-        """수정된 셀의 run — 원래 charPr 기반으로 빨간색 charPr 참조."""
+    def _get_or_create_red_charpr(self, base_charpr_id: str) -> Optional[str]:
+        return self._get_or_create_styled_charpr(
+            base_charpr_id, color=RED_COLOR, cache=self._red_charpr_cache)
+
+    def _get_or_create_green_charpr(self, base_charpr_id: str) -> Optional[str]:
+        return self._get_or_create_styled_charpr(
+            base_charpr_id, color=GREEN_COLOR, cache=self._green_charpr_cache)
+
+    def _get_or_create_strike_charpr(self, base_charpr_id: str) -> Optional[str]:
+        return self._get_or_create_styled_charpr(
+            base_charpr_id, color=RED_COLOR, strikeout=True, cache=self._strike_charpr_cache)
+
+    def _mark_runs_style(self, container: ET.Element, style: str = 'red'):
         if self._header_tree is None:
             return
-        for elem in tc_elem.iter():
-            if _local_tag(elem.tag) != 'run':
+        for elem in container.iter():
+            if local_tag(elem.tag) != 'run':
                 continue
             base_id = elem.get('charPrIDRef', '0')
-            red_id = self._get_or_create_red_charpr(base_id)
-            if red_id:
-                elem.set('charPrIDRef', red_id)
+            if style == 'green':
+                styled_id = self._get_or_create_green_charpr(base_id)
+            elif style == 'strike':
+                styled_id = self._get_or_create_strike_charpr(base_id)
+            else:
+                styled_id = self._get_or_create_red_charpr(base_id)
+            if styled_id:
+                elem.set('charPrIDRef', styled_id)
                 self._modified_runs.add(id(elem))
 
-    def find_all(self, search_text: str) -> list[FindResult]:
-        results = []
-        for section_name, root in self.section_trees.items():
-            for elem in root.iter():
-                if _local_tag(elem.tag) == 't' and elem.text and search_text in elem.text:
-                    results.append(FindResult(
-                        section_file=section_name,
-                        element_path=_local_tag(elem.tag),
-                        original_text=elem.text,
-                        context=elem.text,
-                    ))
-        return results
+    def _mark_runs_red(self, tc_elem: ET.Element):
+        self._mark_runs_style(tc_elem, 'red')
 
-    def replace_all(self, old_text: str, new_text: str) -> int:
-        count = 0
-        modified_tcs = []
-        for section_name, root in self.section_trees.items():
-            for elem in root.iter():
-                if _local_tag(elem.tag) == 't' and elem.text and old_text in elem.text:
-                    elem.text = elem.text.replace(old_text, new_text)
-                    count += 1
-                    # t의 상위 tc를 찾아서 색상 표시
-                    tc = self._find_ancestor_tc(root, elem)
-                    if tc is not None:
-                        modified_tcs.append(tc)
-        if count > 0:
-            for tc in modified_tcs:
-                self._mark_runs_red(tc)
-            self.edit_log.append(EditLog(
-                action="찾기/바꾸기",
-                detail=f"'{old_text}' → '{new_text}' ({count}건)",
-            ))
-            self._recalculate_all_totals()
-        return count
+    def _mark_runs_green(self, container: ET.Element):
+        self._mark_runs_style(container, 'green')
+
+    def _is_blank_text(self, text: str) -> bool:
+        t = (text or '').strip()
+        if not t:
+            return True
+        if PLACEHOLDER_RE.match(t):
+            return True
+        if len(t) <= 3 and all(c in '□○●-_·' for c in t):
+            return True
+        return any(p in t for p in PLACEHOLDER_SUBSTR) and len(t) < 20
 
     def _find_ancestor_tc(self, root: ET.Element, target: ET.Element) -> Optional[ET.Element]:
         """target 요소를 포함하는 tc 요소를 찾는다."""
@@ -256,7 +328,7 @@ class HWPXEditor:
         current = target
         while current in parent_map:
             current = parent_map[current]
-            if _local_tag(current.tag) in ('tc', 'cell', 'td'):
+            if local_tag(current.tag) in ('tc', 'cell', 'td'):
                 return current
         return None
 
@@ -267,19 +339,19 @@ class HWPXEditor:
     def _get_tables(self, root: ET.Element) -> list[ET.Element]:
         tables = []
         for elem in root.iter():
-            if _local_tag(elem.tag) in ('tbl', 'table'):
+            if local_tag(elem.tag) in ('tbl', 'table'):
                 tables.append(elem)
         return tables
 
     def _get_cell_at(self, tbl_elem: ET.Element, target_row: int, target_col: int) -> Optional[ET.Element]:
         for tr_elem in tbl_elem:
-            if _local_tag(tr_elem.tag) not in ('tr', 'row'):
+            if local_tag(tr_elem.tag) not in ('tr', 'row'):
                 continue
             for tc_elem in tr_elem:
-                if _local_tag(tc_elem.tag) not in ('tc', 'cell', 'td'):
+                if local_tag(tc_elem.tag) not in ('tc', 'cell', 'td'):
                     continue
                 for sub in tc_elem:
-                    if _local_tag(sub.tag) == 'cellAddr':
+                    if local_tag(sub.tag) == 'cellAddr':
                         r = int(sub.get('rowAddr', '-1'))
                         c = int(sub.get('colAddr', '-1'))
                         if r == target_row and c == target_col:
@@ -287,25 +359,18 @@ class HWPXEditor:
         return None
 
     def _set_cell_text(self, tc_elem: ET.Element, new_text: str):
-        t_elems = [e for e in tc_elem.iter() if _local_tag(e.tag) == 't']
+        t_elems = [e for e in tc_elem.iter() if local_tag(e.tag) == 't']
         if t_elems:
             t_elems[0].text = new_text
             for extra in t_elems[1:]:
                 extra.text = ''
         else:
             for sub in tc_elem.iter():
-                if _local_tag(sub.tag) == 'run':
-                    t_tag = sub.tag.replace(_local_tag(sub.tag), 't')
+                if local_tag(sub.tag) == 'run':
+                    t_tag = sub.tag.replace(local_tag(sub.tag), 't')
                     t_elem = ET.SubElement(sub, t_tag)
                     t_elem.text = new_text
                     break
-
-    def _get_cell_text(self, tc_elem: ET.Element) -> str:
-        texts = []
-        for elem in tc_elem.iter():
-            if _local_tag(elem.tag) == 't' and elem.text:
-                texts.append(elem.text)
-        return ' '.join(texts).strip()
 
     def edit_table_cell(self, table_index: int, row: int, col: int, new_value: str) -> bool:
         all_tables = []
@@ -321,63 +386,9 @@ class HWPXEditor:
         if tc is None:
             return False
 
-        old_text = self._get_cell_text(tc)
         self._set_cell_text(tc, new_value)
         self._mark_runs_red(tc)
-        self.edit_log.append(EditLog(
-            action="셀 수정",
-            detail=f"표{table_index+1} ({row},{col}): '{old_text}' → '{new_value}'",
-        ))
         return True
-
-    def _build_table_grid(self, tbl_elem: ET.Element) -> list[list[tuple[ET.Element, str]]]:
-        cells_info = []
-        max_row = 0
-        max_col = 0
-        has_addr = False
-
-        for tr_elem in tbl_elem:
-            if _local_tag(tr_elem.tag) not in ('tr', 'row'):
-                continue
-            for tc_elem in tr_elem:
-                if _local_tag(tc_elem.tag) not in ('tc', 'cell', 'td'):
-                    continue
-                addr_elem = None
-                span_elem = None
-                for sub in tc_elem:
-                    sub_tag = _local_tag(sub.tag)
-                    if sub_tag == 'cellAddr':
-                        addr_elem = sub
-                    elif sub_tag == 'cellSpan':
-                        span_elem = sub
-
-                if addr_elem is not None:
-                    has_addr = True
-                    r = int(addr_elem.get('rowAddr', '0'))
-                    c = int(addr_elem.get('colAddr', '0'))
-                    rs = int(span_elem.get('rowSpan', '1')) if span_elem else 1
-                    cs = int(span_elem.get('colSpan', '1')) if span_elem else 1
-                    text = self._get_cell_text(tc_elem)
-                    cells_info.append((r, c, rs, cs, tc_elem, text))
-                    max_row = max(max_row, r + rs)
-                    max_col = max(max_col, c + cs)
-
-        if not has_addr or not cells_info:
-            return []
-
-        row_cnt_attr = int(tbl_elem.get('rowCnt', '0'))
-        col_cnt_attr = int(tbl_elem.get('colCnt', '0'))
-        if row_cnt_attr > 0:
-            max_row = max(max_row, row_cnt_attr)
-        if col_cnt_attr > 0:
-            max_col = max(max_col, col_cnt_attr)
-
-        grid = [[(None, '') for _ in range(max_col)] for _ in range(max_row)]
-        for r, c, rs, cs, tc_elem, text in cells_info:
-            if r < max_row and c < max_col:
-                grid[r][c] = (tc_elem, text)
-
-        return grid
 
     def recalculate_totals(self, table_index: int) -> bool:
         all_tables = []
@@ -389,7 +400,7 @@ class HWPXEditor:
             return False
 
         section_name, tbl = all_tables[table_index]
-        grid = self._build_table_grid(tbl)
+        grid = build_element_grid(tbl)
         if not grid:
             return False
 
@@ -439,11 +450,6 @@ class HWPXEditor:
                     self._mark_runs_red(total_tc)
                     updated = True
 
-        if updated:
-            self.edit_log.append(EditLog(
-                action="합계 재계산",
-                detail=f"표{table_index+1} 합계/소계 행 업데이트",
-            ))
         return updated
 
     def save(self) -> bytes:
@@ -476,5 +482,599 @@ class HWPXEditor:
         if table_index >= len(all_tables):
             return []
 
-        grid = self._build_table_grid(all_tables[table_index])
-        return [[text for _, text in row] for row in grid]
+        parsed = parse_table_grid(all_tables[table_index])
+        return parsed.rows
+
+    # --- 빈칸 감지 / 문단 목록 ---
+
+    def detect_blanks(self, meaningful_only: bool = True) -> list[BlankField]:
+        blanks: list[BlankField] = []
+        for t_idx in range(self.get_table_count()):
+            rows = self.get_table_as_rows(t_idx)
+            if not rows:
+                continue
+            header = rows[0] if rows else []
+            for r_idx, row in enumerate(rows):
+                for c_idx, cell in enumerate(row):
+                    if not self._is_blank_text(cell):
+                        continue
+                    label_parts = []
+                    if c_idx < len(header) and header[c_idx].strip():
+                        label_parts.append(header[c_idx].strip())
+                    if r_idx > 0 and r_idx < len(rows):
+                        row_label = rows[r_idx][0] if rows[r_idx] else ''
+                        if row_label.strip() and row_label.strip() not in label_parts:
+                            label_parts.insert(0, row_label.strip())
+
+                    if meaningful_only:
+                        # 의미 없는 빈 셀(병합 패딩, 헤더행 빈칸) 제외
+                        if r_idx == 0 and not label_parts:
+                            continue
+                        if not label_parts:
+                            continue
+                        # 같은 행에 데이터가 하나도 없으면 스킵
+                        if r_idx > 0 and not any(
+                            rows[r_idx][j].strip() for j in range(len(rows[r_idx])) if j != c_idx
+                        ):
+                            continue
+
+                    context = ' / '.join(label_parts) if label_parts else f'열{c_idx+1}'
+                    blanks.append(BlankField(
+                        field_type='cell',
+                        location=f'표{t_idx+1} ({r_idx},{c_idx})',
+                        context=context,
+                        current_text=cell,
+                        table_index=t_idx,
+                        row=r_idx,
+                        col=c_idx,
+                    ))
+
+        for p_idx, para in enumerate(self.get_paragraphs()):
+            if self._is_blank_text(para['text']):
+                blanks.append(BlankField(
+                    field_type='paragraph',
+                    location=f'문단 {p_idx+1}',
+                    context=para.get('preview', ''),
+                    current_text=para['text'],
+                    paragraph_index=p_idx,
+                    section_file=para.get('section_file'),
+                ))
+        return blanks
+
+    def get_paragraphs(self) -> list[dict]:
+        if self._paragraphs_cache is not None:
+            return self._paragraphs_cache
+        paragraphs = []
+        for section_name, root in self.section_trees.items():
+            for elem in root.iter():
+                if local_tag(elem.tag) != 'p':
+                    continue
+                if is_inside_table(elem, root):
+                    continue
+                texts = []
+                for t_elem in elem.iter():
+                    if local_tag(t_elem.tag) == 't' and t_elem.text:
+                        texts.append(t_elem.text)
+                text = ''.join(texts).strip()
+                if not text:
+                    continue
+                preview = text[:80] + ('...' if len(text) > 80 else '')
+                paragraphs.append({
+                    'index': len(paragraphs),
+                    'text': text,
+                    'preview': preview,
+                    'section_file': section_name,
+                    'elem': elem,
+                })
+        self._paragraphs_cache = paragraphs
+        return paragraphs
+
+    def get_document_blocks(self) -> list[dict]:
+        """문서 순서대로 문단/표 블록 반환 (미리보기용)."""
+        if self._blocks_cache is not None:
+            return self._blocks_cache
+        from hwp_parser import _get_text_from_element
+
+        blocks: list[dict] = []
+        para_counter = 0
+        table_counter = 0
+
+        def collect_ordered(root):
+            ordered = []
+
+            def walk(elem):
+                tag = local_tag(elem.tag)
+                if tag in ('tbl', 'table'):
+                    ordered.append(('table', elem))
+                    return
+                if tag == 'p':
+                    nested_tbls = [
+                        x for x in elem.iter()
+                        if x is not elem and local_tag(x.tag) in ('tbl', 'table')
+                    ]
+                    if nested_tbls:
+                        text = _get_text_from_element(elem, skip_tables=True).strip()
+                        if text:
+                            ordered.append(('paragraph', text))
+                        for tbl in nested_tbls:
+                            ordered.append(('table', tbl))
+                    else:
+                        if is_inside_table(elem, root):
+                            return
+                        text = _get_text_from_element(elem).strip()
+                        if text:
+                            ordered.append(('paragraph', text))
+                    return
+                for child in elem:
+                    walk(child)
+
+            walk(root)
+            return ordered
+
+        for section_name, root in self.section_trees.items():
+            for kind, payload in collect_ordered(root):
+                if kind == 'paragraph':
+                    blocks.append({
+                        'type': 'paragraph',
+                        'paragraph_index': para_counter,
+                        'text': payload,
+                        'section_file': section_name,
+                    })
+                    para_counter += 1
+                else:
+                    parsed = parse_table_grid(payload)
+                    if parsed.rows:
+                        blocks.append({
+                            'type': 'table',
+                            'table_index': table_counter,
+                            'parsed': parsed,
+                            'section_file': section_name,
+                        })
+                        table_counter += 1
+        self._blocks_cache = blocks
+        return blocks
+
+    # --- 변경 제안 (diff) ---
+
+    def propose_cell_change(self, table_index: int, row: int, col: int,
+                            new_value: str, context: str = '') -> PendingChange:
+        rows = self.get_table_as_rows(table_index)
+        old = ''
+        if row < len(rows) and col < len(rows[row]):
+            old = rows[row][col]
+        change = PendingChange(
+            id=str(uuid.uuid4())[:8],
+            change_type='cell',
+            location=f'표{table_index+1} ({row},{col})' + (f' — {context}' if context else ''),
+            old_text=old,
+            new_text=new_value,
+            table_index=table_index,
+            row=row,
+            col=col,
+        )
+        self.pending_changes.append(change)
+        self._bump_preview()
+        return change
+
+    def _bump_preview(self):
+        self.preview_revision += 1
+
+    def _invalidate_structure_cache(self):
+        self._blocks_cache = None
+        self._paragraphs_cache = None
+        self._saved_bytes_cache = None
+
+    def get_saved_bytes(self) -> bytes:
+        if self._saved_bytes_cache is not None and self._saved_bytes_rev == self.preview_revision:
+            return self._saved_bytes_cache
+        self._saved_bytes_cache = self.save()
+        self._saved_bytes_rev = self.preview_revision
+        return self._saved_bytes_cache
+
+    def _record_applied_highlight(self, change: PendingChange):
+        if change.change_type == 'replace':
+            self._scan_replace_highlights(change.old_text, change.new_text)
+        else:
+            self.applied_highlights.append(AppliedHighlight(
+                change_type=change.change_type,
+                location=change.location,
+                old_text=change.old_text,
+                new_text=change.new_text,
+                table_index=change.table_index,
+                row=change.row,
+                col=change.col,
+                paragraph_index=change.paragraph_index,
+            ))
+
+    def _scan_replace_highlights(self, old_text: str, new_text: str):
+        """replace 유형 — 문단/셀 위치를 스캔해 하이라이트 등록."""
+        for p in self.get_paragraphs():
+            txt = p['text']
+            if new_text in txt or (old_text and old_text in txt):
+                key = ('para', p['index'])
+                if any(h.paragraph_index == p['index'] for h in self.applied_highlights):
+                    continue
+                self.applied_highlights.append(AppliedHighlight(
+                    change_type='paragraph',
+                    location=f"문단 {p['index']+1}",
+                    old_text=old_text,
+                    new_text=new_text if new_text in txt else txt,
+                    paragraph_index=p['index'],
+                ))
+        for t_idx in range(self.get_table_count()):
+            rows = self.get_table_as_rows(t_idx)
+            for r_idx, row in enumerate(rows):
+                for c_idx, cell in enumerate(row):
+                    if new_text and (cell == new_text or new_text in cell):
+                        if any(h.table_index == t_idx and h.row == r_idx and h.col == c_idx
+                               for h in self.applied_highlights):
+                            continue
+                        self.applied_highlights.append(AppliedHighlight(
+                            change_type='cell',
+                            location=f'표{t_idx+1} ({r_idx},{c_idx})',
+                            old_text=old_text,
+                            new_text=cell,
+                            table_index=t_idx, row=r_idx, col=c_idx,
+                        ))
+
+    def propose_paragraph_change(self, paragraph_index: int, new_text: str) -> PendingChange:
+        paras = self.get_paragraphs()
+        old = paras[paragraph_index]['text'] if paragraph_index < len(paras) else ''
+        section_file = paras[paragraph_index].get('section_file') if paragraph_index < len(paras) else None
+        change = PendingChange(
+            id=str(uuid.uuid4())[:8],
+            change_type='paragraph',
+            location=f'문단 {paragraph_index+1}',
+            old_text=old,
+            new_text=new_text,
+            paragraph_index=paragraph_index,
+            section_file=section_file,
+            search_hint=old[:120],
+        )
+        self.pending_changes.append(change)
+        self._bump_preview()
+        return change
+
+    def find_table_cell_candidates(
+        self, old_value: str, command: str = '',
+    ) -> list[tuple[int, int, int, str, int]]:
+        """(table_index, row, col, cell_text, score) — 점수 높을수록 적합."""
+        table_index = None
+        m = re.search(r'표\s*(\d+)', command)
+        if m:
+            table_index = int(m.group(1)) - 1
+
+        row_num = None
+        for pat in (r'(\d+)\s*행', r'(\d+)\s*번', r'(\d+)\s*전년도', r'(\d+)\s*줄'):
+            m = re.search(pat, command)
+            if m:
+                row_num = int(m.group(1))
+                break
+
+        skip = {
+            '표에서', '바꿔줘', '수정해줘', '수정해', '바꿔', '으로', '에서', '이에',
+            '맞게', '소계도', '해주고', '해줘', '달라고', '안바뀌었는데', '여기서',
+        }
+        cmd_keywords = [
+            w for w in re.findall(r'[가-힣a-zA-Z0-9]+', command)
+            if len(w) >= 2 and w not in skip and not re.fullmatch(r'[\d,\.]+', w)
+        ]
+
+        candidates: list[tuple[int, int, int, str, int]] = []
+        for t_idx in range(self.get_table_count()):
+            if table_index is not None and t_idx != table_index:
+                continue
+            rows = self.get_table_as_rows(t_idx)
+            if not rows:
+                continue
+            header_rows = rows[:min(3, len(rows))]
+
+            for r_idx, row in enumerate(rows):
+                row_text = ' '.join(str(c) for c in row)
+                for c_idx, cell in enumerate(row):
+                    if not _cell_contains_value(cell, old_value):
+                        continue
+                    score = 0
+                    if table_index is not None:
+                        score += 6
+                    if row_num is not None:
+                        if r_idx in (row_num, row_num - 1):
+                            score += 10
+                        elif str(row_num) in row_text[:30]:
+                            score += 5
+                    for kw in cmd_keywords:
+                        if kw in row_text:
+                            score += 3
+                        for hdr_row in header_rows:
+                            if c_idx < len(hdr_row) and kw in str(hdr_row[c_idx]):
+                                score += 6
+                    if _normalize_value(cell) == _normalize_value(old_value):
+                        score += 2
+                    candidates.append((t_idx, r_idx, c_idx, cell, score))
+        return candidates
+
+    def propose_table_value_replace(
+        self, command: str, old_value: str, new_value: str,
+    ) -> Optional[PendingChange]:
+        """표 셀에서 old_value를 찾아 new_value로 변경 제안."""
+        candidates = self.find_table_cell_candidates(old_value, command)
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x[4], reverse=True)
+        best = candidates[0]
+        min_score = 8 if len(_normalize_value(old_value)) <= 2 else 1
+
+        strong = [c for c in candidates if c[4] >= min_score]
+        if not strong:
+            exact = [c for c in candidates if _normalize_value(c[3]) == _normalize_value(old_value)]
+            if len(exact) == 1:
+                strong = exact
+            else:
+                return None
+
+        if len(strong) > 1 and strong[0][4] == strong[1][4] and strong[0][4] < 6:
+            return None
+
+        t_idx, r_idx, c_idx, cell, _ = strong[0]
+        new_cell = _format_replacement(cell, old_value, new_value)
+        location = f'표{t_idx + 1} ({r_idx + 1}행,{c_idx + 1}열)'
+        return self.propose_cell_change(
+            t_idx, r_idx, c_idx, new_cell,
+            context=location,
+        )
+
+    def propose_replace(self, old_text: str, new_text: str, location: str = '') -> PendingChange:
+        change = PendingChange(
+            id=str(uuid.uuid4())[:8],
+            change_type='replace',
+            location=location or '텍스트 치환',
+            old_text=old_text,
+            new_text=new_text,
+            search_hint=old_text[:120],
+        )
+        self.pending_changes.append(change)
+        self._bump_preview()
+        return change
+
+    def get_pending_changes(self) -> list[PendingChange]:
+        return [c for c in self.pending_changes if c.status == 'pending']
+
+    def accept_change(self, change_id: str, track_changes: bool = True) -> bool:
+        change = next((c for c in self.pending_changes if c.id == change_id), None)
+        if change is None or change.status != 'pending':
+            return False
+        ok = self._apply_change(change, track_changes=track_changes)
+        if ok:
+            change.status = 'accepted'
+            self._record_applied_highlight(change)
+            self._invalidate_structure_cache()
+            self._bump_preview()
+        return ok
+
+    def accept_all_pending(self, track_changes: bool = True) -> int:
+        count = 0
+        for change in list(self.pending_changes):
+            if change.status == 'pending' and self.accept_change(change.id, track_changes):
+                count += 1
+        return count
+
+    def reject_all_pending(self) -> int:
+        count = 0
+        for change in self.pending_changes:
+            if change.status == 'pending':
+                change.status = 'rejected'
+                count += 1
+        return count
+
+    def _apply_change(self, change: PendingChange, track_changes: bool = True) -> bool:
+        if change.change_type == 'cell':
+            if change.table_index is None or change.row is None or change.col is None:
+                return False
+            ok = self.edit_table_cell(change.table_index, change.row, change.col, change.new_text)
+            if ok and track_changes:
+                all_tables = []
+                for root in self.section_trees.values():
+                    all_tables.extend(self._get_tables(root))
+                if change.table_index < len(all_tables):
+                    tc = self._get_cell_at(all_tables[change.table_index], change.row, change.col)
+                    if tc is not None:
+                        self._mark_runs_green(tc)
+            return ok
+
+        if change.change_type == 'paragraph':
+            return self._set_paragraph_text(
+                change.paragraph_index, change.new_text,
+                old_text=change.old_text, track_changes=track_changes)
+
+        if change.change_type == 'replace':
+            if change.old_text:
+                if self.replace_selection(change.old_text, change.new_text, track_changes):
+                    return True
+            return self.find_and_replace(
+                change.old_text, change.new_text,
+                track_changes=track_changes) > 0
+
+        if change.change_type == 'append':
+            title = change.search_hint or ''
+            body = change.new_text
+            if title or body:
+                return self.append_section_text(title or '추가 내용', body)
+            return False
+        return False
+
+    def _set_paragraph_text(self, paragraph_index: int, new_text: str,
+                            old_text: str = '', track_changes: bool = True) -> bool:
+        paras = self.get_paragraphs()
+        if paragraph_index >= len(paras):
+            return False
+        elem = paras[paragraph_index]['elem']
+        t_elems = [e for e in elem.iter() if local_tag(e.tag) == 't']
+        if not t_elems:
+            return False
+
+        if track_changes and old_text and old_text != new_text:
+            orig = t_elems[0].text or ''
+            if old_text in orig:
+                t_elems[0].text = old_text
+                self._mark_runs_style(elem, 'strike')
+                run_parent = None
+                for sub in elem.iter():
+                    if local_tag(sub.tag) == 'run':
+                        run_parent = sub
+                        break
+                if run_parent is not None:
+                    ns = run_parent.tag.rsplit('}', 1)[0] + '}' if '}' in run_parent.tag else ''
+                    new_run = copy.deepcopy(run_parent)
+                    for t in new_run.iter():
+                        if local_tag(t.tag) == 't':
+                            t.text = new_text
+                    self._mark_runs_style(new_run, 'green')
+                    parent = None
+                    for p in elem.iter():
+                        for child in p:
+                            if child is run_parent:
+                                parent = p
+                                break
+                    if parent is not None:
+                        idx = list(parent).index(run_parent)
+                        parent.insert(idx + 1, new_run)
+                    else:
+                        t_elems[0].text = new_text
+                        self._mark_runs_green(elem)
+                else:
+                    t_elems[0].text = new_text
+                    self._mark_runs_green(elem)
+            else:
+                t_elems[0].text = new_text
+                for extra in t_elems[1:]:
+                    extra.text = ''
+                self._mark_runs_green(elem)
+        else:
+            t_elems[0].text = new_text
+            for extra in t_elems[1:]:
+                extra.text = ''
+            if track_changes:
+                self._mark_runs_green(elem)
+        return True
+
+    def _replace_in_table_cells(self, old_text: str, new_text: str,
+                                track_changes: bool = True) -> int:
+        """표 셀 전체 텍스트 기준 치환."""
+        all_tables = []
+        for root in self.section_trees.values():
+            all_tables.extend(self._get_tables(root))
+
+        count = 0
+        for tbl in all_tables:
+            grid = build_element_grid(tbl)
+            for row in grid:
+                for tc, cell_text in row:
+                    if tc is None or not _cell_contains_value(cell_text, old_text):
+                        continue
+                    new_cell = _format_replacement(cell_text, old_text, new_text)
+                    if track_changes and _normalize_value(cell_text) == _normalize_value(old_text):
+                        self._mark_runs_style(tc, 'strike')
+                    self._set_cell_text(tc, new_cell)
+                    if track_changes:
+                        self._mark_runs_green(tc)
+                    count += 1
+        return count
+
+    def find_and_replace(self, old_text: str, new_text: str,
+                         track_changes: bool = True) -> int:
+        """텍스트 위치를 재탐색하여 치환 (에이전트형 편집)."""
+        count = self._replace_in_table_cells(old_text, new_text, track_changes)
+        modified_containers = []
+        for root in self.section_trees.values():
+            for elem in root.iter():
+                if local_tag(elem.tag) != 't' or not elem.text or old_text not in elem.text:
+                    continue
+                if self._find_ancestor_tc(root, elem) is not None:
+                    continue
+                    if track_changes and elem.text.strip() == old_text.strip():
+                        container = self._find_ancestor_tc(root, elem) or self._find_ancestor_p(root, elem)
+                        if container is not None:
+                            self._mark_runs_style(container, 'strike')
+                    elem.text = elem.text.replace(old_text, new_text)
+                    count += 1
+                    container = self._find_ancestor_tc(root, elem) or self._find_ancestor_p(root, elem)
+                    if container is not None:
+                        modified_containers.append(container)
+        if count > 0:
+            if track_changes:
+                for c in modified_containers:
+                    self._mark_runs_green(c)
+            self._recalculate_all_totals()
+            return count
+        if modified_containers:
+            if track_changes:
+                for c in modified_containers:
+                    self._mark_runs_green(c)
+            self._recalculate_all_totals()
+        return count
+
+    def _find_ancestor_p(self, root: ET.Element, target: ET.Element) -> Optional[ET.Element]:
+        parent_map = {child: parent for parent in root.iter() for child in parent}
+        current = target
+        while current in parent_map:
+            current = parent_map[current]
+            if local_tag(current.tag) == 'p':
+                return current
+        return None
+
+    def replace_selection(self, selection_text: str, new_text: str,
+                          track_changes: bool = True) -> bool:
+        """선택 영역 텍스트를 찾아 치환 (위치 변경 시 재탐색)."""
+        selection_text = selection_text.strip()
+        if not selection_text:
+            return False
+        for root in self.section_trees.values():
+            for elem in root.iter():
+                if local_tag(elem.tag) != 'p':
+                    continue
+                full = self._get_element_text(elem)
+                if selection_text not in full:
+                    continue
+                t_elems = [e for e in elem.iter() if local_tag(e.tag) == 't']
+                if not t_elems:
+                    continue
+                combined = ''.join(t.text or '' for t in t_elems)
+                if selection_text not in combined:
+                    continue
+                new_combined = combined.replace(selection_text, new_text, 1)
+                if track_changes:
+                    self._mark_runs_style(elem, 'strike')
+                t_elems[0].text = new_combined
+                for extra in t_elems[1:]:
+                    extra.text = ''
+                if track_changes:
+                    self._mark_runs_green(elem)
+                return True
+        return self.find_and_replace(selection_text, new_text, track_changes) > 0
+
+    def _get_element_text(self, elem: ET.Element) -> str:
+        return ''.join(t.text or '' for t in elem.iter() if local_tag(t.tag) == 't').strip()
+
+    def append_section_text(self, title: str, body: str) -> bool:
+        """문서 끝에 제목+본문 문단 추가 (초안 생성)."""
+        if not self.section_trees:
+            return False
+        section_name = sorted(self.section_trees.keys())[-1]
+        root = self.section_trees[section_name]
+        paras = [e for e in root.iter() if local_tag(e.tag) == 'p']
+        if not paras:
+            return False
+        ref = paras[-1]
+        parent_map = {child: parent for parent in root.iter() for child in parent}
+        parent = parent_map.get(ref)
+        if parent is None:
+            return False
+        for text in [title, body]:
+            new_p = copy.deepcopy(ref)
+            for t in new_p.iter():
+                if local_tag(t.tag) == 't':
+                    t.text = text
+            self._mark_runs_green(new_p)
+            parent.append(new_p)
+        return True
