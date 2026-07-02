@@ -12,7 +12,7 @@ from typing import Optional
 
 import requests
 
-from hwpx_editor import HWPXEditor, BlankField, PendingChange
+from main.hwpx_editor import HWPXEditor, BlankField, PendingChange
 
 
 def _call_ollama_json(prompt: str, model: str, ollama_url: str,

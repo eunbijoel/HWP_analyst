@@ -133,7 +133,7 @@ def _parse_pdf(file_bytes: bytes, filename: str) -> ReferenceDocument:
 
 
 def _parse_hwp_ref(file_bytes: bytes, filename: str) -> ReferenceDocument:
-    from hwp_parser import parse_document
+    from main.hwp_parser import parse_document
     parsed = parse_document(file_bytes=file_bytes, filename=filename)
     doc = ReferenceDocument(filename=filename, file_type='hwp')
     doc.full_text = parsed.full_text

@@ -11,13 +11,13 @@ import streamlit.components.v1 as components
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from hwp_parser import parse_document
-from table_extractor import extract_tables, detect_numbers_in_text, detect_numbers_in_tables
-from qa_engine import QAEngine, check_ollama_status
-from hwpx_editor import HWPXEditor
-from reference_parser import parse_reference, build_reference_context
-from document_preview import build_preview_html, build_preview_from_text
-from command_router import classify_intent, execute_edit_command
+from main.hwp_parser import parse_document
+from main.table_extractor import extract_tables, detect_numbers_in_text, detect_numbers_in_tables
+from main.qa_engine import QAEngine, check_ollama_status
+from main.hwpx_editor import HWPXEditor
+from additional.reference_parser import parse_reference, build_reference_context
+from ui.document_preview import build_preview_html, build_preview_from_text
+from ui.command_router import classify_intent, execute_edit_command
 
 
 st.set_page_config(page_title="HWP 문서 분석기", page_icon="📄", layout="wide")

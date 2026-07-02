@@ -6,7 +6,7 @@ import html
 import re
 from typing import Optional
 
-from hwpx_editor import HWPXEditor, PendingChange, AppliedHighlight
+from main.hwpx_editor import HWPXEditor, PendingChange, AppliedHighlight
 
 
 PREVIEW_CSS = """

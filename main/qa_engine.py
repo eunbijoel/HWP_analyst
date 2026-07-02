@@ -13,7 +13,7 @@ import time
 import requests
 import pandas as pd
 from typing import Optional
-from table_extractor import (
+from .table_extractor import (
     TableSummary, NumberInfo, BUDGET_KEYWORDS, TOTAL_KEYWORDS,
     UNIT_MULTIPLIERS, _normalize_number_str,
     compute_column_sum, find_max_value_in_table, filter_table_by_year,

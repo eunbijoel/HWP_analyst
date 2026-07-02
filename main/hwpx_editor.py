@@ -14,7 +14,7 @@ from xml.etree import ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Optional
 
-from table_grid import (
+from .table_grid import (
     parse_table_grid, is_inside_table, local_tag, build_element_grid,
 )
 TOTAL_KEYWORDS = ['합계', '총계', '소계', '계', '합', '총', 'total', 'sum', '전체']
@@ -573,7 +573,7 @@ class HWPXEditor:
         """문서 순서대로 문단/표 블록 반환 (미리보기용)."""
         if self._blocks_cache is not None:
             return self._blocks_cache
-        from hwp_parser import _get_text_from_element
+        from .hwp_parser import _get_text_from_element
 
         blocks: list[dict] = []
         para_counter = 0

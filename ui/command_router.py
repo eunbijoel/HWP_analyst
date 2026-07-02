@@ -5,8 +5,8 @@
 import re
 from typing import Optional
 
-from hwpx_editor import HWPXEditor
-from ai_editor import generate_blank_fills, generate_document_draft, rewrite_selection
+from main.hwpx_editor import HWPXEditor
+from additional.ai_editor import generate_blank_fills, generate_document_draft, rewrite_selection
 
 
 EDIT_FILL = re.compile(r'빈칸|채워|채우|기입|입력해|공란', re.I)
