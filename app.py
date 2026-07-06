@@ -16,14 +16,15 @@ import hashlib
 from typing import Optional
 import streamlit as st
 import streamlit.components.v1 as components
-import requests
 
 from hwp_core.hwp_parser import parse_document
 from hwp_core.hwp_backends import get_backend_status, hwpilot_convert_to_hwpx, hwpilot_read_structure
 from hwp_core.table_extractor import extract_tables, detect_numbers_in_text, detect_numbers_in_tables
-from hwp_core.qa_engine import QAEngine, check_ollama_status
+from hwp_core.qa_engine import QAEngine
+from hwp_core.llm_client import check_ollama_status, answer_general_question
 from hwp_core.hwpx_editor import HWPXEditor
 from additional.reference_parser import parse_reference, build_reference_context
+from additional.reference_parser import normalize_insert_body
 from ui.document_preview import build_preview_html, build_preview_from_text
 from ui.command_router import classify_intent, execute_edit_command
 
@@ -38,6 +39,21 @@ GENERAL_KNOWLEDGE_RE = re.compile(
 def get_reference_context() -> str:
     refs = st.session_state.get('reference_docs', [])
     return build_reference_context(refs) if refs else ''
+
+
+def _cache_reference_summary(text: str):
+    cleaned = normalize_insert_body(text)
+    if len(cleaned) >= 80:
+        st.session_state['ref_summary_cache'] = cleaned
+
+
+def _apply_edit_result(fname: str, result: dict, editor=None, source_hwp: str = ''):
+    if result.get('summary_text'):
+        st.session_state['ref_summary_cache'] = result['summary_text']
+    if result.get('new_file_bytes'):
+        set_hwp_working_bytes(fname, result['new_file_bytes'])
+    if editor is not None and result.get('applied_direct'):
+        sync_export_state(editor, fname, source_hwp=source_hwp)
 
 
 def get_cached_preview_html(editor: HWPXEditor, filename: str) -> str:
@@ -166,67 +182,6 @@ def validate_hwp_bytes(data: bytes) -> tuple[bool, str]:
     return True, ''
 
 
-def answer_general_question(
-    question: str,
-    model: str,
-    ollama_url: str,
-    use_streaming: bool,
-) -> dict:
-    """문서 근거형 QA 대신 일반 LLM 답변."""
-    prompt = f"""다음 질문에 한국어로 간결하고 실무적으로 답하세요.
-요청이 bullet point 형식이면 해당 형식으로 답하세요.
-
-질문:
-{question}
-"""
-    try:
-        if use_streaming:
-            response = requests.post(
-                f"{ollama_url}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": True,
-                    "options": {"temperature": 0.4, "num_predict": 1200, "num_ctx": 16384},
-                },
-                timeout=120,
-                stream=True,
-            )
-            if response.status_code != 200:
-                return {"answer": f"LLM 오류 (HTTP {response.status_code})"}
-
-            def token_generator():
-                for line in response.iter_lines():
-                    if not line:
-                        continue
-                    try:
-                        chunk = line.decode("utf-8", errors="ignore")
-                        if chunk.startswith("{"):
-                            import json
-                            token = json.loads(chunk).get("response", "")
-                            if token:
-                                yield token
-                    except Exception:
-                        continue
-
-            return {"answer_stream": token_generator()}
-
-        response = requests.post(
-            f"{ollama_url}/api/generate",
-            json={
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.4, "num_predict": 1200, "num_ctx": 16384},
-            },
-            timeout=120,
-        )
-        if response.status_code != 200:
-            return {"answer": f"LLM 오류 (HTTP {response.status_code})"}
-        text = response.json().get("response", "").strip()
-        return {"answer": text or "답변 생성 실패"}
-    except Exception as e:
-        return {"answer": f"일반 답변 생성 실패: {e}"}
 
 
 def render_chat_panel(
@@ -279,15 +234,17 @@ def render_chat_panel(
         ref_ctx = get_reference_context()
         selection = st.session_state.get(f"selection_{fname}", '')
 
-        if intent != 'qa' and use_llm:
+        if intent != 'qa' and (_edit_without_llm(intent) or use_llm):
             with st.spinner("AI 편집 중..."):
                 result = execute_edit_command(
                     editor, user_input, ref_ctx,
                     model_name, ollama_url, selection_text=selection,
                     chat_history=st.session_state[chat_key][:-1],
                     source_filename=fname,
+                    ref_summary_cache=st.session_state.get('ref_summary_cache', ''),
                 )
             reply = result.get('message', '완료')
+            _apply_edit_result(fname, result, editor=editor, source_hwp=source_hwp)
             if result.get('applied_direct'):
                 if result.get('intent') == 'delete':
                     reply += "\n\n👉 **hwpilot**으로 문서에서 삭제되었습니다. 왼쪽 미리보기를 확인하세요."
@@ -298,8 +255,6 @@ def render_chat_panel(
             elif result.get('changes', 0) > 0:
                 reply += "\n\n👉 왼쪽 문서에서 **노란색(제안)** 으로 확인하세요. 맞으면 **「모두 적용」** → **빨간색**으로 확정됩니다."
             st.session_state[chat_key].append({'role': 'assistant', 'content': reply})
-            if result.get('applied_direct') or result.get('changes', 0) > 0:
-                sync_export_state(editor, fname, source_hwp=source_hwp)
             st.rerun()
         else:
             general_mode = use_llm and bool(GENERAL_KNOWLEDGE_RE.search(user_input))
@@ -336,12 +291,16 @@ def render_chat_panel(
                     'content': reply_text,
                     'chart_data': chart.get('data') if chart else None,
                 })
+                if ref_ctx and re.search(r'참고자료|요약', user_input, re.I):
+                    _cache_reference_summary(reply_text)
             else:
                 st.session_state[chat_key].append({
                     'role': 'assistant',
                     'content': ans.get('answer', '답변 없음'),
                     'chart_data': chart.get('data') if chart else None,
                 })
+                if ref_ctx and re.search(r'참고자료|요약', user_input, re.I):
+                    _cache_reference_summary(ans.get('answer', ''))
             st.rerun()
 
     if st.session_state[chat_key] and st.button("대화 초기화", key=f"clr_{fname}"):
@@ -356,79 +315,113 @@ except AttributeError:
 
 
 def _hwp_edit_needs_llm(intent: str) -> bool:
-    """hwpilot 직접 편집(insert/delete/replace)은 LLM 없이 가능."""
+    """hwpilot 직접 편집(insert/delete/replace/table_edit)은 LLM 없이 가능."""
     return intent in ('draft', 'fill', 'rewrite')
 
 
-def render_hwp_split_editor(fname: str, file_bytes: bytes, all_documents: list):
+def _edit_without_llm(intent: str) -> bool:
+    return intent in ('insert', 'delete', 'replace', 'table_edit', 'append_ref')
+
+
+def _render_hwp_chat(
+    fname: str, file_bytes: bytes, all_documents: list,
+    chat_key: str, input_key: str,
+    model_name: str, ollama_url: str, use_llm: bool,
+    use_streaming: bool, stage1_model: str,
+    *,
+    on_new_bytes=None,
+):
+    """HWP/읽기전용 모드 공통 채팅 패널. hwpilot 편집 + Q&A."""
+    st.caption("명령 / 질문 — 예: *A를 B로 바꿔줘*, *삭제해*, *총 사업비는?*")
+    for msg in st.session_state[chat_key]:
+        with st.chat_message(msg['role']):
+            st.write(msg['content'])
+    q = st.chat_input("명령 또는 질문을 입력하세요...", key=input_key)
+    if not q:
+        return
+    st.session_state[chat_key].append({'role': 'user', 'content': q})
+    intent = classify_intent(q)
+    ref_ctx = get_reference_context()
+    if intent != 'qa' and get_backend_status().hwpilot and (
+        _edit_without_llm(intent) or not _hwp_edit_needs_llm(intent) or use_llm
+    ):
+        with st.spinner("편집 중..."):
+            result = execute_edit_command(
+                None, q, ref_ctx, model_name, ollama_url,
+                chat_history=st.session_state[chat_key][:-1],
+                source_filename=fname,
+                file_bytes=file_bytes,
+                ref_summary_cache=st.session_state.get('ref_summary_cache', ''),
+            )
+        reply = result.get('message', '완료')
+        if result.get('summary_text'):
+            st.session_state['ref_summary_cache'] = result['summary_text']
+        new_bytes = result.get('new_file_bytes')
+        if new_bytes and on_new_bytes:
+            on_new_bytes(new_bytes, result)
+            reply += "\n\n👉 문서에 반영되었습니다. 왼쪽 미리보기·다운로드를 확인하세요."
+        elif result.get('applied_direct'):
+            reply += "\n\n👉 문서에 반영되었습니다."
+        elif result.get('changes', 0) == 0 and _hwp_edit_needs_llm(intent) and not use_llm:
+            reply += "\n\n⚠️ 초안/빈칸 채우기는 Ollama가 연결되어 있어야 합니다."
+        elif result.get('changes', 0) > 0:
+            reply += "\n\n👉 왼쪽 문서에서 확인하세요."
+        st.session_state[chat_key].append({'role': 'assistant', 'content': reply})
+        st.rerun()
+    elif intent != 'qa' and _hwp_edit_needs_llm(intent) and not use_llm:
+        st.session_state[chat_key].append({
+            'role': 'assistant',
+            'content': '초안·빈칸 채우기는 Ollama가 연결되어 있어야 합니다. '
+                       '삽입/삭제는 LLM 없이도 됩니다. 예: *마지막에 (내용) 추가해줘*',
+        })
+        st.rerun()
+    else:
+        qa = get_cached_qa_engine(all_documents, fname)
+        hist = []
+        msgs = st.session_state[chat_key][:-1]
+        for i in range(0, len(msgs) - 1, 2):
+            if i + 1 < len(msgs) and msgs[i]['role'] == 'user' and msgs[i + 1]['role'] == 'assistant':
+                hist.append({'question': msgs[i]['content'], 'answer': msgs[i + 1]['content']})
+        with st.spinner("분석 중..."):
+            ans = qa.answer(
+                question=q, use_llm=use_llm, model=model_name,
+                ollama_url=ollama_url, stream=use_streaming,
+                stage1_model=stage1_model, history=hist[-3:],
+            )
+        if ans.get('answer_stream'):
+            with st.chat_message("assistant"):
+                reply_text = st.write_stream(ans['answer_stream'])
+            st.session_state[chat_key].append({'role': 'assistant', 'content': reply_text})
+        else:
+            st.session_state[chat_key].append({
+                'role': 'assistant', 'content': ans.get('answer', '답변 없음'),
+            })
+        st.rerun()
+
+
+def render_hwp_split_editor(
+    fname: str, file_bytes: bytes, all_documents: list,
+    model_name: str, ollama_url: str, use_llm: bool,
+    use_streaming: bool, stage1_model: str,
+):
     """HWP 원본을 hwpilot으로 직접 편집·다운로드 (HWPX 변환 없음 — 한글 호환)."""
-    hwp_bytes = get_hwp_working_bytes(fname, file_bytes)
     chat_key = f"workspace_chat_{fname}"
     if chat_key not in st.session_state:
         st.session_state[chat_key] = []
 
     col_doc, col_chat = st.columns([3, 2], gap="medium")
 
+    def _on_hwp_new_bytes(new_bytes, result):
+        set_hwp_working_bytes(fname, new_bytes)
+        append_hwp_highlights(fname, result.get('hwp_highlights') or [])
+
     with col_chat:
-        st.caption("명령 / 질문 — 예: *9줄 A를 B로 바꿔줘*, *14줄,15줄 삭제해*, *총 사업비는?*")
-        for msg in st.session_state[chat_key]:
-            with st.chat_message(msg['role']):
-                st.write(msg['content'])
-        q = st.chat_input("명령 또는 질문을 입력하세요...", key=f"hwp_input_{fname}")
-        if q:
-            st.session_state[chat_key].append({'role': 'user', 'content': q})
-            intent = classify_intent(q)
-            ref_ctx = get_reference_context()
-            if intent != 'qa' and get_backend_status().hwpilot and (not _hwp_edit_needs_llm(intent) or use_llm):
-                with st.spinner("HWP 편집 중..."):
-                    result = execute_edit_command(
-                        None, q, ref_ctx, model_name, ollama_url,
-                        chat_history=st.session_state[chat_key][:-1],
-                        source_filename=fname,
-                        file_bytes=hwp_bytes,
-                    )
-                reply = result.get('message', '완료')
-                new_bytes = result.get('new_file_bytes')
-                if new_bytes:
-                    set_hwp_working_bytes(fname, new_bytes)
-                    append_hwp_highlights(fname, result.get('hwp_highlights') or [])
-                    hwp_bytes = new_bytes
-                    reply += "\n\n👉 **hwpilot**으로 HWP에 반영되었습니다. 왼쪽 **빨간색** 수정 표시·다운로드를 확인하세요."
-                elif result.get('applied_direct'):
-                    reply += "\n\n👉 문서에 반영되었습니다."
-                elif result.get('changes', 0) == 0 and _hwp_edit_needs_llm(intent) and not use_llm:
-                    reply += "\n\n⚠️ 초안/빈칸 채우기는 Ollama가 연결되어 있어야 합니다."
-                st.session_state[chat_key].append({'role': 'assistant', 'content': reply})
-                st.rerun()
-            elif intent != 'qa' and _hwp_edit_needs_llm(intent) and not use_llm:
-                st.session_state[chat_key].append({
-                    'role': 'assistant',
-                    'content': '초안·빈칸 채우기는 Ollama가 연결되어 있어야 합니다. '
-                               '삽입/삭제는 LLM 없이도 됩니다. 예: *마지막에 (내용) 추가해줘*',
-                })
-                st.rerun()
-            else:
-                qa = get_cached_qa_engine(all_documents, fname)
-                hist = []
-                msgs = st.session_state[chat_key][:-1]
-                for i in range(0, len(msgs) - 1, 2):
-                    if i + 1 < len(msgs) and msgs[i]['role'] == 'user' and msgs[i + 1]['role'] == 'assistant':
-                        hist.append({'question': msgs[i]['content'], 'answer': msgs[i + 1]['content']})
-                with st.spinner("분석 중..."):
-                    ans = qa.answer(
-                        question=q, use_llm=use_llm, model=model_name,
-                        ollama_url=ollama_url, stream=use_streaming,
-                        stage1_model=stage1_model, history=hist[-3:],
-                    )
-                if ans.get('answer_stream'):
-                    with st.chat_message("assistant"):
-                        reply_text = st.write_stream(ans['answer_stream'])
-                    st.session_state[chat_key].append({'role': 'assistant', 'content': reply_text})
-                else:
-                    st.session_state[chat_key].append({
-                        'role': 'assistant', 'content': ans.get('answer', '답변 없음'),
-                    })
-                st.rerun()
+        _render_hwp_chat(
+            fname, get_hwp_working_bytes(fname, file_bytes), all_documents,
+            chat_key, f"hwp_input_{fname}",
+            model_name, ollama_url, use_llm, use_streaming, stage1_model,
+            on_new_bytes=_on_hwp_new_bytes,
+        )
 
     with col_doc:
         st.markdown(f"### 📄 {fname}")
@@ -455,6 +448,11 @@ def render_split_editor(
     fname: str,
     file_bytes: bytes,
     all_documents: list,
+    model_name: str,
+    ollama_url: str,
+    use_llm: bool,
+    use_streaming: bool,
+    stage1_model: str,
     source_hwp: str = '',
 ):
     content_hash = hashlib.sha256(file_bytes).hexdigest()[:16]
@@ -554,7 +552,11 @@ def try_open_hwp_for_editing(filename: str, file_bytes: bytes) -> tuple[Optional
     return None, None, "HWPX 변환 실패 — hwpilot build 확인 (cd hwpilot && npm run build)"
 
 
-def render_readonly_split(fname: str, doc_data: dict, file_bytes: bytes):
+def render_readonly_split(
+    fname: str, doc_data: dict, file_bytes: bytes,
+    model_name: str, ollama_url: str, use_llm: bool,
+    use_streaming: bool, stage1_model: str,
+):
     chat_key = f"workspace_chat_{fname}"
     if chat_key not in st.session_state:
         st.session_state[chat_key] = []
@@ -582,54 +584,21 @@ def render_readonly_split(fname: str, doc_data: dict, file_bytes: bytes):
                         st.error(note)
             else:
                 st.caption("편집: `npm install -g hwpilot` 후 HWPX 변환 가능")
-    with col_chat:
-        st.caption("질문 · 편집: 「…마지막에 추가해줘」 (hwpilot)")
-        qa = get_cached_qa_engine([doc_data], fname)
-        for msg in st.session_state[chat_key]:
-            with st.chat_message(msg['role']):
-                st.write(msg['content'])
-        q = st.chat_input("질문 또는 편집 명령...", key=f"ro_input_{fname}")
-        if q:
-            st.session_state[chat_key].append({'role': 'user', 'content': q})
-            intent = classify_intent(q)
-            ref_ctx = get_reference_context()
-            if intent != 'qa' and get_backend_status().hwpilot and (intent in ('insert', 'delete', 'replace') or use_llm):
-                with st.spinner("문서 편집 중..."):
-                    result = execute_edit_command(
-                        None, q, ref_ctx, model_name, ollama_url,
-                        chat_history=st.session_state[chat_key][:-1],
-                        source_filename=fname,
-                        file_bytes=file_bytes,
-                    )
-                reply = result.get('message', '완료')
-                new_bytes = result.get('new_file_bytes')
-                if new_bytes:
-                    bytes_key = f"upload_bytes_{fname}"
-                    st.session_state[bytes_key] = new_bytes
-                    for k in list(st.session_state.keys()):
-                        if k.startswith(f"parsed_{fname}_") or k.startswith(f"qa_engine_{fname}"):
-                            del st.session_state[k]
-                    reply += "\n\n👉 왼쪽 미리보기 갱신 · 아래 **수정 HWP 다운로드**"
-                st.session_state[chat_key].append({'role': 'assistant', 'content': reply})
-                st.rerun()
-            else:
-                ans = qa.answer(
-                    q, use_llm=use_llm, model=model_name,
-                    ollama_url=ollama_url, stage1_model=stage1_model,
-                    stream=use_streaming,
-                )
-                if ans.get('answer_stream'):
-                    with st.chat_message("assistant"):
-                        reply_text = st.write_stream(ans['answer_stream'])
-                    st.session_state[chat_key].append({
-                        'role': 'assistant', 'content': reply_text,
-                    })
-                else:
-                    st.session_state[chat_key].append({
-                        'role': 'assistant', 'content': ans.get('answer', ''),
-                    })
-                st.rerun()
 
+    def _on_ro_new_bytes(new_bytes, result):
+        bytes_key = f"upload_bytes_{fname}"
+        st.session_state[bytes_key] = new_bytes
+        for k in list(st.session_state.keys()):
+            if k.startswith(f"parsed_{fname}_") or k.startswith(f"qa_engine_{fname}"):
+                del st.session_state[k]
+
+    with col_chat:
+        _render_hwp_chat(
+            fname, file_bytes, [doc_data],
+            chat_key, f"ro_input_{fname}",
+            model_name, ollama_url, use_llm, use_streaming, stage1_model,
+            on_new_bytes=_on_ro_new_bytes,
+        )
         bytes_key = f"upload_bytes_{fname}"
         current_bytes = st.session_state.get(bytes_key, file_bytes)
         if current_bytes is not file_bytes:
@@ -753,7 +722,12 @@ if uploaded_files:
         st.error("문서에서 문단·표를 추출하지 못했습니다. pyhwp/hwpilot 설치 및 파일 형식을 확인하세요.")
 
     if filename.lower().endswith('.hwp') and get_backend_status().hwpilot:
-        render_hwp_split_editor(filename, file_bytes, all_documents)
+        render_hwp_split_editor(
+            filename, file_bytes, all_documents,
+            model_name=model_name, ollama_url=ollama_url,
+            use_llm=use_llm, use_streaming=use_streaming,
+            stage1_model=stage1_model,
+        )
     elif edit_name.lower().endswith('.hwpx'):
         with st.expander("📋 hwpilot 문서 구조 (표·문단)", expanded=False):
             if get_backend_status().hwpilot:
@@ -770,9 +744,19 @@ if uploaded_files:
                     st.caption("hwpilot read 실패")
             else:
                 st.caption("hwpilot 미설치")
-        render_split_editor(edit_name, edit_bytes, all_documents)
+        render_split_editor(
+            edit_name, edit_bytes, all_documents,
+            model_name=model_name, ollama_url=ollama_url,
+            use_llm=use_llm, use_streaming=use_streaming,
+            stage1_model=stage1_model,
+        )
     else:
-        render_readonly_split(filename, all_documents[0], file_bytes)
+        render_readonly_split(
+            filename, all_documents[0], file_bytes,
+            model_name=model_name, ollama_url=ollama_url,
+            use_llm=use_llm, use_streaming=use_streaming,
+            stage1_model=stage1_model,
+        )
 
 else:
     st.info("HWP/HWPX를 업로드하세요.")

@@ -10,7 +10,6 @@
 import re
 import json
 import time
-import requests
 import pandas as pd
 from typing import Optional
 from .table_extractor import (
@@ -18,6 +17,7 @@ from .table_extractor import (
     UNIT_MULTIPLIERS, _normalize_number_str,
     compute_column_sum, find_max_value_in_table, filter_table_by_year,
 )
+from .llm_client import generate as _llm_generate, check_ollama_status
 
 
 SUM_KEYWORDS = ['합계', '합산', '총합', '합', '더해', '합쳐', '총', '전체 합', '다 더', 'sum', '합을']
@@ -123,12 +123,11 @@ class QAEngine:
         if not pre_computed:
             pre_computed, chart_data = self._pre_compute_analysis(question)
 
-        # Step 3: pandas 코드 생성 (복잡한 질문에 대한 최후 수단)
-        if not pre_computed and use_llm:
-            pandas_result = self._try_pandas_code_gen(question, model=stage1_model,
-                                                       ollama_url=ollama_url)
-            if pandas_result:
-                pre_computed = pandas_result
+        # Step 3: pandas 코드 생성 — exec() 보안 취약점으로 비활성화
+        # if not pre_computed and use_llm:
+        #     pandas_result = self._try_pandas_code_gen(...)
+        #     if pandas_result:
+        #         pre_computed = pandas_result
 
         # Rule-based 답변
         if stage1_result and stage1_result.get('intent'):
@@ -227,24 +226,14 @@ JSON만 출력:
 {{"intent": "lookup", "entities": [], "metrics": [], "years": []}}"""
 
         try:
-            response = requests.post(
-                f"{ollama_url}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.1,
-                        "num_predict": 256,
-                        "num_ctx": 4096,
-                    }
-                },
-                timeout=15,
+            llm_result = _llm_generate(
+                prompt, model, ollama_url,
+                temperature=0.1, num_predict=256, num_ctx=4096, timeout=15,
             )
-            if response.status_code != 200:
+            if llm_result.get('error'):
                 return None
 
-            text = response.json().get('response', '').strip()
+            text = llm_result.get('text', '').strip()
             json_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
             if not json_match:
                 return None
@@ -405,24 +394,13 @@ JSON만 출력:
 ## Python 코드:
 """
         try:
-            response = requests.post(
-                f"{ollama_url}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.1,
-                        "num_predict": 512,
-                        "num_ctx": 8192,
-                    }
-                },
-                timeout=30,
+            llm_result = _llm_generate(
+                prompt, model, ollama_url,
+                temperature=0.1, num_predict=512, num_ctx=8192, timeout=30,
             )
-            if response.status_code != 200:
+            if llm_result.get('error'):
                 return None
-
-            text = response.json().get('response', '').strip()
+            text = llm_result.get('text', '').strip()
             code_match = re.search(r'```(?:python)?\s*\n?(.*?)```', text, re.DOTALL)
             if code_match:
                 return code_match.group(1).strip()
@@ -433,38 +411,8 @@ JSON만 출력:
             return None
 
     def _safe_execute_pandas(self, code: str, tables_dict: dict) -> Optional[str]:
-        forbidden = ['import ', 'open(', 'exec(', 'eval(', '__', 'os.', 'sys.',
-                      'subprocess', 'shutil', 'globals(', 'locals(', 'compile(']
-        for f in forbidden:
-            if f in code:
-                return None
-
-        safe_builtins = {
-            'len': len, 'range': range, 'sum': sum, 'min': min, 'max': max,
-            'round': round, 'str': str, 'int': int, 'float': float,
-            'list': list, 'dict': dict, 'tuple': tuple, 'set': set,
-            'sorted': sorted, 'enumerate': enumerate, 'zip': zip,
-            'map': map, 'filter': filter, 'print': print,
-            'isinstance': isinstance, 'type': type, 'abs': abs,
-            'any': any, 'all': all, 'bool': bool, 'ValueError': ValueError,
-            'KeyError': KeyError, 'IndexError': IndexError, 'TypeError': TypeError,
-        }
-
-        namespace = {
-            '__builtins__': safe_builtins,
-            'tables': tables_dict,
-            'pd': pd,
-            're': re,
-        }
-
-        try:
-            exec(code, namespace)
-            result = namespace.get('result')
-            if result is not None:
-                return str(result)
-            return None
-        except Exception:
-            return None
+        """비활성화: exec()으로 LLM 생성 코드를 실행하는 것은 보안 취약점."""
+        return None
 
     def _try_pandas_code_gen(self, question: str, model: str,
                              ollama_url: str) -> Optional[str]:
@@ -499,6 +447,7 @@ JSON만 출력:
 
     def _pre_compute_with_stage1(self, question: str, stage1: dict) -> tuple:
         q = question.strip()
+        table_idx = self._parse_table_index_from_question(q)
         entities = stage1.get('entities', [])
         metrics = stage1.get('metrics', [])
         target_years = []
@@ -514,13 +463,15 @@ JSON만 출력:
         if entities and metrics:
             for entity in entities:
                 for metric in metrics:
-                    lookup = self._lookup_entity_metric(entity, metric, target_years)
+                    lookup = self._lookup_entity_metric(
+                        entity, metric, target_years, table_index=table_idx)
                     if lookup:
                         results.append(lookup)
 
         if not results and entities:
             for entity in entities:
-                lookup = self._lookup_entity_all(entity, target_years)
+                lookup = self._lookup_entity_all(
+                    entity, target_years, table_index=table_idx)
                 if lookup:
                     results.append(lookup)
 
@@ -560,6 +511,7 @@ JSON만 출력:
 
     def _pre_compute_analysis(self, question: str) -> tuple:
         q = question.strip()
+        table_idx = self._parse_table_index_from_question(q)
 
         entities = self._find_entities_in_question(q)
         metrics = self._find_metrics_in_question(q)
@@ -572,19 +524,28 @@ JSON만 출력:
         if entities and metrics:
             for entity in entities:
                 for metric in metrics:
-                    lookup = self._lookup_entity_metric(entity, metric, target_years)
+                    lookup = self._lookup_entity_metric(
+                        entity, metric, target_years, table_index=table_idx)
                     if lookup:
                         results.append(lookup)
 
         if not results and entities:
             for entity in entities:
-                lookup = self._lookup_entity_all(entity, target_years)
+                lookup = self._lookup_entity_all(
+                    entity, target_years, table_index=table_idx)
                 if lookup:
                     results.append(lookup)
 
         if not results and metrics:
             for metric in metrics:
                 lookup = self._lookup_metric_all(metric, target_years)
+                if lookup:
+                    results.append(lookup)
+
+        if not results and '소계' in q.replace(' ', '') and entities:
+            for entity in entities:
+                lookup = self._lookup_entity_metric_rows(
+                    entity, '소계', target_years, table_index=table_idx)
                 if lookup:
                     results.append(lookup)
 
@@ -618,14 +579,18 @@ JSON만 출력:
     def _find_entities_in_question(self, question: str) -> list:
         found = []
         q_clean = question.replace(' ', '')
-        skip_headers = {'순번', '구분', '열2', '열3', '열4', '열5', '열6', '열7', '열8',
-                        '기관명 구분', '기관명구분', '연구개발비', '소계', '합계', '총계'}
+        table_idx = self._parse_table_index_from_question(question)
+        skip_labels = {'순번', '구분', '열2', '열3', '열4', '열5', '열6', '열7', '열8',
+                       '기관명 구분', '기관명구분', '연구개발비', '소계', '합계', '총계',
+                       '현물인건비', '현물 인건비', '인건비', '항목', '세부항목'}
         for ts in self.tables:
+            if table_idx is not None and ts.index != table_idx:
+                continue
             if ts.dataframe is None:
                 continue
             for col in ts.headers:
                 col_str = str(col).strip()
-                if len(col_str) < 2 or col_str in skip_headers:
+                if len(col_str) < 2 or col_str in skip_labels:
                     continue
                 col_clean = col_str.replace(' ', '')
                 if col_clean in q_clean or col_str in question:
@@ -635,22 +600,37 @@ JSON만 출력:
                     )
                     if not already:
                         found.append(col_str)
+            label_cols = self._get_label_columns(ts.dataframe)
+            for _, row in ts.dataframe.iterrows():
+                for lc in label_cols:
+                    cell = str(row.get(lc, '')).strip()
+                    cell_clean = cell.replace(' ', '')
+                    if len(cell_clean) < 4 or cell in skip_labels or cell_clean in skip_labels:
+                        continue
+                    if self._text_matches_question(cell, question, min_len=4):
+                        already = any(
+                            cell_clean == f.replace(' ', '') or cell in f or f in cell
+                            for f in found
+                        )
+                        if not already:
+                            found.append(cell)
         return found
 
     def _find_metrics_in_question(self, question: str) -> list:
         q_clean = question.replace(' ', '')
         metric_keywords = [
             '전년도 매출액', '매출액 대비 연구개발비 비율', '연구개발비 비율', '연구개발비',
+            '현물 인건비', '현물인건비', '인건비',
             '자본잠식 현황', '자본 총계', '자본총계', '자본금',
             '부채 비율', '부채비율', '유동 비율', '유동비율',
             '영업 이익', '영업이익', '이자 보상 비율', '이자보상비율',
             '매출액', '사업비', '예산', '상시 종업원 수', '주생산 품목',
+            '소계', '합계',
         ]
         found = []
         for kw in metric_keywords:
             if kw.replace(' ', '') in q_clean and kw not in found:
                 found.append(kw)
-                break
         return found
 
     def _find_year_label_col(self, df: pd.DataFrame, label_cols: list) -> Optional[str]:
@@ -663,6 +643,18 @@ JSON만 출력:
                 return col
         return None
 
+    def _parse_table_index_from_question(self, question: str) -> Optional[int]:
+        m = re.search(r'표\s*(\d+)', question)
+        return int(m.group(1)) - 1 if m else None
+
+    def _text_matches_question(self, text: str, question: str, min_len: int = 3) -> bool:
+        cell = (text or '').strip()
+        if len(cell.replace(' ', '')) < min_len:
+            return False
+        cell_clean = cell.replace(' ', '')
+        q_clean = question.replace(' ', '')
+        return cell_clean in q_clean or cell in question
+
     def _get_label_columns(self, df: pd.DataFrame) -> list:
         label_cols = []
         for col in df.columns[:4]:
@@ -673,11 +665,100 @@ JSON만 출력:
                 label_cols.append(col)
         return label_cols if label_cols else [df.columns[0]]
 
-    def _lookup_entity_metric(self, entity: str, metric: str, target_years: list) -> Optional[dict]:
+    def _lookup_entity_metric_rows(
+        self,
+        entity: str,
+        metric: str,
+        target_years: list,
+        table_index: Optional[int] = None,
+    ) -> Optional[dict]:
+        """행 라벨 기반 조회 — 기관명이 행에 있고 지표가 하위 행인 표."""
+        entity_clean = entity.replace(' ', '')
+        metric_clean = (metric or '').replace(' ', '')
+        metric_tokens = [metric_clean] if metric_clean else []
+        if metric_clean == '소계' or (not metric_clean and '소계' in entity):
+            metric_tokens = ['소계', '합계', '계']
+
+        for ts in self.tables:
+            if table_index is not None and ts.index != table_index:
+                continue
+            if ts.dataframe is None:
+                continue
+            df = ts.dataframe
+            label_cols = self._get_label_columns(df)
+            data_cols = [c for c in df.columns if c not in label_cols]
+
+            start_idx = None
+            for idx, row in df.iterrows():
+                row_text = ' '.join(str(row.get(lc, '')).strip() for lc in label_cols)
+                row_clean = row_text.replace(' ', '')
+                if entity_clean in row_clean or entity in row_text:
+                    start_idx = idx
+                    break
+            if start_idx is None:
+                continue
+
+            block_rows = []
+            for idx in range(start_idx, len(df)):
+                row = df.iloc[idx]
+                if idx > start_idx:
+                    first_label = str(row.get(label_cols[0], '')).strip()
+                    fl_clean = first_label.replace(' ', '')
+                    if (
+                        first_label
+                        and entity_clean not in fl_clean
+                        and entity not in first_label
+                        and len(fl_clean) >= 3
+                        and not any(kw in first_label for kw in ['소계', '합계', '계', '합'])
+                    ):
+                        break
+                block_rows.append(idx)
+
+            values = []
+            for idx in block_rows:
+                row = df.iloc[idx]
+                row_labels = ' | '.join(
+                    str(row.get(lc, '')).strip() for lc in label_cols
+                    if str(row.get(lc, '')).strip()
+                )
+                row_clean = row_labels.replace(' ', '')
+
+                if metric_tokens:
+                    if not any(tok in row_clean for tok in metric_tokens if tok):
+                        continue
+
+                for col in data_cols:
+                    raw_val = str(row.get(col, '')).strip()
+                    if not raw_val or raw_val in ('-', ''):
+                        continue
+                    numeric_val = _parse_number(raw_val)
+                    label = f"{row_labels} ({col})" if len(data_cols) > 1 else row_labels
+                    values.append({
+                        'label': label,
+                        'raw': raw_val,
+                        'numeric': numeric_val,
+                    })
+
+            doc_tag = f" [{ts.document_id}]" if ts.document_id and self.multi_doc else ""
+            if values:
+                desc_metric = metric or '소계'
+                return {
+                    'description': f"표 {ts.index+1}{doc_tag}에서 [{entity}]의 [{desc_metric}] 조회:",
+                    'values': values,
+                    'unit': ts.unit,
+                    'table_index': ts.index,
+                }
+
+        return None
+
+    def _lookup_entity_metric(self, entity: str, metric: str, target_years: list,
+                              table_index: Optional[int] = None) -> Optional[dict]:
         entity_clean = entity.replace(' ', '')
         metric_clean = metric.replace(' ', '')
 
         for ts in self.tables:
+            if table_index is not None and ts.index != table_index:
+                continue
             if ts.dataframe is None:
                 continue
             df = ts.dataframe
@@ -771,12 +852,15 @@ JSON만 출력:
                     'table_index': ts.index,
                 }
 
-        return None
+        return self._lookup_entity_metric_rows(entity, metric, target_years, table_index)
 
-    def _lookup_entity_all(self, entity: str, target_years: list) -> Optional[dict]:
+    def _lookup_entity_all(self, entity: str, target_years: list,
+                           table_index: Optional[int] = None) -> Optional[dict]:
         entity_clean = entity.replace(' ', '')
 
         for ts in self.tables:
+            if table_index is not None and ts.index != table_index:
+                continue
             if ts.dataframe is None:
                 continue
             df = ts.dataframe
@@ -787,6 +871,9 @@ JSON만 출력:
                     entity_col = col
                     break
             if entity_col is None:
+                row_lookup = self._lookup_entity_metric_rows(entity, '', target_years, table_index=ts.index)
+                if row_lookup:
+                    return row_lookup
                 continue
 
             label_cols = self._get_label_columns(df)
@@ -1129,60 +1216,29 @@ JSON만 출력:
         start_time = time.time()
 
         try:
-            response = requests.post(
-                f"{ollama_url}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.2,
-                        "num_predict": 2048,
-                        "num_ctx": 32768,
-                    }
-                },
-                timeout=180,
+            llm_result = _llm_generate(
+                prompt, model, ollama_url,
+                temperature=0.2, num_predict=2048, num_ctx=32768, timeout=180,
             )
             elapsed = time.time() - start_time
 
-            if response.status_code == 200:
-                result = response.json()
-                llm_answer = result.get('response', '').strip()
-                prompt_tokens = result.get('prompt_eval_count', 0)
-                completion_tokens = result.get('eval_count', 0)
-
+            if llm_result.get('error'):
                 return {
-                    'answer': llm_answer,
-                    'source': f'LLM ({model}) + 문서 분석',
-                    'confidence': 'llm',
-                    'model': model,
-                    'elapsed': round(elapsed, 1),
-                    'prompt_tokens': prompt_tokens,
-                    'completion_tokens': completion_tokens,
-                }
-            else:
-                return {
-                    'answer': f"LLM 오류 (HTTP {response.status_code}).\n\nRule-based:\n{rule_hint}",
+                    'answer': f"LLM 오류: {llm_result['error']}.\n\nRule-based:\n{rule_hint}",
                     'source': rule_result.get('source', ''),
                     'confidence': rule_result.get('confidence', 'low'),
-                    'error': response.text[:200],
-                    'elapsed': round(time.time() - start_time, 1),
+                    'error': llm_result['error'],
+                    'elapsed': round(elapsed, 1),
                 }
-        except requests.ConnectionError:
+
             return {
-                'answer': f"Ollama 미연결.\n\nRule-based:\n{rule_hint}",
-                'source': rule_result.get('source', ''),
-                'confidence': rule_result.get('confidence', 'low'),
-                'error': 'Ollama 연결 실패',
-                'elapsed': round(time.time() - start_time, 1),
-            }
-        except requests.Timeout:
-            return {
-                'answer': f"LLM 시간 초과.\n\nRule-based:\n{rule_hint}",
-                'source': rule_result.get('source', ''),
-                'confidence': rule_result.get('confidence', 'low'),
-                'error': 'Timeout',
-                'elapsed': round(time.time() - start_time, 1),
+                'answer': llm_result.get('text', '').strip(),
+                'source': f'LLM ({model}) + 문서 분석',
+                'confidence': 'llm',
+                'model': model,
+                'elapsed': round(elapsed, 1),
+                'prompt_tokens': llm_result.get('prompt_tokens', 0),
+                'completion_tokens': llm_result.get('completion_tokens', 0),
             }
         except Exception as e:
             return {
@@ -1226,67 +1282,29 @@ JSON만 출력:
         start_time = time.time()
 
         try:
-            response = requests.post(
-                f"{ollama_url}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": True,
-                    "options": {
-                        "temperature": 0.2,
-                        "num_predict": 2048,
-                        "num_ctx": 32768,
-                    }
-                },
-                timeout=180,
-                stream=True,
+            llm_result = _llm_generate(
+                prompt, model, ollama_url,
+                stream=True, temperature=0.2, num_predict=2048,
+                num_ctx=32768, timeout=180,
             )
 
-            if response.status_code != 200:
+            if llm_result.get('error'):
                 return {
-                    'answer': f"LLM 오류 (HTTP {response.status_code}).\n\nRule-based:\n{rule_hint}",
+                    'answer': f"LLM 오류: {llm_result['error']}.\n\nRule-based:\n{rule_hint}",
                     'source': rule_result.get('source', ''),
                     'confidence': rule_result.get('confidence', 'low'),
-                    'error': response.text[:200],
+                    'error': llm_result['error'],
                     'elapsed': round(time.time() - start_time, 1),
                 }
 
-            def token_generator():
-                for line in response.iter_lines():
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                        token = chunk.get('response', '')
-                        if token:
-                            yield token
-                    except json.JSONDecodeError:
-                        continue
-
             return {
-                'answer_stream': token_generator(),
+                'answer_stream': llm_result['stream'],
                 'source': f'LLM ({model}) + 문서 분석',
                 'confidence': 'llm',
                 'model': model,
                 'start_time': start_time,
             }
 
-        except requests.ConnectionError:
-            return {
-                'answer': f"Ollama 미연결.\n\nRule-based:\n{rule_hint}",
-                'source': rule_result.get('source', ''),
-                'confidence': rule_result.get('confidence', 'low'),
-                'error': 'Ollama 연결 실패',
-                'elapsed': round(time.time() - start_time, 1),
-            }
-        except requests.Timeout:
-            return {
-                'answer': f"LLM 시간 초과.\n\nRule-based:\n{rule_hint}",
-                'source': rule_result.get('source', ''),
-                'confidence': rule_result.get('confidence', 'low'),
-                'error': 'Timeout',
-                'elapsed': round(time.time() - start_time, 1),
-            }
         except Exception as e:
             return {
                 'answer': f"LLM 오류: {e}\n\nRule-based:\n{rule_hint}",
@@ -1428,15 +1446,6 @@ JSON만 출력:
         return lines
 
 
-def check_ollama_status(ollama_url: str = "http://localhost:11434") -> dict:
-    try:
-        resp = requests.get(f"{ollama_url}/api/tags", timeout=5)
-        if resp.status_code == 200:
-            models = resp.json().get('models', [])
-            names = [m.get('name', '') for m in models]
-            return {'status': 'running', 'models': names, 'has_gemma4': any('gemma4' in m for m in names)}
-        return {'status': 'error', 'models': [], 'has_gemma4': False}
-    except requests.ConnectionError:
-        return {'status': 'not_running', 'models': [], 'has_gemma4': False}
-    except Exception:
-        return {'status': 'error', 'models': [], 'has_gemma4': False}
+
+# check_ollama_status는 llm_client에서 import하여 re-export
+# from .llm_client import check_ollama_status  (이미 상단에서 import)

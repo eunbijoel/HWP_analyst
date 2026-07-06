@@ -313,6 +313,8 @@ def hwpilot_convert_to_hwpx(file_bytes: bytes, filename: str = 'doc.hwp') -> Opt
 
 def hwpilot_append_to_end(file_path: str, body: str) -> tuple[bool, str]:
     """문서 끝에 문단 추가 (HWP/HWPX 모두 hwpilot 직접 편집)."""
+    from additional.reference_parser import normalize_insert_body
+
     section_ref = 's0'
     data = hwpilot_read_file(file_path, limit=5)
     if data and data.get('sections'):
@@ -320,6 +322,7 @@ def hwpilot_append_to_end(file_path: str, body: str) -> tuple[bool, str]:
         if sections:
             section_ref = f"s{sections[-1].get('index', len(sections) - 1)}"
 
+    body = normalize_insert_body(body)
     lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
     if not lines:
         return False, '삽입할 본문이 비어 있습니다.'
@@ -327,7 +330,7 @@ def hwpilot_append_to_end(file_path: str, body: str) -> tuple[bool, str]:
     added = 0
     for line in lines:
         _, err = hwpilot_run(
-            ['paragraph', 'add', file_path, section_ref, line, '--position', 'end'],
+            ['paragraph', 'add', file_path, section_ref, '--position', 'end', '--', line],
             timeout=60,
         )
         if err:
@@ -357,8 +360,11 @@ def hwpilot_apply_content(
 
 def hwpilot_insert_after_anchor(file_path: str, anchor: str, body: str) -> tuple[bool, str]:
     """앵커 텍스트를 find한 뒤 문단을 after로 추가."""
+    from additional.reference_parser import normalize_insert_body
+
     if not anchor.strip():
         return False, '앵커 텍스트가 필요합니다.'
+    body = normalize_insert_body(body)
     matches = hwpilot_find_refs(file_path, anchor.strip())
     if not matches:
         short = anchor.strip()[:40]
@@ -378,7 +384,7 @@ def hwpilot_insert_after_anchor(file_path: str, anchor: str, body: str) -> tuple
     added = 0
     for line in lines:
         _, err = hwpilot_run(
-            ['paragraph', 'add', file_path, ref, line, '--position', 'after'],
+            ['paragraph', 'add', file_path, ref, '--position', 'after', '--', line],
             timeout=60,
         )
         if err:

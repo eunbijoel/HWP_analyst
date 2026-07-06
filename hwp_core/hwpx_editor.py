@@ -14,7 +14,7 @@ from xml.etree import ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .table_grid import (
+from .table_extractor import (
     parse_table_grid, is_inside_table, local_tag, build_element_grid,
 )
 TOTAL_KEYWORDS = ['합계', '총계', '소계', '계', '합', '총', 'total', 'sum', '전체']
@@ -1230,15 +1230,15 @@ class HWPXEditor:
                     continue
                 if self._find_ancestor_tc(root, elem) is not None:
                     continue
-                    if track_changes and elem.text.strip() == old_text.strip():
-                        container = self._find_ancestor_tc(root, elem) or self._find_ancestor_p(root, elem)
-                        if container is not None:
-                            self._mark_runs_style(container, 'strike')
-                    elem.text = elem.text.replace(old_text, new_text)
-                    count += 1
-                    container = self._find_ancestor_tc(root, elem) or self._find_ancestor_p(root, elem)
+                if track_changes and elem.text.strip() == old_text.strip():
+                    container = self._find_ancestor_p(root, elem)
                     if container is not None:
-                        modified_containers.append(container)
+                        self._mark_runs_style(container, 'strike')
+                elem.text = elem.text.replace(old_text, new_text)
+                count += 1
+                container = self._find_ancestor_p(root, elem)
+                if container is not None:
+                    modified_containers.append(container)
         if count > 0:
             if track_changes:
                 for c in modified_containers:

@@ -16,7 +16,7 @@ from xml.etree import ElementTree as ET
 from typing import Optional
 from dataclasses import dataclass, field
 
-from hwp_core.table_grid import local_tag, parse_table_grid
+from hwp_core.table_extractor import local_tag, parse_table_grid
 
 
 UNIT_PATTERN = re.compile(r'[\(\（]\s*단위\s*[:：]\s*([^)\）]+)[\)\）]')

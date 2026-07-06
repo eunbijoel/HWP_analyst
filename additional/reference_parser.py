@@ -1,11 +1,16 @@
 """
-참고 자료 파서 — PDF, DOCX, XLSX, TXT 등 다형식 텍스트/표 추출
-AI 편집·Q&A 컨텍스트용
+참고 자료 파서 + 워크플로
+- PDF, DOCX, XLSX, TXT 등 다형식 텍스트/표 추출
+- 참고자료 요약 생성
+- 요약을 작업 HWP/HWPX 문서 끝에 삽입
 """
+
+from __future__ import annotations
 
 import io
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -164,3 +169,194 @@ def build_reference_context(refs: list[ReferenceDocument], max_chars: int = 1200
         if total >= max_chars:
             break
     return '\n\n'.join(parts)
+
+
+# =========================================================
+# 참고자료 워크플로 (구 reference_workflow.py)
+# =========================================================
+
+def normalize_insert_body(text: str) -> str:
+    """마크다운·UI 힌트를 한글 문서 삽입용 평문으로 변환."""
+    t = (text or '').strip()
+    t = re.sub(r'👉[^\n]*', '', t)
+    lines: list[str] = []
+    for raw in t.splitlines():
+        line = raw.strip()
+        if not line or line in ('---', '***', '___'):
+            continue
+        line = re.sub(r'^#{1,6}\s*', '', line)
+        line = re.sub(r'\*\*([^*]+)\*\*', r'\1', line)
+        line = re.sub(r'\*([^*]+)\*', r'\1', line)
+        line = re.sub(r'^[-*•]\s+', '· ', line)
+        if line.startswith('-'):
+            line = '· ' + line.lstrip('-').strip()
+        lines.append(line)
+    return '\n'.join(lines)
+
+
+def generate_reference_summary(
+    reference_context: str,
+    model: str,
+    ollama_url: str,
+    focus: str = '',
+) -> tuple[str, str]:
+    """참고자료 전체를 작업 문서에 넣기 좋은 요약으로 변환."""
+    from hwp_core.llm_client import generate
+
+    if not reference_context.strip():
+        return '', '참고자료가 없습니다. 사이드바에서 PDF·DOCX 등을 업로드하세요.'
+
+    focus_line = f'\n특히 다음 관점을 반영하세요: {focus}' if focus else ''
+    prompt = f"""다음 참고자료를 한글 공문서에 붙여 넣을 수 있는 요약으로 작성하세요.
+
+규칙:
+- 마크다운(---, ###, **) 사용 금지. 일반 문장과 · 불릿만 사용
+- 제목 한 줄 후 본문 (번호 목록 가능)
+- 표·수치는 빠짐없이 포함
+- 800~2000자 내외{focus_line}
+
+[참고자료]
+{reference_context[:10000]}
+"""
+    result = generate(
+        prompt, model, ollama_url,
+        temperature=0.3, num_predict=3000, num_ctx=16384, timeout=180,
+    )
+    if result.get('error'):
+        return '', f"LLM 오류: {result['error']}"
+    text = result.get('text', '').strip()
+    return normalize_insert_body(text), ''
+
+
+def pick_summary_text(
+    command: str,
+    chat_history: list | None,
+    cached_summary: str = '',
+) -> str:
+    """명령·캐시·이전 채팅에서 삽입할 본문 선택."""
+    if cached_summary and len(cached_summary.strip()) >= 40:
+        return normalize_insert_body(cached_summary)
+
+    if chat_history:
+        for msg in reversed(chat_history):
+            if msg.get('role') != 'assistant':
+                continue
+            content = (msg.get('content') or '').strip()
+            if len(content) < 40:
+                continue
+            if content.startswith('\U0001f449') or '모두 적용' in content:
+                continue
+            if '참고자료' in content or '요약' in content or len(content) > 200:
+                return normalize_insert_body(content)
+
+    colon = re.search(r'[:：]\s*(.+)$', command, re.S)
+    if colon and len(colon.group(1).strip()) >= 40:
+        return normalize_insert_body(colon.group(1))
+
+    return ''
+
+
+def propose_append_at_end(editor, body: str):
+    """문서 마지막 문단 뒤에 본문 삽입 제안 (HWPX XML, hwpilot 불필요)."""
+    from hwp_core.hwpx_editor import PendingChange
+
+    body = normalize_insert_body(body)
+    if not body or len(body) < 10:
+        return None
+    paras = editor.get_paragraphs()
+    if not paras:
+        return None
+    last = paras[-1]
+    import uuid
+    change = PendingChange(
+        id=str(uuid.uuid4())[:8],
+        change_type='insert_after',
+        location='문서 끝',
+        old_text='',
+        new_text=body,
+        paragraph_index=last['index'],
+        section_file=last.get('section_file'),
+        search_hint='__END__',
+    )
+    editor.pending_changes.append(change)
+    editor._bump_preview()
+    return change
+
+
+def append_summary_to_document(
+    editor,
+    command: str,
+    reference_context: str,
+    model: str,
+    ollama_url: str,
+    chat_history: list | None = None,
+    cached_summary: str = '',
+    source_filename: str = 'doc.hwpx',
+    file_bytes: bytes | None = None,
+) -> dict:
+    """참고자료 요약을 작업 문서 끝에 추가."""
+    start = time.time()
+    body = pick_summary_text(command, chat_history, cached_summary)
+
+    if not body and reference_context:
+        body, err = generate_reference_summary(reference_context, model, ollama_url)
+        if err:
+            return {
+                'type': 'edit', 'intent': 'append_ref',
+                'message': f'요약 생성 실패: {err}',
+                'changes': 0, 'elapsed': round(time.time() - start, 1),
+            }
+
+    if not body:
+        return {
+            'type': 'edit', 'intent': 'append_ref',
+            'message': (
+                '삽입할 요약이 없습니다. 먼저 「참고자료 요약 생성」을 누르거나 '
+                '「참고자료 내용 알려줘」로 요약을 받은 뒤 「작업 문서 끝에 추가」를 사용하세요.'
+            ),
+            'changes': 0, 'elapsed': round(time.time() - start, 1),
+        }
+
+    title = '【참고자료 요약】'
+    full_body = f'{title}\n{body}'
+
+    if editor is not None:
+        ch = propose_append_at_end(editor, full_body)
+        if ch:
+            return {
+                'type': 'edit', 'intent': 'append_ref',
+                'message': (
+                    f'참고자료 요약 {len(body)}자를 문서 끝에 제안했습니다. '
+                    '왼쪽 **노란색** 확인 후 「모두 적용」하세요.'
+                ),
+                'changes': 1,
+                'elapsed': round(time.time() - start, 1),
+                'summary_text': body,
+            }
+
+    from hwp_core.hwp_backends import get_backend_status, hwpilot_apply_content
+    if file_bytes and get_backend_status().hwpilot:
+        new_bytes, msg = hwpilot_apply_content(
+            file_bytes, source_filename, full_body, anchor='__END__',
+        )
+        if new_bytes:
+            return {
+                'type': 'edit', 'intent': 'append_ref',
+                'message': f'{msg} — 참고자료 요약이 문서 끝에 반영되었습니다.',
+                'changes': 1,
+                'elapsed': round(time.time() - start, 1),
+                'applied_direct': True,
+                'new_file_bytes': new_bytes,
+                'summary_text': body,
+            }
+        return {
+            'type': 'edit', 'intent': 'append_ref',
+            'message': msg or '문서 끝 삽입에 실패했습니다.',
+            'changes': 0, 'elapsed': round(time.time() - start, 1),
+        }
+
+    return {
+        'type': 'edit', 'intent': 'append_ref',
+        'message': '작업 문서가 열려 있지 않습니다. HWP/HWPX를 업로드하세요.',
+        'changes': 0, 'elapsed': round(time.time() - start, 1),
+    }

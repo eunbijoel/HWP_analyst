@@ -16,17 +16,42 @@ from additional.ai_editor import (
     delete_hwp_from_command,
     replace_hwp_from_command,
     extract_replace_spec,
+    apply_table_cell_amount_command,
 )
 
 
 EDIT_FILL = re.compile(r'빈칸|채워|채우|기입|입력해|공란', re.I)
 EDIT_DRAFT = re.compile(r'초안|작성해|써줘|작성해줘|제안서|계획서.*작성', re.I)
 EDIT_REWRITE = re.compile(r'리라이트|다듬|명확하게|개선', re.I)
-EDIT_REPLACE = re.compile(r'찾아서.*바꿔|치환|전체.*바꿔|표', re.I)
+EDIT_REPLACE = re.compile(r'찾아서.*바꿔|치환|전체.*바꿔', re.I)
 EDIT_DELETE = re.compile(r'삭제|지워|제거|없애|빼\s*줘|취소해', re.I)
-INSERT_CMD = re.compile(r'넣어|삽입|기입해|적어\s*넣|기록해|추가해', re.I)
+INSERT_CMD = re.compile(r'넣어|삽입|기입해|적어\s*넣|기록해|추가해|추가하', re.I)
 INSERT_ANCHOR = re.compile(r'(?:아래|밑|하단|뒤|이후|마지막|맨\s*끝|문서\s*끝)에', re.I)
-QUESTION = re.compile(r'\?|얼마|몇 |무엇|어떤|알려|합계|총 |평균|비교|목록|리스트', re.I)
+QUESTION = re.compile(
+    r'\?|얼마|몇 |무엇|어떤|어떻게|뭐야|뭔지|돼|알려|합계|소계|총 |평균|비교|목록|리스트',
+    re.I,
+)
+TABLE_QUESTION = re.compile(
+    r'표\s*\d+.*(?:어떻게|뭐|얼마|소계|합계|알려|돼|계산|뭔지)',
+    re.I,
+)
+TABLE_CELL_EDIT = re.compile(
+    r'표\s*\d+.*(?:추가|반영|넣|기입).*(?:계산|소계|합계|재계산)|'
+    r'표\s*\d+.*[\d,]+.*(?:추가|반영)',
+    re.I,
+)
+APPEND_REF = re.compile(
+    r'(?:참고자료|참고\s*자료).*(?:요약|추가|넣|반영)|'
+    r'(?:요약|요약한\s*내용).*(?:추가|넣|반영|삽입)|'
+    r'(?:추가|넣|반영).*(?:참고자료|요약한\s*내용)|'
+    r'\.hwpx.*(?:에\s*)?(?:추가|넣)|\.hwp.*(?:에\s*)?(?:추가|넣)',
+    re.I,
+)
+REPLACE_VERBS = re.compile(r'(?:바꿔|치환|교체|고쳐|변경)(?:줘|주세요)?', re.I)
+REPLACE_PATTERN = re.compile(
+    r'(?:을|를)\s*.+\s*(?:으로|로)\s*(?:바꿔|수정|변경|교체|고쳐)',
+    re.I,
+)
 KNOWLEDGE_REQUEST = re.compile(
     r'필요성|중요성|의미|정의|개념|장점|단점|배경|목적|정리|요약|설명|bullet|불릿',
     re.I,
@@ -89,7 +114,19 @@ def _try_hwp_bytes_insert(
 
 def classify_intent(text: str) -> str:
     t = text.strip()
-    if extract_replace_spec(t):
+    spec = extract_replace_spec(t)
+
+    if TABLE_CELL_EDIT.search(t):
+        return 'table_edit'
+    if APPEND_REF.search(t):
+        return 'append_ref'
+    if TABLE_QUESTION.search(t) and not (spec and REPLACE_VERBS.search(t)):
+        return 'qa'
+    if QUESTION.search(t) and not (spec and (REPLACE_VERBS.search(t) or spec.get('line_num'))):
+        if not REPLACE_PATTERN.search(t):
+            return 'qa'
+
+    if spec and (spec.get('line_num') or REPLACE_VERBS.search(t) or REPLACE_PATTERN.search(t)):
         return 'replace'
     if EDIT_DELETE.search(t):
         return 'delete'
@@ -103,7 +140,7 @@ def classify_intent(text: str) -> str:
         return 'draft'
     if EDIT_REPLACE.search(t):
         return 'replace'
-    if re.search(r'바꿔|수정|고쳐|교체|변경', t, re.I):
+    if REPLACE_PATTERN.search(t):
         return 'replace'
     if EDIT_REWRITE.search(t):
         return 'rewrite'
@@ -134,11 +171,48 @@ def execute_edit_command(
     chat_history: list | None = None,
     source_filename: str = 'doc.hwpx',
     file_bytes: bytes | None = None,
+    ref_summary_cache: str = '',
 ) -> dict:
     """편집 명령 실행 → pending changes 생성."""
     intent = classify_intent(command)
     spec = extract_replace_spec(command)
     pair = (spec['old'], spec['new']) if spec and spec.get('new') else None
+
+    if intent == 'table_edit':
+        if editor is None:
+            return {
+                'type': 'edit', 'intent': 'table_edit',
+                'message': (
+                    '표 셀 금액 수정·소계 재계산은 **HWPX 편집 모드**에서 지원됩니다. '
+                    'HWP 파일은 한글에서 HWPX로 저장 후 업로드하거나, '
+                    'hwpilot이 없을 때는 HWPX 문서를 사용해 주세요.'
+                ),
+                'changes': 0,
+            }
+        changes, msg, elapsed = apply_table_cell_amount_command(editor, command)
+        if changes and re.search(r'계산|소계|합계|재계산', command):
+            m = re.search(r'표\s*(\d+)', command)
+            if m:
+                editor.recalculate_totals(int(m.group(1)) - 1)
+                msg += ' · 소계/합계 행을 재계산했습니다.'
+        return {
+            'type': 'edit', 'intent': 'table_edit',
+            'message': (
+                f'{msg} — 왼쪽에서 **노란색** 확인 후 「모두 적용」'
+                if changes else msg
+            ),
+            'changes': len(changes),
+            'elapsed': elapsed,
+        }
+
+    if intent == 'append_ref':
+        from additional.reference_parser import append_summary_to_document
+        result = append_summary_to_document(
+            editor, command, reference_context, model, ollama_url,
+            chat_history=chat_history, cached_summary=ref_summary_cache,
+            source_filename=source_filename, file_bytes=file_bytes,
+        )
+        return result
 
     if intent == 'replace':
         if (

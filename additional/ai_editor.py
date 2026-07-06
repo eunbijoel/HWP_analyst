@@ -10,43 +10,8 @@ import re
 import time
 from typing import Optional
 
-import requests
-
 from hwp_core.hwpx_editor import HWPXEditor, BlankField, PendingChange
-
-
-def _call_ollama_json(prompt: str, model: str, ollama_url: str,
-                      timeout: int = 180) -> tuple[Optional[dict | list], str]:
-    try:
-        response = requests.post(
-            f'{ollama_url}/api/generate',
-            json={
-                'model': model,
-                'prompt': prompt,
-                'stream': False,
-                'format': 'json',
-                'options': {'temperature': 0.3, 'num_predict': 4096, 'num_ctx': 32768},
-            },
-            timeout=timeout,
-        )
-        if response.status_code != 200:
-            return None, f'HTTP {response.status_code}'
-        raw = response.json().get('response', '').strip()
-        if not raw:
-            return None, '빈 응답'
-        return json.loads(raw), ''
-    except json.JSONDecodeError as e:
-        m = re.search(r'[\[{].*[\]}]', raw, re.S)
-        if m:
-            try:
-                return json.loads(m.group()), ''
-            except json.JSONDecodeError:
-                pass
-        return None, f'JSON 파싱 오류: {e}'
-    except requests.RequestException as e:
-        return None, str(e)
-    except Exception as e:
-        return None, str(e)
+from hwp_core.llm_client import generate_json as _call_ollama_json
 
 
 def _document_outline(editor: HWPXEditor, max_paras: int = 30) -> str:
@@ -392,6 +357,12 @@ def _extract_insert_payload(command: str, chat_history: list | None) -> tuple[st
 
     if re.search(r'마지막|맨\s*끝|문서\s*끝', cmd, re.I):
         anchor = '__END__'
+    if re.search(
+        r'(?:참고자료|요약|요약한\s*내용).*(?:추가|넣|반영)|'
+        r'(?:추가|넣|반영).*(?:참고자료|요약)|\.hwpx.*(?:추가|넣)|\.hwp.*(?:추가|넣)',
+        cmd, re.I,
+    ):
+        anchor = '__END__'
 
     body = cmd
     if anchor:
@@ -440,6 +411,9 @@ def insert_content_from_command(
         return [], '삽입할 본문을 찾지 못했습니다. 이전 AI 답변 또는 붙여넣은 내용이 필요합니다.', 0.0
 
     from hwp_core.hwp_backends import get_backend_status, hwpilot_apply_content
+    from additional.reference_parser import normalize_insert_body
+
+    body = normalize_insert_body(body)
 
     if get_backend_status().hwpilot and anchor == '__END__':
         new_bytes, msg = hwpilot_apply_content(
@@ -877,3 +851,78 @@ def delete_hwp_from_command(
     if not indices:
         return None, '문서에서 삭제할 문단을 찾지 못했습니다.', []
     return _apply_hwp_paragraph_deletes(file_bytes, filename, indices)
+
+
+def apply_table_cell_amount_command(
+    editor: HWPXEditor,
+    command: str,
+) -> tuple[list, str, float]:
+    """표 번호·행 키워드·금액으로 셀 값 설정/추가."""
+    m_table = re.search(r'표\s*(\d+)', command)
+    m_amount = re.search(r'([\d][\d,]*)', command)
+    if not m_table or not m_amount:
+        return [], '표 번호와 금액을 찾지 못했습니다.', 0.0
+
+    table_idx = int(m_table.group(1)) - 1
+    try:
+        amount_val = float(m_amount.group(1).replace(',', ''))
+    except ValueError:
+        return [], '금액 형식을 이해하지 못했습니다.', 0.0
+
+    is_add = bool(re.search(r'추가', command))
+    skip = {
+        '표', '추가', '반영', '계산', '다시', '해줘', '하고', '넣', '기입',
+        '한국', '생산성', '본부',
+    }
+    keywords = [
+        w for w in re.findall(r'[가-힣a-zA-Z0-9]+', command)
+        if len(w) >= 2 and w not in skip and not re.fullmatch(r'[\d,\.]+', w)
+    ]
+
+    if table_idx < 0 or table_idx >= editor.get_table_count():
+        return [], f'표 {table_idx + 1}을 찾지 못했습니다.', 0.0
+
+    rows = editor.get_table_as_rows(table_idx)
+    if not rows:
+        return [], '표가 비어 있습니다.', 0.0
+
+    best = None
+    best_score = 0
+    for r_idx, row in enumerate(rows):
+        row_text = ' '.join(str(c) for c in row)
+        score = sum(3 for kw in keywords if kw in row_text)
+        if score <= 0:
+            continue
+        for c_idx, cell in enumerate(row):
+            cell_s = str(cell).strip()
+            if not cell_s:
+                continue
+            if re.fullmatch(r'[\d,\.\-\s]+', cell_s) or re.search(r'\d{2,}', cell_s):
+                if score > best_score:
+                    best = (r_idx, c_idx, cell_s, row_text)
+                    best_score = score
+
+    if not best or best_score < 3:
+        return [], (
+            f'표 {table_idx + 1}에서 해당 행을 찾지 못했습니다. '
+            f'(예: *표 3 한국생산성본부 현물인건비 44,000 추가하고 소계 다시 계산해줘*)'
+        ), 0.0
+
+    r_idx, c_idx, old_cell, row_text = best
+    old_num = 0.0
+    parsed_old = re.sub(r'[^\d.\-]', '', old_cell.replace(',', ''))
+    if parsed_old and parsed_old not in ('-', ''):
+        try:
+            old_num = float(parsed_old)
+        except ValueError:
+            pass
+    new_val = amount_val if not is_add else old_num + amount_val
+    new_str = f'{int(new_val):,}' if abs(new_val - int(new_val)) < 0.01 else f'{new_val:,.0f}'
+
+    ch = editor.propose_cell_change(
+        table_idx, r_idx, c_idx, new_str, context=row_text[:50],
+    )
+    verb = '추가' if is_add else '설정'
+    return [ch], (
+        f'표 {table_idx + 1} {row_text[:35]}… 셀 {old_cell or "(빈칸)"} → {new_str} ({verb})'
+    ), 0.0
