@@ -70,6 +70,7 @@ streamlit run app.py #실행
  │                │  │                  │  │ Stage 2: gemma4 (스트리밍)   │
  └────────────────┘  └──────────────────┘  └──────────────────────────────┘
 ```
+
 ```mermaid
 flowchart LR
     subgraph Input
@@ -97,7 +98,7 @@ flowchart LR
     end
 
     subgraph Enrich["Post-process (CPU)"]
-        ET[extract_tables<br/>TableSummary[]]
+        ET[extract_tables<br/>TableSummary]
         NT[detect_numbers_in_text]
         NB[detect_numbers_in_tables]
     end
@@ -119,6 +120,7 @@ flowchart LR
     HWPX_Path --> Enrich
     Enrich --> C
 ```
+
 
 ### 편집
 
