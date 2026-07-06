@@ -41,6 +41,16 @@ HWP analysis/
     └── windows_agent/      # Windows 한글 COM 브리지 (선택)
         └── hwp_bridge.py
 ```
+## 설치 및 실행
+
+```bash
+pip install -r requirements.txt  # pyhwp CLI: hwp5txt, hwp5html
+
+# hwpilot (선택 — HWP 편집·변환·구조화 read)
+npm install -g hwpilot  # npm에 없으면: git clone https://github.com/devxoul/hwpilot && cd hwpilot && npm install -g .
+
+streamlit run app.py #실행
+```
 
 
 ## 아키텍처
