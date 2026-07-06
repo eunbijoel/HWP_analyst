@@ -1,0 +1,80 @@
+{
+  "name": "hwpilot",
+  "version": "0.1.0",
+  "description": "HWP Copilot",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/devxoul/hwpilot"
+  },
+  "bin": {
+    "hwpilot": "./src/cli/main.ts"
+  },
+  "files": [
+    "dist/",
+    "skills/",
+    ".claude-plugin/"
+  ],
+  "type": "module",
+  "main": "dist/src/sdk/index.js",
+  "module": "dist/src/sdk/index.js",
+  "exports": {
+    ".": {
+      "types": "./src/sdk/index.ts",
+      "default": "./src/sdk/index.ts"
+    },
+    "./node": {
+      "types": "./src/node/index.ts",
+      "default": "./src/node/index.ts"
+    },
+    "./server": {
+      "types": "./src/server/index.ts",
+      "default": "./src/server/index.ts"
+    },
+    "./client": {
+      "types": "./src/client/index.ts",
+      "default": "./src/client/index.ts"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "node": ["./src/node/index.ts"],
+      "server": ["./src/server/index.ts"],
+      "client": ["./src/client/index.ts"]
+    }
+  },
+  "scripts": {
+    "build": "tsc && tsc-alias --resolve-full-paths",
+    "postbuild": "bun scripts/postbuild.ts",
+    "test": "bun test src/",
+    "test:e2e": "bun test e2e/",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "format": "oxfmt --write .",
+    "prepublishOnly": "bun run build && bun run typecheck && bun test src/ && bun scripts/prepublish.ts",
+    "postpublish": "git checkout package.json"
+  },
+  "dependencies": {
+    "cfb": "^1.2.2",
+    "commander": "^11.1.0",
+    "fast-xml-parser": "^4.3.2",
+    "jszip": "^3.10.1",
+    "mdast-util-to-string": "^4.0.0",
+    "pako": "^2.1.0",
+    "remark": "^15.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-parse": "^11.0.0",
+    "remark-stringify": "^11.0.0",
+    "unist-util-visit": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/mdast": "^4.0.4",
+    "@types/node": "^20.10.6",
+    "@types/pako": "^2.0.4",
+    "oxfmt": "latest",
+    "oxlint": "latest",
+    "tsc-alias": "^1.8.16",
+    "typescript": "^5.9.3"
+  }
+}

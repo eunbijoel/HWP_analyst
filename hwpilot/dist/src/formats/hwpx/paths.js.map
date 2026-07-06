@@ -1,0 +1,1 @@
+{"version":3,"file":"paths.js","sourceRoot":"","sources":["../../../../src/formats/hwpx/paths.ts"],"names":[],"mappings":"AAAA,MAAM,CAAC,MAAM,KAAK,GAAG;IACnB,WAAW,EAAE,aAAa;IAC1B,UAAU,EAAE,qBAAqB;IACjC,WAAW,EAAE,sBAAsB;IACnC,YAAY,EAAE,uBAAuB;IACrC,YAAY,EAAE,UAAU;CAChB,CAAA;AAEV,MAAM,UAAU,WAAW,CAAC,CAAS;IACnC,OAAO,mBAAmB,CAAC,MAAM,CAAA;AACnC,CAAC"}

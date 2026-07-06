@@ -1,0 +1,1 @@
+{"version":3,"file":"reader.d.ts","sourceRoot":"","sources":["../../../../../src/sdk/formats/hwp/reader.ts"],"names":[],"mappings":"AAIA,OAAO,KAAK,EAIV,WAAW,EASZ,MAAM,aAAa,CAAA;AAmBpB,wBAAsB,OAAO,CAAC,UAAU,EAAE,UAAU,GAAG,OAAO,CAAC,WAAW,CAAC,CAuC1E;AAED,wBAAsB,mBAAmB,CAAC,UAAU,EAAE,UAAU,GAAG,OAAO,CAAC,MAAM,EAAE,CAAC,CA+CnF;AA2iBD,wBAAgB,eAAe,CAAC,IAAI,EAAE,MAAM,GAAG,MAAM,CAsBpD"}

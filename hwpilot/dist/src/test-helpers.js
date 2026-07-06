@@ -1,0 +1,329 @@
+import CFB from 'cfb';
+import JSZip from 'jszip';
+import { controlIdBuffer } from './formats/hwp/control-id.js';
+import { buildCellListHeaderData, buildParaLineSegBuffer, buildRecord, buildTableCtrlHeaderData, buildTableData, } from './formats/hwp/record-serializer.js';
+import { compressStream } from './formats/hwp/stream-util.js';
+import { TAG } from './formats/hwp/tag-ids.js';
+export { buildCellListHeaderData };
+export async function createTestHwpx(opts = {}) {
+    const zip = new JSZip();
+    const paragraphs = opts.paragraphs ?? [''];
+    const tables = opts.tables ?? [];
+    const images = opts.images ?? [];
+    const textBoxes = opts.textBoxes ?? [];
+    const fontName = opts.font ?? '맑은 고딕';
+    const fontHeight = opts.fontSize ?? 1000;
+    zip.file('version.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<hv:version xmlns:hv="http://www.hancom.co.kr/hwpml/2011/version"
+  major="5" minor="1" micro="0" buildNumber="0"/>`);
+    zip.file('META-INF/manifest.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0">
+  <manifest:file-entry manifest:full-path="/" manifest:media-type="application/hwp+zip"/>
+  <manifest:file-entry manifest:full-path="Contents/header.xml" manifest:media-type="text/xml"/>
+  <manifest:file-entry manifest:full-path="Contents/section0.xml" manifest:media-type="text/xml"/>
+</manifest:manifest>`);
+    zip.file('Contents/content.hpf', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<opf:package xmlns:opf="http://www.idpf.org/2007/opf/">
+  <opf:manifest>
+    <opf:item id="header" href="header.xml" media-type="text/xml"/>
+    <opf:item id="section0" href="section0.xml" media-type="text/xml"/>
+  </opf:manifest>
+  <opf:spine>
+    <opf:itemref idref="section0"/>
+  </opf:spine>
+</opf:package>`);
+    const headingFontSizes = [2200, 1800, 1600, 1400, 1300, 1200, 1100];
+    const headingCharPrs = headingFontSizes
+        .map((size, i) => `      <hh:charPr hh:id="${i + 1}" hh:height="${size}" hh:fontRef="0"
+        hh:fontBold="1" hh:fontItalic="0" hh:underline="0" hh:color="0"/>`)
+        .join('\n');
+    const headingParaPrs = headingFontSizes
+        .map((_, i) => `      <hh:paraPr hh:id="${i + 1}" hh:align="LEFT">
+        <hh:heading hh:type="OUTLINE" hh:idRef="0" hh:level="${i + 1}"/>
+      </hh:paraPr>`)
+        .join('\n');
+    const headingStyles = headingFontSizes
+        .map((_, i) => `      <hh:style hh:id="${i + 1}" hh:name="\uAC1C\uC694 ${i + 1}" hh:charPrIDRef="${i + 1}" hh:paraPrIDRef="${i + 1}" hh:type="PARA"/>`)
+        .join('\n');
+    zip.file('Contents/header.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList>
+    <hh:fontfaces>
+      <hh:fontface hh:id="0" hh:face="${escapeXml(fontName)}"/>
+    </hh:fontfaces>
+    <hh:charProperties>
+      <hh:charPr hh:id="0" hh:height="${fontHeight}" hh:fontRef="0"
+        hh:fontBold="0" hh:fontItalic="0" hh:underline="0" hh:color="0"/>
+${headingCharPrs}
+    </hh:charProperties>
+    <hh:paraProperties>
+      <hh:paraPr hh:id="0" hh:align="JUSTIFY"/>
+${headingParaPrs}
+    </hh:paraProperties>
+    <hh:styles>
+      <hh:style hh:id="0" hh:name="Normal" hh:charPrIDRef="0" hh:paraPrIDRef="0"/>
+${headingStyles}
+    </hh:styles>
+  </hh:refList>
+</hh:head>`);
+    let sectionContent = '';
+    paragraphs.forEach((text, i) => {
+        sectionContent += `
+    <hp:p xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+      hp:id="${i}" hp:paraPrIDRef="0" hp:styleIDRef="0">
+      <hp:run hp:charPrIDRef="0"><hp:t>${escapeXml(text)}</hp:t></hp:run>
+    </hp:p>`;
+    });
+    tables.forEach((table) => {
+        sectionContent += `
+    <hp:tbl xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">`;
+        table.rows.forEach((row, ri) => {
+            sectionContent += `
+      <hp:tr>`;
+            row.forEach((cellText, ci) => {
+                sectionContent += `
+        <hp:tc>
+          <hp:cellAddr hp:colAddr="${ci}" hp:rowAddr="${ri}"/>
+          <hp:cellSpan hp:colSpan="1" hp:rowSpan="1"/>
+          <hp:p hp:id="0" hp:paraPrIDRef="0" hp:styleIDRef="0">
+            <hp:run hp:charPrIDRef="0"><hp:t>${escapeXml(cellText)}</hp:t></hp:run>
+          </hp:p>
+        </hp:tc>`;
+            });
+            sectionContent += `
+      </hp:tr>`;
+        });
+        sectionContent += `
+    </hp:tbl>`;
+    });
+    images.forEach((img) => {
+        const binPath = `BinData/${img.name}.${img.format}`;
+        zip.file(binPath, img.data);
+        sectionContent += `
+    <hp:pic xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph" hp:id="${img.name}" hp:binDataPath="${binPath}" hp:format="${img.format}" hp:width="200" hp:height="150">
+      <hp:imgRect><hc:pt0 xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core"/></hp:imgRect>
+    </hp:pic>`;
+    });
+    textBoxes.forEach((tb) => {
+        sectionContent += `
+    <hp:rect xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+      <hp:drawText lastWidth="0" editable="true">
+        <hp:textMargin left="0" right="0" top="0" bottom="0"/>
+        <hp:subList>
+          <hp:p hp:id="0" hp:paraPrIDRef="0" hp:styleIDRef="0">
+            <hp:run hp:charPrIDRef="0"><hp:t>${escapeXml(tb.text)}</hp:t></hp:run>
+          </hp:p>
+        </hp:subList>
+      </hp:drawText>
+    </hp:rect>`;
+    });
+    zip.file('Contents/section0.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section"
+        xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core"
+        xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">${sectionContent}
+</hs:sec>`);
+    return zip.generateAsync({ type: 'nodebuffer' });
+}
+export async function createTestHwpBinary(opts = {}) {
+    const paragraphs = opts.paragraphs ?? [];
+    const tables = opts.tables ?? [];
+    const textBoxes = opts.textBoxes ?? [];
+    const compressed = opts.compressed ?? false;
+    const docInfo = buildDocInfoStream();
+    const section0 = buildSection0Stream(paragraphs, tables, textBoxes);
+    const cfb = CFB.utils.cfb_new();
+    CFB.utils.cfb_add(cfb, 'FileHeader', createHwpFileHeader(compressed));
+    CFB.utils.cfb_add(cfb, '\u0005HwpSummaryInformation', Buffer.alloc(0));
+    CFB.utils.cfb_add(cfb, 'DocInfo', compressed ? compressStream(docInfo) : docInfo);
+    CFB.utils.cfb_add(cfb, 'BodyText/Section0', compressed ? compressStream(section0) : section0);
+    return Buffer.from(CFB.write(cfb, { type: 'buffer' }));
+}
+export function createTestHwpCfb() {
+    const cfb = CFB.utils.cfb_new();
+    const fileHeader = Buffer.alloc(256);
+    fileHeader.write('HWP Document File', 0, 'ascii');
+    fileHeader.writeUInt32LE(0, 36); // flags: no compression, no encryption
+    CFB.utils.cfb_add(cfb, 'FileHeader', fileHeader);
+    const docInfo = buildDocInfoStream();
+    CFB.utils.cfb_add(cfb, 'DocInfo', docInfo);
+    return Buffer.from(CFB.write(cfb, { type: 'buffer' }));
+}
+function escapeXml(text) {
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+}
+function buildDocInfoStream() {
+    // HWP 5.0 ID_MAPPINGS: binData, faceNames×7, borderFill, charShape, tabDef, numbering, bullet, paraShape, style
+    const idMappings = Buffer.alloc(4 * 15);
+    idMappings.writeUInt32LE(0, 0); // binData
+    idMappings.writeUInt32LE(1, 4); // hangul faceName
+    idMappings.writeUInt32LE(1, 8); // english faceName
+    idMappings.writeUInt32LE(1, 12); // hanja faceName
+    idMappings.writeUInt32LE(1, 16); // japanese faceName
+    idMappings.writeUInt32LE(1, 20); // other faceName
+    idMappings.writeUInt32LE(1, 24); // symbol faceName
+    idMappings.writeUInt32LE(1, 28); // user faceName
+    idMappings.writeUInt32LE(2, 32); // borderFill
+    idMappings.writeUInt32LE(1, 36); // charShape
+    idMappings.writeUInt32LE(0, 40); // tabDef
+    idMappings.writeUInt32LE(0, 44); // numbering
+    idMappings.writeUInt32LE(0, 48); // bullet
+    idMappings.writeUInt32LE(1, 52); // paraShape
+    idMappings.writeUInt32LE(1, 56); // style
+    const faceName = Buffer.concat([Buffer.from([0x00]), encodeLengthPrefixedUtf16('맑은 고딕')]);
+    const charShape = Buffer.alloc(74);
+    charShape.writeUInt16LE(0, 0);
+    charShape.writeUInt16LE(0, 2);
+    charShape.writeUInt32LE(1000, 42);
+    charShape.writeUInt32LE(0, 46);
+    charShape.writeUInt32LE(0, 52);
+    const paraShape = Buffer.alloc(4);
+    paraShape.writeUInt32LE(0, 0);
+    const borderFill = Buffer.alloc(2);
+    const styleName = encodeLengthPrefixedUtf16('Normal');
+    const style = Buffer.alloc(styleName.length + 6);
+    styleName.copy(style, 0);
+    style.writeUInt16LE(0, styleName.length + 2);
+    style.writeUInt16LE(0, styleName.length + 4);
+    return Buffer.concat([
+        buildRecord(TAG.ID_MAPPINGS, 0, idMappings),
+        ...Array.from({ length: 7 }, () => buildRecord(TAG.FACE_NAME, 1, faceName)),
+        buildRecord(TAG.BORDER_FILL, 1, borderFill),
+        buildRecord(TAG.BORDER_FILL, 1, borderFill),
+        buildRecord(TAG.CHAR_SHAPE, 1, charShape),
+        buildRecord(TAG.PARA_SHAPE, 1, paraShape),
+        buildRecord(TAG.STYLE, 1, style),
+    ]);
+}
+function buildSection0Stream(paragraphs, tables, textBoxes) {
+    const records = [];
+    for (const paragraph of paragraphs) {
+        records.push(buildParagraphRecords(paragraph));
+    }
+    for (const table of tables) {
+        const tableParaCharShape = Buffer.alloc(6);
+        tableParaCharShape.writeUInt16LE(0, 4);
+        records.push(buildRecord(TAG.PARA_HEADER, 0, Buffer.alloc(0)));
+        records.push(buildRecord(TAG.PARA_CHAR_SHAPE, 1, tableParaCharShape));
+        records.push(buildRecord(TAG.PARA_TEXT, 1, encodeUint16([0x000b])));
+        records.push(buildRecord(TAG.PARA_LINE_SEG, 1, buildParaLineSegBuffer()));
+        records.push(buildRecord(TAG.CTRL_HEADER, 1, buildTableCtrlHeaderData()));
+        records.push(buildRecord(TAG.TABLE, 2, buildTableData(table.rows.length, table.rows[0]?.length ?? 0)));
+        for (let rowIndex = 0; rowIndex < table.rows.length; rowIndex++) {
+            for (let colIndex = 0; colIndex < table.rows[rowIndex].length; colIndex++) {
+                const cellText = table.rows[rowIndex][colIndex];
+                const cellTextData = Buffer.from(cellText, 'utf16le');
+                const cellParaHeader = Buffer.alloc(24);
+                cellParaHeader.writeUInt32LE((0x80000000 | (cellTextData.length / 2)) >>> 0, 0);
+                const cellParaCharShape = Buffer.alloc(6);
+                cellParaCharShape.writeUInt16LE(0, 4);
+                records.push(buildRecord(TAG.LIST_HEADER, 2, buildCellListHeaderData(colIndex, rowIndex, 1, 1)));
+                records.push(buildRecord(TAG.PARA_HEADER, 3, cellParaHeader));
+                records.push(buildRecord(TAG.PARA_CHAR_SHAPE, 3, cellParaCharShape));
+                records.push(buildRecord(TAG.PARA_TEXT, 3, cellTextData));
+                records.push(buildRecord(TAG.PARA_LINE_SEG, 3, buildParaLineSegBuffer()));
+            }
+        }
+    }
+    for (const textBox of textBoxes) {
+        records.push(buildTextBoxRecord(1, textBox.text));
+    }
+    return Buffer.concat(records);
+}
+function buildParagraphRecords(text) {
+    const textData = Buffer.from(text, 'utf16le');
+    const nChars = textData.length / 2;
+    const paraHeader = Buffer.alloc(24);
+    paraHeader.writeUInt32LE(nChars, 0);
+    const paraCharShape = Buffer.alloc(6);
+    paraCharShape.writeUInt16LE(0, 4);
+    return Buffer.concat([
+        buildRecord(TAG.PARA_HEADER, 0, paraHeader),
+        buildRecord(TAG.PARA_CHAR_SHAPE, 1, paraCharShape),
+        buildRecord(TAG.PARA_TEXT, 1, textData),
+        buildRecord(TAG.PARA_LINE_SEG, 1, buildParaLineSegBuffer()),
+    ]);
+}
+export function buildMergedTable(rows, colCount, rowCount) {
+    const records = [];
+    const tableParaHeader = Buffer.alloc(24);
+    tableParaHeader.writeUInt32LE(1, 0);
+    const tableParaCharShape = Buffer.alloc(6);
+    tableParaCharShape.writeUInt16LE(0, 4);
+    records.push(buildRecord(TAG.PARA_HEADER, 0, tableParaHeader));
+    records.push(buildRecord(TAG.PARA_CHAR_SHAPE, 1, tableParaCharShape));
+    records.push(buildRecord(TAG.PARA_TEXT, 1, encodeUint16([0x000b])));
+    records.push(buildRecord(TAG.PARA_LINE_SEG, 1, buildParaLineSegBuffer()));
+    records.push(buildRecord(TAG.CTRL_HEADER, 1, buildTableCtrlHeaderData()));
+    const cellsPerRow = rows.map((row) => row.length);
+    records.push(buildRecord(TAG.TABLE, 2, buildTableData(rowCount, colCount, cellsPerRow)));
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+        for (let colIndex = 0; colIndex < rows[rowIndex].length; colIndex++) {
+            const cell = rows[rowIndex][colIndex];
+            const col = cell.col ?? colIndex;
+            const row = cell.row ?? rowIndex;
+            const colSpan = cell.colSpan ?? 1;
+            const rowSpan = cell.rowSpan ?? 1;
+            const cellTextData = Buffer.from(cell.text, 'utf16le');
+            const cellParaHeader = Buffer.alloc(24);
+            cellParaHeader.writeUInt32LE((0x80000000 | (cellTextData.length / 2)) >>> 0, 0);
+            const cellParaCharShape = Buffer.alloc(6);
+            cellParaCharShape.writeUInt16LE(0, 4);
+            records.push(buildRecord(TAG.LIST_HEADER, 2, buildCellListHeaderData(col, row, colSpan, rowSpan)));
+            records.push(buildRecord(TAG.PARA_HEADER, 3, cellParaHeader));
+            records.push(buildRecord(TAG.PARA_CHAR_SHAPE, 3, cellParaCharShape));
+            records.push(buildRecord(TAG.PARA_TEXT, 3, cellTextData));
+            records.push(buildRecord(TAG.PARA_LINE_SEG, 3, buildParaLineSegBuffer()));
+        }
+    }
+    return Buffer.concat(records);
+}
+function createHwpFileHeader(compressed) {
+    const fileHeader = Buffer.alloc(256);
+    fileHeader.write('HWP Document File', 0, 'ascii');
+    fileHeader.writeUInt32LE(0x05040000, 32);
+    fileHeader.writeUInt32LE(compressed ? 0x1 : 0, 36);
+    return fileHeader;
+}
+function encodeLengthPrefixedUtf16(text) {
+    const value = Buffer.from(text, 'utf16le');
+    const length = Buffer.alloc(2);
+    length.writeUInt16LE(text.length, 0);
+    return Buffer.concat([length, value]);
+}
+function encodeUint16(values) {
+    const output = Buffer.alloc(values.length * 2);
+    for (const [index, value] of values.entries()) {
+        output.writeUInt16LE(value, index * 2);
+    }
+    return output;
+}
+function buildTextBoxRecord(level, text) {
+    const textData = Buffer.from(text, 'utf16le');
+    const nChars = textData.length / 2;
+    const paraHeader = Buffer.alloc(24);
+    paraHeader.writeUInt32LE(nChars, 0);
+    const paraCharShape = Buffer.alloc(6);
+    paraCharShape.writeUInt16LE(0, 4);
+    const shapeComponentData = Buffer.alloc(32);
+    controlIdBuffer('$rec').copy(shapeComponentData, 0);
+    controlIdBuffer('$rec').copy(shapeComponentData, 4);
+    shapeComponentData.writeInt32LE(200, 20);
+    shapeComponentData.writeInt32LE(100, 24);
+    return Buffer.concat([
+        buildRecord(TAG.CTRL_HEADER, level, controlIdBuffer('gso ')),
+        buildRecord(TAG.SHAPE_COMPONENT, level + 1, shapeComponentData),
+        buildRecord(TAG.SHAPE_COMPONENT_RECTANGLE, level + 2, Buffer.alloc(0)),
+        buildRecord(TAG.LIST_HEADER, level + 1, Buffer.alloc(46)),
+        buildRecord(TAG.PARA_HEADER, level + 2, paraHeader),
+        buildRecord(TAG.PARA_CHAR_SHAPE, level + 3, paraCharShape),
+        buildRecord(TAG.PARA_TEXT, level + 3, textData),
+        buildRecord(TAG.PARA_LINE_SEG, level + 3, buildParaLineSegBuffer()),
+    ]);
+}
+//# sourceMappingURL=test-helpers.js.map

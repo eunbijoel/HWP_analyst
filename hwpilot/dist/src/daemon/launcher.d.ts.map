@@ -1,0 +1,1 @@
+{"version":3,"file":"launcher.d.ts","sourceRoot":"","sources":["../../../src/daemon/launcher.ts"],"names":[],"mappings":"AAOA,wBAAsB,YAAY,CAAC,QAAQ,EAAE,MAAM,GAAG,OAAO,CAAC;IAAE,IAAI,EAAE,MAAM,CAAC;IAAC,KAAK,EAAE,MAAM,CAAA;CAAE,CAAC,CAoC7F;AAED,wBAAsB,UAAU,CAAC,QAAQ,EAAE,MAAM,GAAG,OAAO,CAAC,IAAI,CAAC,CAqBhE"}

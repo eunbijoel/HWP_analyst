@@ -1,0 +1,141 @@
+import { readFile, writeFile } from 'node:fs/promises';
+import { extname } from 'node:path';
+import { dispatchViaDaemon } from '../../daemon/dispatch.js';
+import { killDaemon } from '../../daemon/launcher.js';
+import { loadHwp } from '../../formats/hwp/reader.js';
+import { loadHwpx } from '../../formats/hwpx/loader.js';
+import { parseSections } from '../../formats/hwpx/section-parser.js';
+import { listImages } from '../../sdk/document-ops.js';
+import { handleError } from '../../cli/error-handler.js';
+import { detectFormat } from '../../shared/format-detector.js';
+import { formatOutput } from '../../cli/output.js';
+import { parseRef, validateRef } from '../../sdk/refs.js';
+export async function imageListCommand(file, options) {
+    try {
+        const daemonResult = await dispatchViaDaemon(file, 'image-list', {});
+        if (daemonResult !== null) {
+            if (!daemonResult.success) {
+                const errorOptions = daemonResult.context && typeof daemonResult.context === 'object'
+                    ? { context: daemonResult.context, hint: daemonResult.hint }
+                    : daemonResult.hint
+                        ? { hint: daemonResult.hint }
+                        : undefined;
+                handleError(new Error(daemonResult.error), errorOptions);
+                return;
+            }
+            console.log(formatOutput(daemonResult.data, options.pretty));
+            return;
+        }
+        const format = await detectFormat(file);
+        let sections;
+        if (format === 'hwp') {
+            const doc = await loadHwp(file);
+            sections = doc.sections;
+        }
+        else {
+            const archive = await loadHwpx(file);
+            sections = await parseSections(archive);
+        }
+        const images = listImages(sections);
+        console.log(formatOutput(images, options.pretty));
+    }
+    catch (e) {
+        handleError(e);
+    }
+}
+export async function imageExtractCommand(file, ref, outputPath, options) {
+    try {
+        // Kill daemon first — image extract reads directly from file, bypassing daemon state
+        await killDaemon(file).catch(() => { });
+        await validateHwpxFormat(file);
+        const parsed = validateImageRef(ref);
+        const archive = await loadHwpx(file);
+        const sections = await parseSections(archive);
+        const image = getImage(sections, parsed, ref);
+        const data = await archive.getBinData(image.binDataPath);
+        await writeFile(outputPath, data);
+        console.log(formatOutput({ ref: image.ref, outputPath, success: true }, options.pretty));
+    }
+    catch (e) {
+        handleError(e);
+    }
+}
+export async function imageInsertCommand(file, imagePath, options) {
+    try {
+        await killDaemon(file).catch(() => { });
+        await validateHwpxFormat(file);
+        const imageBuffer = await readFile(imagePath);
+        const format = detectImageFormat(imagePath);
+        const archive = await loadHwpx(file);
+        const zip = archive.getZip();
+        const existingFiles = new Set(archive.listBinData());
+        let index = existingFiles.size;
+        let newBinDataPath;
+        do {
+            newBinDataPath = `BinData/image${index}.${format}`;
+            index++;
+        } while (existingFiles.has(newBinDataPath));
+        zip.file(newBinDataPath, imageBuffer);
+        const buffer = await zip.generateAsync({ type: 'uint8array' });
+        await writeFile(file, buffer);
+        console.log(formatOutput({ binDataPath: newBinDataPath, success: true }, options.pretty));
+    }
+    catch (e) {
+        handleError(e);
+    }
+}
+export async function imageReplaceCommand(file, ref, imagePath, options) {
+    try {
+        await killDaemon(file).catch(() => { });
+        await validateHwpxFormat(file);
+        const parsed = validateImageRef(ref);
+        const archive = await loadHwpx(file);
+        const sections = await parseSections(archive);
+        const image = getImage(sections, parsed, ref);
+        const newImageBuffer = await readFile(imagePath);
+        const zip = archive.getZip();
+        zip.file(image.binDataPath, newImageBuffer);
+        const buffer = await zip.generateAsync({ type: 'uint8array' });
+        await writeFile(file, buffer);
+        console.log(formatOutput({ ref: image.ref, binDataPath: image.binDataPath, success: true }, options.pretty));
+    }
+    catch (e) {
+        handleError(e);
+    }
+}
+async function validateHwpxFormat(file) {
+    const format = await detectFormat(file);
+    if (format !== 'hwpx') {
+        throw new Error('Image insert/replace/extract requires HWPX format. Convert with: hwp convert <file.hwp> <file.hwpx>');
+    }
+}
+function validateImageRef(ref) {
+    if (!validateRef(ref)) {
+        throw new Error(`Invalid reference: ${ref}`);
+    }
+    const parsed = parseRef(ref);
+    if (parsed.image === undefined) {
+        throw new Error(`Not an image reference: ${ref}`);
+    }
+    return parsed;
+}
+function getImage(sections, parsed, ref) {
+    const section = sections[parsed.section];
+    if (!section) {
+        throw new Error(`Section ${parsed.section} not found`);
+    }
+    const image = section.images[parsed.image];
+    if (!image) {
+        throw new Error(`Image ${ref} not found`);
+    }
+    return image;
+}
+function detectImageFormat(imagePath) {
+    const ext = extname(imagePath).toLowerCase().slice(1);
+    if (ext === 'jpeg')
+        return 'jpg';
+    if (['png', 'jpg', 'gif'].includes(ext))
+        return ext;
+    throw new Error(`Unsupported image format: .${ext}`);
+}
+//# sourceMappingURL=image.js.map

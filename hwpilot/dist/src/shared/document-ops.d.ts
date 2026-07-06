@@ -1,0 +1,2 @@
+export { resolveRef, findInSections, extractRefText, extractAllText, extractPaginatedText, getTableData, listTables, listImages, } from '../sdk/document-ops.js';
+//# sourceMappingURL=document-ops.d.ts.map

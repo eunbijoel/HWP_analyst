@@ -1,0 +1,1 @@
+{"version":3,"file":"client.d.ts","sourceRoot":"","sources":["../../../src/daemon/client.ts"],"names":[],"mappings":"AAEA,OAAO,KAAK,EAAE,aAAa,EAAE,cAAc,EAAE,MAAM,mBAAmB,CAAA;AAMtE,wBAAsB,WAAW,CAC/B,IAAI,EAAE,MAAM,EACZ,KAAK,EAAE,MAAM,EACb,OAAO,EAAE,IAAI,CAAC,aAAa,EAAE,OAAO,CAAC,GACpC,OAAO,CAAC,cAAc,CAAC,CAuDzB"}

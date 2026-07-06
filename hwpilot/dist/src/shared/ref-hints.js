@@ -1,0 +1,68 @@
+import { loadHwp } from '../formats/hwp/reader.js';
+import { loadHwpx } from '../formats/hwpx/loader.js';
+import { parseSections } from '../formats/hwpx/section-parser.js';
+import { detectFormat } from '../shared/format-detector.js';
+import { parseRef, validateRef } from '../shared/refs.js';
+export async function getRefHint(file, ref) {
+    if (!validateRef(ref)) {
+        return 'Valid ref format: s<N>.p<N>, s<N>.t<N>.r<N>.c<N>';
+    }
+    const format = await detectFormat(file);
+    const sections = format === 'hwp' ? (await loadHwp(file)).sections : await parseSections(await loadHwpx(file));
+    return computeHint(sections, ref);
+}
+function computeHint(sections, ref) {
+    const parsed = parseRef(ref);
+    const section = sections[parsed.section];
+    if (!section) {
+        if (sections.length === 0)
+            return 'Document has no sections';
+        return `Valid sections: s0 through s${sections.length - 1}`;
+    }
+    if (parsed.table !== undefined) {
+        const table = section.tables[parsed.table];
+        if (!table) {
+            if (section.tables.length === 0)
+                return `Section ${parsed.section} has no tables`;
+            return `Valid table refs: s${parsed.section}.t0 through s${parsed.section}.t${section.tables.length - 1}`;
+        }
+        if (parsed.row !== undefined) {
+            const row = table.rows[parsed.row];
+            if (!row) {
+                return `Valid row refs: s${parsed.section}.t${parsed.table}.r0 through s${parsed.section}.t${parsed.table}.r${table.rows.length - 1}`;
+            }
+            if (parsed.cell !== undefined) {
+                const cell = row.cells[parsed.cell];
+                if (!cell) {
+                    return `Valid cell refs: s${parsed.section}.t${parsed.table}.r${parsed.row}.c0 through s${parsed.section}.t${parsed.table}.r${parsed.row}.c${row.cells.length - 1}`;
+                }
+            }
+        }
+        return undefined;
+    }
+    if (parsed.textBox !== undefined) {
+        const textBox = section.textBoxes[parsed.textBox];
+        if (!textBox) {
+            if (section.textBoxes.length === 0)
+                return `Section ${parsed.section} has no text boxes`;
+            return `Valid text box refs: s${parsed.section}.tb0 through s${parsed.section}.tb${section.textBoxes.length - 1}`;
+        }
+        if (parsed.textBoxParagraph !== undefined) {
+            const para = textBox.paragraphs[parsed.textBoxParagraph];
+            if (!para) {
+                return `Valid text box paragraph refs: s${parsed.section}.tb${parsed.textBox}.p0 through s${parsed.section}.tb${parsed.textBox}.p${textBox.paragraphs.length - 1}`;
+            }
+        }
+        return undefined;
+    }
+    if (parsed.paragraph !== undefined) {
+        const para = section.paragraphs[parsed.paragraph];
+        if (!para) {
+            if (section.paragraphs.length === 0)
+                return `Section ${parsed.section} has no paragraphs`;
+            return `Valid paragraph refs: s${parsed.section}.p0 through s${parsed.section}.p${section.paragraphs.length - 1}`;
+        }
+    }
+    return undefined;
+}
+//# sourceMappingURL=ref-hints.js.map

@@ -1,0 +1,1 @@
+{"version":3,"file":"viewer.d.ts","sourceRoot":"","sources":["../../../src/node/viewer.ts"],"names":[],"mappings":"AAMA,MAAM,MAAM,iBAAiB,GAAG;IAC9B,SAAS,EAAE,OAAO,CAAA;IAClB,KAAK,CAAC,EAAE,MAAM,CAAA;IACd,OAAO,EAAE,OAAO,CAAA;CACjB,CAAA;AAsBD,wBAAsB,oBAAoB,IAAI,OAAO,CAAC,OAAO,CAAC,CAK7D;AAED,wBAAsB,qBAAqB,CAAC,QAAQ,EAAE,MAAM,GAAG,OAAO,CAAC,iBAAiB,CAAC,CAiDxF"}

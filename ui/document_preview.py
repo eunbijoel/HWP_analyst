@@ -6,7 +6,7 @@ import html
 import re
 from typing import Optional
 
-from main.hwpx_editor import HWPXEditor, PendingChange, AppliedHighlight
+from hwp_core.hwpx_editor import HWPXEditor, PendingChange, AppliedHighlight
 
 
 PREVIEW_CSS = """
@@ -99,6 +99,7 @@ def _build_preview_maps(editor: HWPXEditor):
     """pending / applied 위치 맵 구성."""
     pending_cells: dict[tuple, PendingChange] = {}
     pending_paras: dict[int, PendingChange] = {}
+    pending_inserts: dict[int, list[PendingChange]] = {}
     applied_cells: dict[tuple, AppliedHighlight] = {}
     applied_paras: dict[int, AppliedHighlight] = {}
 
@@ -109,6 +110,8 @@ def _build_preview_maps(editor: HWPXEditor):
             pending_cells[_cell_key(ch.table_index, ch.row, ch.col)] = ch
         elif ch.change_type == 'paragraph' and ch.paragraph_index is not None:
             pending_paras[ch.paragraph_index] = ch
+        elif ch.change_type == 'insert_after' and ch.paragraph_index is not None:
+            pending_inserts.setdefault(ch.paragraph_index, []).append(ch)
         elif ch.change_type == 'replace' and ch.old_text:
             for block in editor.get_document_blocks():
                 if block['type'] == 'table':
@@ -144,7 +147,7 @@ def _build_preview_maps(editor: HWPXEditor):
                     'paragraph', ch.location, ch.old_text, ch.new_text,
                     paragraph_index=ch.paragraph_index)
 
-    return pending_cells, pending_paras, applied_cells, applied_paras
+    return pending_cells, pending_paras, pending_inserts, applied_cells, applied_paras
 
 
 def _render_applied_cell(live_text: str, highlight: AppliedHighlight) -> str:
@@ -252,7 +255,7 @@ def build_preview_html(
     max_tables: int = 20,
     max_rows_per_table: int = 50,
 ) -> str:
-    pending_cells, pending_paras, applied_cells, applied_paras = _build_preview_maps(editor)
+    pending_cells, pending_paras, pending_inserts, applied_cells, applied_paras = _build_preview_maps(editor)
     parts = [PREVIEW_CSS, f'<!-- rev:{editor.preview_revision} -->']
     parts.append('<div class="doc-preview"><div class="doc-page">')
 
@@ -277,6 +280,13 @@ def build_preview_html(
                 pending_paras.get(idx),
                 applied_paras.get(idx),
             ))
+            for ins in pending_inserts.get(idx, []):
+                for line in ins.new_text.split('\n'):
+                    line = line.strip()
+                    if line:
+                        parts.append(
+                            f'<p class="para ch-pending"><span class="ins">{_esc(line)}</span></p>'
+                        )
             para_shown += 1
         elif block['type'] == 'table':
             if table_shown >= max_tables:
@@ -297,12 +307,40 @@ def build_preview_from_text(
     paragraphs: list[str],
     tables: list[list[list[str]]],
     filename: str = '',
+    applied_changes: list[dict] | None = None,
 ) -> str:
+    applied_by_line: dict[int, dict] = {}
+    for ch in applied_changes or []:
+        ln = int(ch.get('line') or 0)
+        if ln > 0:
+            applied_by_line[ln] = ch
+
     parts = [PREVIEW_CSS, '<div class="doc-preview"><div class="doc-page">']
+    parts.append('<div class="legend">')
+    parts.append('<span><i class="dot" style="background:#cc0000"></i> 적용된 수정 (한글과 동일)</span>')
+    parts.append('</div>')
     if filename:
         parts.append(f'<div class="doc-title">📄 {_esc(filename)}</div>')
     for i, text in enumerate(paragraphs[:200]):
-        parts.append(f'<p class="para"><span class="para-num">{i+1}</span>{_esc(text)}</p>')
+        line_no = i + 1
+        applied = applied_by_line.get(line_no)
+        if applied:
+            if applied.get('type') == 'delete':
+                parts.append(
+                    f'<p class="para ch-applied" id="para-{i}">'
+                    f'<span class="para-num">{line_no}</span>'
+                    f'<span class="mod-applied-del">{_esc(applied.get("old", text))}</span>'
+                    f'</p>'
+                )
+            else:
+                parts.append(_render_paragraph(
+                    text, i, None, type('H', (), {
+                        'old_text': applied.get('old', ''),
+                        'new_text': applied.get('new', text),
+                    })(),
+                ))
+        else:
+            parts.append(f'<p class="para"><span class="para-num">{line_no}</span>{_esc(text)}</p>')
     for t_idx, rows in enumerate(tables[:20]):
         if not rows:
             continue

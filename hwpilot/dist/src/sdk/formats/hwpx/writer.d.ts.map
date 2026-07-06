@@ -1,0 +1,1 @@
+{"version":3,"file":"writer.d.ts","sourceRoot":"","sources":["../../../../../src/sdk/formats/hwpx/writer.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,KAAK,aAAa,EAAE,KAAK,aAAa,EAAE,KAAK,OAAO,EAAE,MAAM,kBAAkB,CAAA;AAKvF,YAAY,EAAE,aAAa,EAAE,aAAa,EAAE,OAAO,EAAE,CAAA;AAErD,wBAAsB,QAAQ,CAAC,UAAU,EAAE,UAAU,EAAE,UAAU,EAAE,aAAa,EAAE,GAAG,OAAO,CAAC,UAAU,CAAC,CAWvG"}

@@ -1,0 +1,1 @@
+{"version":3,"file":"flush.d.ts","sourceRoot":"","sources":["../../../src/daemon/flush.ts"],"names":[],"mappings":"AAAA,MAAM,MAAM,cAAc,GAAG;IAC3B,QAAQ,IAAI,IAAI,CAAA;IAChB,MAAM,IAAI,IAAI,CAAA;IACd,QAAQ,IAAI,OAAO,CAAC,IAAI,CAAC,CAAA;CAC1B,CAAA;AAED,wBAAgB,oBAAoB,CAAC,OAAO,EAAE,MAAM,OAAO,CAAC,IAAI,CAAC,EAAE,UAAU,EAAE,MAAM,GAAG,cAAc,CAgCrG"}
