@@ -309,7 +309,7 @@ def render_chat_panel(
                         question=user_input,
                         model=model_name,
                         ollama_url=ollama_url,
-                        use_streaming=use_streaming and use_llm,
+                        use_streaming=use_streaming,
                     )
             else:
                 qa = get_cached_qa_engine(all_documents, fname)
@@ -324,7 +324,7 @@ def render_chat_panel(
                 with st.spinner("분석 중..."):
                     ans = qa.answer(
                         question=q, use_llm=use_llm, model=model_name,
-                        ollama_url=ollama_url, stream=use_streaming and use_llm,
+                        ollama_url=ollama_url, stream=use_streaming,
                         stage1_model=stage1_model, history=hist[-3:],
                     )
             chart = ans.get('chart_data')
@@ -397,13 +397,13 @@ def render_hwp_split_editor(fname: str, file_bytes: bytes, all_documents: list):
                 elif result.get('applied_direct'):
                     reply += "\n\n👉 문서에 반영되었습니다."
                 elif result.get('changes', 0) == 0 and _hwp_edit_needs_llm(intent) and not use_llm:
-                    reply += "\n\n⚠️ 초안/빈칸 채우기는 사이드바 **LLM 사용**을 켜야 합니다."
+                    reply += "\n\n⚠️ 초안/빈칸 채우기는 Ollama가 연결되어 있어야 합니다."
                 st.session_state[chat_key].append({'role': 'assistant', 'content': reply})
                 st.rerun()
             elif intent != 'qa' and _hwp_edit_needs_llm(intent) and not use_llm:
                 st.session_state[chat_key].append({
                     'role': 'assistant',
-                    'content': '초안·빈칸 채우기는 Ollama 연결 후 **LLM 사용**을 켜 주세요. '
+                    'content': '초안·빈칸 채우기는 Ollama가 연결되어 있어야 합니다. '
                                '삽입/삭제는 LLM 없이도 됩니다. 예: *마지막에 (내용) 추가해줘*',
                 })
                 st.rerun()
@@ -417,7 +417,7 @@ def render_hwp_split_editor(fname: str, file_bytes: bytes, all_documents: list):
                 with st.spinner("분석 중..."):
                     ans = qa.answer(
                         question=q, use_llm=use_llm, model=model_name,
-                        ollama_url=ollama_url, stream=use_streaming and use_llm,
+                        ollama_url=ollama_url, stream=use_streaming,
                         stage1_model=stage1_model, history=hist[-3:],
                     )
                 if ans.get('answer_stream'):
@@ -616,7 +616,7 @@ def render_readonly_split(fname: str, doc_data: dict, file_bytes: bytes):
                 ans = qa.answer(
                     q, use_llm=use_llm, model=model_name,
                     ollama_url=ollama_url, stage1_model=stage1_model,
-                    stream=use_streaming and use_llm,
+                    stream=use_streaming,
                 )
                 if ans.get('answer_stream'):
                     with st.chat_message("assistant"):
@@ -663,9 +663,8 @@ with st.sidebar:
         model_name = "gemma4"
         available_models = []
 
-    use_llm = st.checkbox("LLM 사용", value=ollama_status['status'] == 'running',
-                          disabled=ollama_status['status'] != 'running')
-    use_streaming = st.checkbox("스트리밍", value=True, disabled=not use_llm)
+    use_llm = ollama_status['status'] == 'running'
+    use_streaming = use_llm
 
     if use_llm and available_models:
         small_models = [m for m in available_models
