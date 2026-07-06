@@ -99,6 +99,19 @@ def _normalize_value(s: str) -> str:
     return re.sub(r'[\s,]', '', str(s).strip())
 
 
+def text_locatable_in(needle: str, haystack: str) -> bool:
+    """공백·줄바꿈 차이를 무시하고 needle이 haystack에 있는지 확인."""
+    if not needle or not haystack:
+        return False
+    if needle in haystack:
+        return True
+    n = re.sub(r'\s+', '', needle.strip())
+    h = re.sub(r'\s+', '', haystack.strip())
+    if not n:
+        return False
+    return n in h
+
+
 def _cell_contains_value(cell: str, value: str) -> bool:
     cv = _normalize_value(cell)
     vv = _normalize_value(value)
@@ -809,7 +822,7 @@ class HWPXEditor:
         """replace 유형 — 문단/셀 위치를 스캔해 하이라이트 등록."""
         for p in self.get_paragraphs():
             txt = p['text']
-            if new_text in txt or (old_text and old_text in txt):
+            if text_locatable_in(new_text, txt) or text_locatable_in(old_text, txt):
                 key = ('para', p['index'])
                 if any(h.paragraph_index == p['index'] for h in self.applied_highlights):
                     continue
@@ -1030,13 +1043,62 @@ class HWPXEditor:
             context=location,
         )
 
+    def locate_replace_targets(self, old_text: str, new_text: str = '') -> list[dict]:
+        """치환 대상 문단/셀 위치 탐색 (미리보기·제안용)."""
+        targets: list[dict] = []
+        for block in self.get_document_blocks():
+            if block['type'] == 'paragraph':
+                txt = block['text']
+                if text_locatable_in(old_text, txt) or (
+                    new_text and text_locatable_in(new_text, txt)
+                ):
+                    targets.append({
+                        'kind': 'paragraph',
+                        'paragraph_index': block['paragraph_index'],
+                        'section_file': block.get('section_file'),
+                    })
+            elif block['type'] == 'table':
+                t_idx = block['table_index']
+                for r_idx, row in enumerate(block['parsed'].rows):
+                    for c_idx, cell in enumerate(row):
+                        if _cell_contains_value(str(cell), old_text):
+                            targets.append({
+                                'kind': 'cell',
+                                'table_index': t_idx,
+                                'row': r_idx,
+                                'col': c_idx,
+                            })
+        return targets
+
     def propose_replace(self, old_text: str, new_text: str, location: str = '') -> PendingChange:
+        targets = self.locate_replace_targets(old_text, new_text)
+        paragraph_index = None
+        table_index = row = col = None
+        if targets:
+            t = targets[0]
+            if t['kind'] == 'paragraph':
+                paragraph_index = t['paragraph_index']
+                if not location:
+                    location = f'문단 {paragraph_index + 1}'
+            else:
+                table_index = t['table_index']
+                row, col = t['row'], t['col']
+                if not location:
+                    location = (
+                        f'표{table_index + 1} ({row + 1}행,{col + 1}열)'
+                    )
+        if not location:
+            location = '텍스트 치환 (미리보기에서 위치 미확인)'
         change = PendingChange(
             id=str(uuid.uuid4())[:8],
             change_type='replace',
-            location=location or '텍스트 치환',
+            location=location,
             old_text=old_text,
             new_text=new_text,
+            paragraph_index=paragraph_index,
+            table_index=table_index,
+            row=row,
+            col=col,
             search_hint=old_text[:120],
         )
         self.pending_changes.append(change)
@@ -1276,15 +1338,21 @@ class HWPXEditor:
                 if local_tag(elem.tag) != 'p':
                     continue
                 full = self._get_element_text(elem)
-                if selection_text not in full:
+                if not text_locatable_in(selection_text, full):
                     continue
                 t_elems = [e for e in elem.iter() if local_tag(e.tag) == 't']
                 if not t_elems:
                     continue
                 combined = ''.join(t.text or '' for t in t_elems)
-                if selection_text not in combined:
+                if selection_text not in combined and not text_locatable_in(selection_text, combined):
                     continue
                 new_combined = combined.replace(selection_text, new_text, 1)
+                if new_combined == combined and text_locatable_in(selection_text, combined):
+                    pattern = re.escape(selection_text.strip())
+                    pattern = re.sub(r'\\ ', r'\\s+', pattern)
+                    new_combined = re.sub(pattern, new_text, combined, count=1)
+                if new_combined == combined:
+                    continue
                 if track_changes:
                     self._mark_runs_style(elem, 'strike')
                 t_elems[0].text = new_combined

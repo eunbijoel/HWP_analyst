@@ -6,7 +6,7 @@ import html
 import re
 from typing import Optional
 
-from hwp_core.hwpx_editor import HWPXEditor, PendingChange, AppliedHighlight
+from hwp_core.hwpx_editor import HWPXEditor, PendingChange, AppliedHighlight, text_locatable_in
 
 
 PREVIEW_CSS = """
@@ -60,6 +60,15 @@ table.hwpx-tbl th { background: #f0f0f0; font-weight: 600; }
 .cell-empty { background: #fafafa; color: #ccc; }
 /* 대기 중 (AI 제안) */
 .ch-pending { background: #fff8e1; outline: 2px solid #ffc107; }
+.ch-focus {
+    outline: 3px solid #ff5722 !important;
+    box-shadow: 0 0 14px rgba(255, 152, 0, .55);
+    animation: pulse-focus 0.9s ease-in-out 3;
+}
+@keyframes pulse-focus {
+    0%, 100% { box-shadow: 0 0 8px rgba(255, 193, 7, .5); }
+    50% { box-shadow: 0 0 18px rgba(255, 87, 34, .75); }
+}
 .ins { color: #008800; font-weight: 600; }
 .old-pending { color: #cc0000; text-decoration: line-through; opacity: .75; }
 /* 적용 완료 — 한글 파일과 동일한 빨간 수정 표시 */
@@ -88,11 +97,43 @@ def _cell_key(t_idx: int, r: int, c: int) -> tuple:
 
 
 def _values_match(old: str, cell: str) -> bool:
+    if text_locatable_in(old, str(cell)):
+        return True
     old_n = re.sub(r'[\s,]', '', old)
     cell_n = re.sub(r'[\s,]', '', str(cell))
     if not old_n:
         return False
     return old in str(cell) or cell_n == old_n or old_n in cell_n
+
+
+def _map_replace_pending(
+    ch: PendingChange,
+    editor: HWPXEditor,
+    pending_cells: dict,
+    pending_paras: dict,
+) -> None:
+    """replace 유형 — 저장된 인덱스 또는 문서 스캔으로 위치 연결."""
+    if ch.paragraph_index is not None:
+        pending_paras[ch.paragraph_index] = ch
+        return
+    if ch.table_index is not None and ch.row is not None and ch.col is not None:
+        pending_cells[_cell_key(ch.table_index, ch.row, ch.col)] = ch
+        return
+    if not ch.old_text:
+        return
+    for block in editor.get_document_blocks():
+        if block['type'] == 'table':
+            t_idx = block['table_index']
+            for r_idx, row in enumerate(block['parsed'].rows):
+                for c_idx, cell in enumerate(row):
+                    if _values_match(ch.old_text, cell):
+                        pending_cells[_cell_key(t_idx, r_idx, c_idx)] = ch
+                        return
+        elif block['type'] == 'paragraph':
+            txt = block['text']
+            if text_locatable_in(ch.old_text, txt) or text_locatable_in(ch.new_text, txt):
+                pending_paras[block['paragraph_index']] = ch
+                return
 
 
 def _build_preview_maps(editor: HWPXEditor):
@@ -112,18 +153,8 @@ def _build_preview_maps(editor: HWPXEditor):
             pending_paras[ch.paragraph_index] = ch
         elif ch.change_type == 'insert_after' and ch.paragraph_index is not None:
             pending_inserts.setdefault(ch.paragraph_index, []).append(ch)
-        elif ch.change_type == 'replace' and ch.old_text:
-            for block in editor.get_document_blocks():
-                if block['type'] == 'table':
-                    t_idx = block['table_index']
-                    for r_idx, row in enumerate(block['parsed'].rows):
-                        for c_idx, cell in enumerate(row):
-                            if _values_match(ch.old_text, cell):
-                                pending_cells[_cell_key(t_idx, r_idx, c_idx)] = ch
-                elif block['type'] == 'paragraph':
-                    txt = block['text']
-                    if ch.old_text in txt or ch.new_text in txt:
-                        pending_paras[block['paragraph_index']] = ch
+        elif ch.change_type == 'replace':
+            _map_replace_pending(ch, editor, pending_cells, pending_paras)
 
     for h in editor.applied_highlights:
         if h.change_type == 'cell' and h.table_index is not None:
@@ -196,7 +227,8 @@ def _render_paragraph(
     else:
         cls = 'para'
         body = _esc(live_text)
-    return f'<p class="{cls}" id="para-{idx}"><span class="para-num">{idx+1}</span>{body}</p>'
+    pid = f'pending-{pending.id}' if pending else f'para-{idx}'
+    return f'<p class="{cls}" id="{pid}"><span class="para-num">{idx+1}</span>{body}</p>'
 
 
 def _render_table_block(
@@ -229,13 +261,17 @@ def _render_table_block(
             ach = applied_cells.get(key)
             if pch:
                 cls, content = 'ch-pending', _render_pending_cell(pch)
+                id_attr = f' id="pending-{pch.id}"'
             elif ach:
                 cls, content = 'ch-applied', _render_applied_cell(str(cell), ach)
+                id_attr = ''
             elif not cell or not str(cell).strip():
                 cls, content = 'cell-empty', '<span class="cell-empty">(비어 있음)</span>'
+                id_attr = ''
             else:
                 cls, content = '', _esc(cell)
-            parts.append(f'<{tag} class="{cls}"{span_attr}>{content}</{tag}>')
+                id_attr = ''
+            parts.append(f'<{tag} class="{cls}"{span_attr}{id_attr}>{content}</{tag}>')
         parts.append('</tr>')
 
     if len(parsed.rows) > max_rows:
@@ -248,14 +284,28 @@ def _render_table_block(
     return '\n'.join(parts)
 
 
+def format_pending_label(ch: PendingChange, max_len: int = 36) -> str:
+    """대기 변경 네비게이션용 짧은 라벨."""
+    if ch.old_text and ch.new_text:
+        old = ch.old_text[:max_len] + ('…' if len(ch.old_text) > max_len else '')
+        new = ch.new_text[:max_len] + ('…' if len(ch.new_text) > max_len else '')
+        return f'"{old}" → "{new}"'
+    if ch.location:
+        return ch.location[: max_len * 2]
+    return ch.change_type
+
+
 def build_preview_html(
     editor: HWPXEditor,
     filename: str = '',
     max_paras: int = 200,
     max_tables: int = 20,
     max_rows_per_table: int = 50,
+    scroll_to_change_id: str | None = None,
 ) -> str:
-    pending_cells, pending_paras, pending_inserts, applied_cells, applied_paras = _build_preview_maps(editor)
+    pending_cells, pending_paras, pending_inserts, applied_cells, applied_paras = (
+        _build_preview_maps(editor)
+    )
     parts = [PREVIEW_CSS, f'<!-- rev:{editor.preview_revision} -->']
     parts.append('<div class="doc-preview"><div class="doc-page">')
 
@@ -285,7 +335,8 @@ def build_preview_html(
                     line = line.strip()
                     if line:
                         parts.append(
-                            f'<p class="para ch-pending"><span class="ins">{_esc(line)}</span></p>'
+                            f'<p class="para ch-pending" id="pending-{ins.id}">'
+                            f'<span class="ins">{_esc(line)}</span></p>'
                         )
             para_shown += 1
         elif block['type'] == 'table':
@@ -300,6 +351,26 @@ def build_preview_html(
             table_shown += 1
 
     parts.append('</div></div>')
+
+    if scroll_to_change_id:
+        cid = re.sub(r'[^\w\-]', '', scroll_to_change_id)
+        parts.append(f"""<script>
+(function() {{
+  function focusPending() {{
+    var el = document.getElementById("pending-{cid}");
+    if (!el) return;
+    el.scrollIntoView({{behavior: "smooth", block: "center"}});
+    el.classList.add("ch-focus");
+    setTimeout(function() {{ el.classList.remove("ch-focus"); }}, 2800);
+  }}
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", focusPending);
+  }} else {{
+    focusPending();
+  }}
+}})();
+</script>""")
+
     return '\n'.join(parts)
 
 
