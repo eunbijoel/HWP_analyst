@@ -1,10 +1,8 @@
 """
 질의응답 엔진
-- 2-Stage LLM 아키텍처: Stage 1 (소형 모델 intent/entity 추출) + Stage 2 (대형 모델 해석)
+- Rules-first pre-compute + 조건부 Stage1 (소형 LLM) + Stage2 (대형 LLM)
 - 표 데이터 기반 자동 계산 (엔티티+지표 교차 조회, 합계/비교 등)
-- Rule-based 분석
 - Ollama LLM 연결 (Stage 1: gemma3:4b, Stage 2: gemma4 기본)
-- 다중 문서 지원
 """
 
 import re
@@ -26,6 +24,16 @@ OVERVIEW_QUESTION = re.compile(
     r'알려|소개|요약|개요|무슨|어떤\s*내용|설명해|정리해|이\s*자료|이\s*문서|전체|개략|뭐에\s*관',
     re.I,
 )
+COREF_QUESTION = re.compile(
+    r'거기|그것|그거|이것|저것|해당|위에서|앞에서|방금|이번|앞의|위의|말한|그\s*기관|그\s*회사',
+    re.I,
+)
+DATA_QUESTION = re.compile(
+    r'표\s*\d|연구개발비|사업비|예산|매출|인건비|합계|소계|\d{4}\s*년',
+    re.I,
+)
+
+
 SYSTEM_PROMPT = """당신은 한글(HWP) 문서 분석 전문가입니다.
 
 ## 핵심 규칙:
@@ -99,37 +107,167 @@ class QAEngine:
 
         self.all_numbers = self.text_numbers + self.table_numbers
 
+    # --- Rules-first / 조건부 Stage1 helpers ---
+
+    def _years_from_question(self, question: str) -> list[int]:
+        return [int(y) for y in re.findall(r'((?:19|20)\d{2})', question)]
+
+    def _intent_from_question(self, question: str) -> str:
+        q = question.strip()
+        if any(kw in q for kw in SUM_KEYWORDS):
+            return 'sum'
+        if re.search(r'최대|최고|가장\s*큰|max', q, re.I):
+            return 'max'
+        if re.search(r'비교|대비|차이', q, re.I):
+            return 'compare'
+        if OVERVIEW_QUESTION.search(q):
+            return 'summary'
+        return 'lookup'
+
+    def _extraction_spec(
+        self,
+        entities: list,
+        metrics: list,
+        years: list[int],
+        intent: str,
+    ) -> dict:
+        return {
+            'entities': list(entities),
+            'metrics': list(metrics),
+            'years': list(years),
+            'intent': intent,
+        }
+
+    def _is_overview_question(self, question: str) -> bool:
+        return bool(OVERVIEW_QUESTION.search(question))
+
+    def _has_coref(self, question: str, history: list | None) -> bool:
+        if COREF_QUESTION.search(question):
+            return True
+        if history and len(question.strip()) < 30:
+            return True
+        return False
+
+    def _should_run_stage1(
+        self,
+        question: str,
+        history: list | None,
+        rules_entities: list,
+        rules_metrics: list,
+        rules_pre_hit: bool,
+    ) -> tuple[bool, str]:
+        """Stage1 LLM을 호출할지 — Rules-first 효율화."""
+        if self._is_overview_question(question):
+            return False, 'overview_skip'
+        if self._has_coref(question, history):
+            return True, 'coref'
+        if history and not rules_entities:
+            return True, 'history_no_entity'
+        if rules_pre_hit:
+            return False, 'rules_pre_hit'
+        if DATA_QUESTION.search(question) or rules_entities or rules_metrics:
+            return True, 'rules_miss'
+        return False, 'not_data_question'
+
+    def _merge_extractions(
+        self,
+        stage1: dict,
+        rules_entities: list,
+        rules_metrics: list,
+        question: str,
+    ) -> dict:
+        years = list(stage1.get('years') or [])
+        for y in self._years_from_question(question):
+            if y not in years:
+                years.append(y)
+        entities = list(rules_entities)
+        for e in stage1.get('entities', []):
+            if e and e not in entities:
+                entities.append(e)
+        metrics = list(rules_metrics)
+        for m in stage1.get('metrics', []):
+            if m and m not in metrics:
+                metrics.append(m)
+        intent = stage1.get('intent') or self._intent_from_question(question)
+        return self._extraction_spec(entities, metrics, years, intent)
+
+    def _entity_names_conflict(self, stage1_entities: list, rules_entities: list) -> bool:
+        if not stage1_entities or not rules_entities:
+            return False
+        s1 = {e.replace(' ', '') for e in stage1_entities}
+        r1 = {e.replace(' ', '') for e in rules_entities}
+        return not (s1 & r1 or any(
+            a in b or b in a for a in s1 for b in r1 if len(a) >= 3 and len(b) >= 3
+        ))
+
     def answer(self, question: str, use_llm: bool = False,
                model: str = "gemma4", ollama_url: str = "http://localhost:11434",
                stream: bool = False, stage1_model: str = "gemma3:4b",
-               history: list = None) -> dict:
-        # Stage 1: LLM 기반 intent/entity 추출
+               history: list = None,
+               run_stage1: bool | None = None,
+               benchmark: bool = False) -> dict:
+        """Rules-first pre-compute → 조건부 Stage1 → Stage2."""
+        enable_stage1 = run_stage1 if run_stage1 is not None else use_llm
+        t_start = time.time()
+        history = history or []
+        q = question.strip()
+
+        rules_entities = self._find_entities_in_question(q)
+        rules_metrics = self._find_metrics_in_question(q)
+        target_years = self._years_from_question(q)
+        rules_intent = self._intent_from_question(q)
+
         stage1_result = None
-        if use_llm:
-            stage1_result = self._stage1_analyze(question, model=stage1_model,
-                                                  ollama_url=ollama_url,
-                                                  history=history)
+        stage1_elapsed = 0.0
+        stage1_skipped = False
+        stage1_run_reason = ''
 
         wants_chart = any(kw in question for kw in CHART_KEYWORDS)
         chart_data = None
-        pre_computed = ""
+        pre_computed = ''
+        rules_pre = ''
 
-        # 신뢰도 순서: 직접 매칭 → 규칙기반 → pandas codegen
-        # Step 1: Stage1 엔티티 기반 직접 교차 조회 (가장 신뢰도 높음)
-        if stage1_result and (stage1_result['entities'] or stage1_result['metrics']):
-            pre_computed, chart_data = self._pre_compute_with_stage1(question, stage1_result)
+        rules_spec = self._extraction_spec(
+            rules_entities, rules_metrics, target_years, rules_intent,
+        )
+        rules_pre, chart_data = self._pre_compute_with_stage1(question, rules_spec)
 
-        # Step 2: 키워드 기반 규칙 매칭
-        if not pre_computed:
+        run_stage1_flag = False
+        if enable_stage1:
+            run_stage1_flag, stage1_run_reason = self._should_run_stage1(
+                q, history, rules_entities, rules_metrics, bool(rules_pre),
+            )
+        elif not enable_stage1:
+            stage1_skipped = True
+            stage1_run_reason = 'no_llm'
+
+        if run_stage1_flag:
+            t0 = time.time()
+            stage1_result = self._stage1_analyze(
+                question, model=stage1_model, ollama_url=ollama_url, history=history,
+            )
+            stage1_elapsed = round(time.time() - t0, 3)
+            if stage1_result and not self._is_overview_question(q):
+                merged = self._merge_extractions(
+                    stage1_result, rules_entities, rules_metrics, q,
+                )
+                if self._entity_names_conflict(
+                    stage1_result.get('entities', []), rules_entities,
+                ) and rules_entities:
+                    merged['entities'] = list(rules_entities)
+                s1_pre, chart2 = self._pre_compute_with_stage1(question, merged)
+                if s1_pre:
+                    pre_computed = s1_pre
+                    if chart2:
+                        chart_data = chart2
+        elif enable_stage1:
+            stage1_skipped = True
+
+        if not pre_computed and rules_pre:
+            pre_computed = rules_pre
+        elif not pre_computed:
             pre_computed, chart_data = self._pre_compute_analysis(question)
 
-        # Step 3: pandas 코드 생성 — exec() 보안 취약점으로 비활성화
-        # if not pre_computed and use_llm:
-        #     pandas_result = self._try_pandas_code_gen(...)
-        #     if pandas_result:
-        #         pre_computed = pandas_result
-
-        # Rule-based 답변
         if stage1_result and stage1_result.get('intent'):
             rule_result = self._rule_based_with_intent(question, stage1_result['intent'])
         else:
@@ -141,21 +279,20 @@ class QAEngine:
         if not wants_chart:
             chart_data = None
 
-        # Stage 2: LLM 해석
         if use_llm:
             if stream:
-                result = self._llm_answer_stream(question, model, ollama_url,
-                                                 rule_result, pre_computed,
-                                                 history=history)
+                result = self._llm_answer_stream(
+                    question, model, ollama_url, rule_result, pre_computed,
+                    history=history,
+                )
             else:
-                result = self._llm_answer(question, model, ollama_url,
-                                          rule_result, pre_computed,
-                                          history=history)
+                result = self._llm_answer(
+                    question, model, ollama_url, rule_result, pre_computed,
+                    history=history,
+                )
             if chart_data:
                 result['chart_data'] = chart_data
-            return result
-
-        if pre_computed:
+        elif pre_computed:
             result = {
                 'answer': pre_computed,
                 'source': '표 데이터 자동 계산',
@@ -163,11 +300,31 @@ class QAEngine:
             }
             if chart_data:
                 result['chart_data'] = chart_data
-            return result
+        else:
+            if chart_data:
+                rule_result['chart_data'] = chart_data
+            result = rule_result
 
-        if chart_data:
-            rule_result['chart_data'] = chart_data
-        return rule_result
+        if benchmark:
+            s1_entities = stage1_result.get('entities', []) if stage1_result else []
+            s1_metrics = stage1_result.get('metrics', []) if stage1_result else []
+            result['benchmark'] = {
+                'stage1': stage1_result,
+                'stage1_elapsed_s': stage1_elapsed,
+                'stage1_skipped': stage1_skipped,
+                'stage1_run_reason': stage1_run_reason,
+                'rules_entities': rules_entities,
+                'rules_metrics': rules_metrics,
+                'stage1_entities': s1_entities,
+                'stage1_metrics': s1_metrics,
+                'entity_overlap': bool(set(s1_entities) & set(rules_entities)),
+                'metric_overlap': bool(set(s1_metrics) & set(rules_metrics)),
+                'pre_compute_hit': bool(pre_computed),
+                'rules_pre_hit': bool(rules_pre),
+                'pre_computed_chars': len(pre_computed),
+                'total_elapsed_s': round(time.time() - t_start, 3),
+            }
+        return result
 
     # =========================================================
     # Stage 1: 소형 모델 의도/엔티티 추출
@@ -1186,13 +1343,18 @@ JSON만 출력:
 
     def _llm_answer(self, question: str, model: str, ollama_url: str,
                     rule_result: dict, pre_computed: str,
-                    history: list = None) -> dict:
+                    history: list = None,
+                    include_rule_hint: bool = True) -> dict:
         context = self._build_context(question)
         rule_hint = rule_result.get('answer', '')
 
         pre_section = ""
         if pre_computed:
             pre_section = f"\n## 사전 계산 결과 (프로그래밍으로 정확히 계산됨 — 이 결과를 신뢰하세요):\n{pre_computed}\n"
+
+        rule_section = ""
+        if include_rule_hint and rule_hint:
+            rule_section = f"\n## Rule-based 사전 분석:\n{rule_hint}\n"
 
         history_section = ""
         if history:
@@ -1204,10 +1366,7 @@ JSON만 출력:
 ## 문서에서 추출된 데이터:
 
 {context}
-{pre_section}
-## Rule-based 사전 분석:
-{rule_hint}
-{history_section}
+{pre_section}{rule_section}{history_section}
 ## 사용자 질문:
 {question}
 
@@ -1251,13 +1410,18 @@ JSON만 출력:
 
     def _llm_answer_stream(self, question: str, model: str, ollama_url: str,
                            rule_result: dict, pre_computed: str,
-                           history: list = None) -> dict:
+                           history: list = None,
+                           include_rule_hint: bool = True) -> dict:
         context = self._build_context(question)
         rule_hint = rule_result.get('answer', '')
 
         pre_section = ""
         if pre_computed:
             pre_section = f"\n## 사전 계산 결과 (프로그래밍으로 정확히 계산됨 — 이 결과를 신뢰하세요):\n{pre_computed}\n"
+
+        rule_section = ""
+        if include_rule_hint and rule_hint:
+            rule_section = f"\n## Rule-based 사전 분석:\n{rule_hint}\n"
 
         history_section = ""
         if history:
@@ -1269,10 +1433,7 @@ JSON만 출력:
 ## 문서에서 추출된 데이터:
 
 {context}
-{pre_section}
-## Rule-based 사전 분석:
-{rule_hint}
-{history_section}
+{pre_section}{rule_section}{history_section}
 
 ## 사용자 질문:
 {question}
