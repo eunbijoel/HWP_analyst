@@ -25,9 +25,12 @@ from hwp_core.llm_client import check_ollama_status, answer_general_question
 from hwp_core.hwpx_editor import HWPXEditor
 from additional.reference_parser import parse_reference, build_reference_context
 from additional.reference_parser import normalize_insert_body
-from ui.document_preview import build_preview_html, build_preview_from_text
+from ui.document_preview import (
+    build_preview_html, build_preview_from_text,
+    format_pending_label,
+)
 from ui.command_router import classify_intent, execute_edit_command
-
+from ui.canvas_editor import render_canvas_editor, render_canvas_editor_hwp
 
 st.set_page_config(page_title="HWP 문서 분석기", page_icon="📄", layout="wide")
 GENERAL_KNOWLEDGE_RE = re.compile(
@@ -54,16 +57,6 @@ def _apply_edit_result(fname: str, result: dict, editor=None, source_hwp: str = 
         set_hwp_working_bytes(fname, result['new_file_bytes'])
     if editor is not None and result.get('applied_direct'):
         sync_export_state(editor, fname, source_hwp=source_hwp)
-
-
-def get_cached_preview_html(editor: HWPXEditor, filename: str) -> str:
-    key = f"preview_html_{filename}"
-    entry = st.session_state.get(key)
-    if entry and entry.get('rev') == editor.preview_revision:
-        return entry['html']
-    html = build_preview_html(editor, filename=filename)
-    st.session_state[key] = {'rev': editor.preview_revision, 'html': html}
-    return html
 
 
 def get_cached_ollama_status(url: str) -> dict:
@@ -119,29 +112,12 @@ def process_document(file_bytes: bytes, filename: str):
     return doc, tables, tnums, tblnums
 
 
-def sync_export_state(editor: HWPXEditor, hwpx_name: str, source_hwp: str = ''):
-    """편집 후 다운로드용 bytes를 세션에 동기화."""
-    export = editor.get_export_bytes()
-    st.session_state[f"export_bytes_{hwpx_name}"] = export
-    if source_hwp:
-        auto_key = f"auto_hwpx_{source_hwp}"
-        if auto_key in st.session_state:
-            st.session_state[auto_key]['bytes'] = export
-
-
-def get_hwp_working_bytes(fname: str, initial: bytes) -> bytes:
-    key = f"hwp_working_{fname}"
-    if key not in st.session_state:
-        st.session_state[key] = initial
-    return st.session_state[key]
-
-
-def set_hwp_working_bytes(fname: str, data: bytes):
-    st.session_state[f"hwp_working_{fname}"] = data
-    st.session_state[f"upload_bytes_{fname}"] = data
-    for k in list(st.session_state.keys()):
-        if k.startswith(f"parsed_{fname}_") or k.startswith(f"hwp_preview_{fname}_"):
-            del st.session_state[k]
+from ui.session_store import (
+    sync_export_state,
+    get_hwp_working_bytes,
+    set_hwp_working_bytes,
+    validate_hwp_bytes,
+)
 
 
 def append_hwp_highlights(fname: str, highlights: list[dict]):
@@ -174,14 +150,16 @@ def get_hwp_preview_html(fname: str, file_bytes: bytes) -> str:
     return html
 
 
-def validate_hwp_bytes(data: bytes) -> tuple[bool, str]:
-    if not isinstance(data, (bytes, bytearray)) or len(data) < 8:
-        return False, '파일 데이터가 비어 있습니다.'
-    if data[:4] != b'\xd0\xcf\x11\xe0':
-        return False, 'HWP(OLE) 형식이 아닙니다.'
-    return True, ''
+def _selected_para_state(fname: str) -> dict | None:
+    return st.session_state.get(f"selected_para_{fname}")
 
 
+def _set_selected_para(fname: str, para_index: int, text: str):
+    st.session_state[f"selected_para_{fname}"] = {
+        'index': para_index,
+        'text': text,
+    }
+    st.session_state[f"selection_{fname}"] = text
 
 
 def render_chat_panel(
@@ -193,14 +171,32 @@ def render_chat_panel(
     stage1_model: str,
     use_llm: bool,
     use_streaming: bool,
+    ollama_url: str = 'http://localhost:11434',
     source_hwp: str = '',
+    canvas_mode: bool = False,
 ):
     st.caption("명령 / 질문 — 예: *빈칸 채워줘*, *초안 작성해줘*, *총 사업비는?*")
 
     sel_key = f"selection_{fname}"
+    selected_para_key = f"selected_para_{fname}"
     if sel_key not in st.session_state:
         st.session_state[sel_key] = ''
-    if st.session_state.get(f"show_para_{fname}"):
+
+    sel = st.session_state.get(selected_para_key)
+    if sel:
+        preview = (sel.get('text') or '')[:60]
+        if len(sel.get('text', '')) > 60:
+            preview += '…'
+        c1, c2 = st.columns([4, 1])
+        with c1:
+            st.info(f"📌 **문단 {sel['index'] + 1}** 선택 · {preview}")
+        with c2:
+            if st.button('해제', key=f"clear_sel_{fname}", use_container_width=True):
+                st.session_state.pop(selected_para_key, None)
+                st.session_state[sel_key] = ''
+                st.rerun()
+
+    if not canvas_mode and st.session_state.get(f"show_para_{fname}"):
         paras = editor.get_paragraphs()
         if paras:
             para_labels = [f"{p['index']+1}. {p['preview']}" for p in paras[:30]]
@@ -211,7 +207,7 @@ def render_chat_panel(
                 key=f"sel_{fname}",
             )
             st.session_state[sel_key] = paras[sel_idx]['text']
-    else:
+    elif not canvas_mode:
         if st.button("편집 대상 문단 선택", key=f"para_btn_{fname}", use_container_width=True):
             st.session_state[f"show_para_{fname}"] = True
             st.rerun()
@@ -233,6 +229,8 @@ def render_chat_panel(
         intent = classify_intent(user_input)
         ref_ctx = get_reference_context()
         selection = st.session_state.get(f"selection_{fname}", '')
+        para_sel = _selected_para_state(fname)
+        para_index = para_sel['index'] if para_sel else None
 
         if intent != 'qa' and (_edit_without_llm(intent) or use_llm):
             with st.spinner("AI 편집 중..."):
@@ -242,6 +240,7 @@ def render_chat_panel(
                     chat_history=st.session_state[chat_key][:-1],
                     source_filename=fname,
                     ref_summary_cache=st.session_state.get('ref_summary_cache', ''),
+                    para_index=para_index,
                 )
             reply = result.get('message', '완료')
             _apply_edit_result(fname, result, editor=editor, source_hwp=source_hwp)
@@ -424,24 +423,10 @@ def render_hwp_split_editor(
         )
 
     with col_doc:
-        st.markdown(f"### 📄 {fname}")
-        st.caption("HWP 직접 편집 모드 — 🔴 적용된 수정 표시 · 다운로드 **.hwp**")
-        hwp_bytes = get_hwp_working_bytes(fname, file_bytes)
-        components.html(get_hwp_preview_html(fname, hwp_bytes), height=720, scrolling=True)
-        base = os.path.splitext(fname)[0]
-        ok, err = validate_hwp_bytes(hwp_bytes)
-        if ok:
-            st.caption(f"파일 크기: {len(hwp_bytes):,} bytes")
-            st.download_button(
-                "📥 수정본 HWP 다운로드",
-                data=bytes(hwp_bytes),
-                file_name=f"{base}_edited.hwp",
-                mime="application/octet-stream",
-                key=f"dl_hwp_btn_{fname}",
-                use_container_width=True,
-            )
-        else:
-            st.error(f"다운로드 불가: {err}")
+        render_canvas_editor_hwp(
+            fname, file_bytes,
+            chat_key=chat_key,
+        )
 
 
 def render_split_editor(
@@ -466,13 +451,38 @@ def render_split_editor(
     if chat_key not in st.session_state:
         st.session_state[chat_key] = []
 
-    pending_n = len(editor.get_pending_changes())
+    pending_list = editor.get_pending_changes()
+    pending_n = len(pending_list)
+    scroll_key = f"scroll_pending_{fname}"
 
     bar1, bar2, bar3, bar4 = st.columns([2, 1, 1, 1])
     with bar1:
         st.markdown(f"### 📄 {fname}")
     with bar2:
-        st.metric("대기 변경", pending_n)
+        st.caption("대기 변경")
+        if pending_n == 0:
+            st.markdown("**0**")
+        elif pending_n == 1:
+            ch = pending_list[0]
+            if st.button(
+                f"**{pending_n}** · 위치로",
+                key=f"goto_pending_{fname}_{ch.id}",
+                help=format_pending_label(ch),
+                use_container_width=True,
+            ):
+                st.session_state[scroll_key] = ch.id
+                st.rerun()
+        else:
+            st.markdown(f"**{pending_n}**")
+            with st.popover("목록 · 위치로", use_container_width=True):
+                for ch in pending_list:
+                    if st.button(
+                        format_pending_label(ch),
+                        key=f"goto_{ch.id}_{fname}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[scroll_key] = ch.id
+                        st.rerun()
     with bar3:
         if pending_n and st.button("✅ 모두 적용", key=f"apply_{fname}", type="primary", use_container_width=True):
             n = editor.accept_all_pending(track_changes=True)
@@ -481,9 +491,10 @@ def render_split_editor(
                     editor.recalculate_totals(t)
             st.session_state[chat_key].append({
                 'role': 'assistant',
-                'content': f'✅ {n}건 변경을 문서에 적용했습니다. 왼쪽에서 **빨간색**으로 확인하세요.',
+                'content': f'✅ {n}건 변경을 문서에 적용했습니다.',
             })
             sync_export_state(editor, fname, source_hwp=source_hwp)
+            st.session_state[f"cvs_rev_{fname}"] = st.session_state.get(f"cvs_rev_{fname}", 0) + 1
             st.rerun()
     with bar4:
         if pending_n and st.button("❌ 모두 취소", key=f"cancel_{fname}", use_container_width=True):
@@ -495,51 +506,21 @@ def render_split_editor(
 
     col_doc, col_chat = st.columns([3, 2], gap="medium")
 
-    # 채팅 패널을 먼저 렌더링 — 미리보기 HTML/ZIP 생성이 채팅 표시를 막지 않도록
+    with col_doc:
+        render_canvas_editor(
+            fname, editor,
+            source_hwp=source_hwp,
+            chat_key=chat_key,
+        )
+
     with col_chat:
         render_chat_panel(
             fname, editor, all_documents, chat_key,
             model_name, stage1_model, use_llm, use_streaming,
+            ollama_url=ollama_url,
             source_hwp=source_hwp,
+            canvas_mode=True,
         )
-
-    with col_doc:
-        st.caption("문서 미리보기 — 🟡 AI 제안  🔴 적용된 수정  🟢 새 내용")
-        components.html(get_cached_preview_html(editor, fname), height=720, scrolling=True)
-        base = os.path.splitext(fname)[0]
-        dl_ready_key = f"dl_ready_{fname}"
-        if st.button("📥 다운로드 준비", key=f"prep_{fname}", use_container_width=True):
-            sync_export_state(editor, fname, source_hwp=source_hwp)
-            export = editor.get_export_bytes()
-            ok, err = HWPXEditor.validate_hwpx_bytes(export)
-            if ok:
-                st.session_state[dl_ready_key] = True
-            else:
-                st.error(f"다운로드 준비 실패: {err}")
-            st.rerun()
-        if st.session_state.get(dl_ready_key):
-            dl_data = editor.get_export_bytes()
-            ok, err = HWPXEditor.validate_hwpx_bytes(dl_data)
-            if not ok:
-                st.error(f"다운로드 파일 오류: {err}. 문서를 다시 업로드해 주세요.")
-                dl_data = None
-        else:
-            dl_data = None
-        if dl_data:
-            if source_hwp:
-                st.info(
-                    f"원본 **{source_hwp}** → 편집본은 **HWPX** 형식입니다. "
-                    "한글에서 **파일 열기**로 여세요. 확장자를 `.hwp`로 바꾸지 마세요."
-                )
-            st.caption(f"파일 크기: {len(dl_data):,} bytes")
-            st.download_button(
-                "📥 수정된 HWPX 다운로드",
-                data=bytes(dl_data),
-                file_name=f"{base}_edited.hwpx",
-                mime="application/vnd.hancom.hwpx",
-                key=f"dl_btn_{fname}",
-                use_container_width=True,
-            )
 
 
 def try_open_hwp_for_editing(filename: str, file_bytes: bytes) -> tuple[Optional[bytes], Optional[str], str]:
@@ -615,7 +596,7 @@ def render_readonly_split(
 # --- 사이드바 ---
 with st.sidebar:
     st.header("⚙️ 설정")
-    ollama_url = st.text_input("Ollama URL", value="http://localhost:11434")
+    ollama_url = st.text_input("Ollama URL", value="http://localhost:11434", key="sidebar_ollama_url")
     ollama_status = get_cached_ollama_status(ollama_url)
 
     if ollama_status['status'] == 'running':
@@ -626,7 +607,7 @@ with st.sidebar:
             sorted_models = gemma4_models + [m for m in available_models if m not in gemma4_models]
             model_name = st.selectbox("모델", sorted_models, index=0)
         else:
-            model_name = st.text_input("모델", value="gemma4")
+            model_name = st.text_input("모델", value="gemma4", key="sidebar_model_name")
     else:
         st.warning("Ollama 미연결")
         model_name = "gemma4"

@@ -60,6 +60,15 @@ table.hwpx-tbl th { background: #f0f0f0; font-weight: 600; }
 .cell-empty { background: #fafafa; color: #ccc; }
 /* 대기 중 (AI 제안) */
 .ch-pending { background: #fff8e1; outline: 2px solid #ffc107; }
+/* 선택된 문단 (Canvas) */
+.ch-selected { background: #e3f2fd; outline: 2px solid #2196f3; }
+.para-clickable { cursor: pointer; }
+.para-clickable:hover { background: #f5f9ff; }
+.para-editable { outline: none; min-height: 1em; display: inline; }
+.para-editable:focus { background: rgba(33, 150, 243, .08); border-radius: 2px; }
+.para-hint {
+    font-size: 10px; color: #999; margin-left: 6px; user-select: none;
+}
 .ch-focus {
     outline: 3px solid #ff5722 !important;
     box-shadow: 0 0 14px rgba(255, 152, 0, .55);
@@ -131,8 +140,13 @@ def _map_replace_pending(
                         return
         elif block['type'] == 'paragraph':
             txt = block['text']
+            editor_idx = editor.editor_index_for_block(
+                block['paragraph_index'], txt,
+            )
+            if editor_idx is None:
+                continue
             if text_locatable_in(ch.old_text, txt) or text_locatable_in(ch.new_text, txt):
-                pending_paras[block['paragraph_index']] = ch
+                pending_paras[editor_idx] = ch
                 return
 
 
@@ -201,10 +215,14 @@ def _render_pending_cell(highlight: PendingChange) -> str:
 
 def _render_paragraph(
     live_text: str,
-    idx: int,
+    editor_idx: int,
     pending: Optional[PendingChange],
     applied: Optional[AppliedHighlight],
+    *,
+    canvas_mode: bool = False,
+    selected: bool = False,
 ) -> str:
+    extra_cls = ''
     if pending:
         cls = 'para ch-pending'
         if pending.change_type == 'replace':
@@ -226,9 +244,23 @@ def _render_paragraph(
         body = ''.join(parts)
     else:
         cls = 'para'
-        body = _esc(live_text)
-    pid = f'pending-{pending.id}' if pending else f'para-{idx}'
-    return f'<p class="{cls}" id="{pid}"><span class="para-num">{idx+1}</span>{body}</p>'
+        if canvas_mode:
+            body = f'<span class="para-editable">{_esc(live_text)}</span>'
+        else:
+            body = _esc(live_text)
+
+    if canvas_mode and not pending:
+        extra_cls = ' para-clickable'
+
+    pid = f'pending-{pending.id}' if pending else f'para-{editor_idx}'
+    data_attr = f' data-para-idx="{editor_idx}"' if canvas_mode else ''
+    if canvas_mode and not pending:
+        data_attr += f' data-para-orig="{_esc(live_text[:300])}"'
+    hint = '' if canvas_mode else ''
+    return (
+        f'<p class="{cls}{extra_cls}" id="{pid}"{data_attr}>'
+        f'<span class="para-num">{editor_idx + 1}</span>{body}{hint}</p>'
+    )
 
 
 def _render_table_block(
@@ -238,6 +270,7 @@ def _render_table_block(
     applied_cells: dict,
     max_rows: int = 50,
 ) -> str:
+    # TODO(canvas): 표 셀 클릭 선택·편집은 후속 단계에서 지원
     parts = [f'<div class="tbl-wrap" id="table-{t_idx}">']
     parts.append(f'<div class="tbl-caption">표 {t_idx + 1}</div>')
     parts.append('<table class="hwpx-tbl"><tbody>')
@@ -302,6 +335,7 @@ def build_preview_html(
     max_tables: int = 20,
     max_rows_per_table: int = 50,
     scroll_to_change_id: str | None = None,
+    canvas_mode: bool = False,
 ) -> str:
     pending_cells, pending_paras, pending_inserts, applied_cells, applied_paras = (
         _build_preview_maps(editor)
@@ -311,26 +345,41 @@ def build_preview_html(
 
     parts.append('<div class="legend">')
     parts.append('<span><i class="dot" style="background:#ffc107"></i> 대기 중 (AI 제안)</span>')
+    parts.append('<span><i class="dot" style="background:#2196f3"></i> 선택 문단</span>')
     parts.append('<span><i class="dot" style="background:#cc0000"></i> 적용된 수정 (한글과 동일)</span>')
     parts.append('<span><i class="dot" style="background:#008800"></i> 제안된 새 내용</span>')
     parts.append('</div>')
 
     if filename:
         parts.append(f'<div class="doc-title">📄 {_esc(filename)}</div>')
+    if canvas_mode:
+        parts.append(
+            '<div style="font-size:11px;color:#666;margin-bottom:10px">'
+            '위 「편집할 문단」에서 선택 · 번호는 미리보기 왼쪽 숫자와 같음 · '
+            '직접 수정은 선택 후 텍스트 상자 이용</div>'
+        )
 
     para_shown = 0
     table_shown = 0
+    block_map = editor.build_block_to_editor_paragraph_map() if canvas_mode else {}
     for block in editor.get_document_blocks():
         if block['type'] == 'paragraph':
             if para_shown >= max_paras:
                 continue
-            idx = block['paragraph_index']
+            block_idx = block['paragraph_index']
+            editor_idx = block_map.get(block_idx)
+            if editor_idx is None:
+                editor_idx = editor.editor_index_for_block(block_idx, block['text'])
+            if editor_idx is None:
+                continue
             parts.append(_render_paragraph(
-                block['text'], idx,
-                pending_paras.get(idx),
-                applied_paras.get(idx),
+                block['text'], editor_idx,
+                pending_paras.get(editor_idx),
+                applied_paras.get(editor_idx),
+                canvas_mode=canvas_mode,
+                selected=False,
             ))
-            for ins in pending_inserts.get(idx, []):
+            for ins in pending_inserts.get(editor_idx, []):
                 for line in ins.new_text.split('\n'):
                     line = line.strip()
                     if line:
@@ -352,7 +401,7 @@ def build_preview_html(
 
     parts.append('</div></div>')
 
-    if scroll_to_change_id:
+    if scroll_to_change_id and not canvas_mode:
         cid = re.sub(r'[^\w\-]', '', scroll_to_change_id)
         parts.append(f"""<script>
 (function() {{
@@ -372,6 +421,47 @@ def build_preview_html(
 </script>""")
 
     return '\n'.join(parts)
+
+
+def append_viewer_scripts(
+    html: str,
+    *,
+    selected_para_index: int | None = None,
+    scroll_to_change_id: str | None = None,
+    scroll_to_para_index: int | None = None,
+) -> str:
+    """캐시된 HTML에 선택/스크롤 스크립트만 추가 (캐시 무효화 없음)."""
+    actions: list[str] = []
+    if selected_para_index is not None:
+        actions.append(
+            f'var sel=document.getElementById("para-{selected_para_index}");'
+            f'if(sel){{sel.classList.add("ch-selected");}}'
+        )
+    if scroll_to_change_id:
+        cid = re.sub(r'[^\w\-]', '', scroll_to_change_id)
+        actions.append(
+            f'var pe=document.getElementById("pending-{cid}");'
+            f'if(pe){{pe.scrollIntoView({{behavior:"smooth",block:"center"}});'
+            f'pe.classList.add("ch-focus");'
+            f'setTimeout(function(){{pe.classList.remove("ch-focus");}},2800);}}'
+        )
+    if scroll_to_para_index is not None:
+        actions.append(
+            f'var sp=document.getElementById("para-{scroll_to_para_index}");'
+            f'if(sp){{sp.scrollIntoView({{behavior:"smooth",block:"center"}});'
+            f'sp.classList.add("ch-selected");}}'
+        )
+    if not actions:
+        return html
+    body = ' '.join(actions)
+    return html + f"""<script>
+(function() {{
+  function run() {{ {body} }}
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", run);
+  }} else {{ run(); }}
+}})();
+</script>"""
 
 
 def build_preview_from_text(
@@ -409,6 +499,7 @@ def build_preview_from_text(
                         'old_text': applied.get('old', ''),
                         'new_text': applied.get('new', text),
                     })(),
+                    canvas_mode=False,
                 ))
         else:
             parts.append(f'<p class="para"><span class="para-num">{line_no}</span>{_esc(text)}</p>')

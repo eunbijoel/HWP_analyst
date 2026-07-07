@@ -10,6 +10,10 @@ from additional.ai_editor import (
     generate_blank_fills,
     generate_document_draft,
     rewrite_selection,
+    rewrite_paragraph,
+    propose_manual_paragraph_edit,
+    delete_paragraph_by_index,
+    insert_after_paragraph_index,
     generate_fill_fallback,
     insert_content_from_command,
     delete_content_from_command,
@@ -22,7 +26,10 @@ from additional.ai_editor import (
 
 EDIT_FILL = re.compile(r'빈칸|채워|채우|기입|입력해|공란', re.I)
 EDIT_DRAFT = re.compile(r'초안|작성해|써줘|작성해줘|제안서|계획서.*작성', re.I)
-EDIT_REWRITE = re.compile(r'리라이트|다듬|명확하게|개선', re.I)
+EDIT_REWRITE = re.compile(
+    r'리라이트|다듬|명확하게|개선|짧게|줄여|공문체|기술문서',
+    re.I,
+)
 EDIT_REPLACE = re.compile(r'찾아서.*바꿔|치환|전체.*바꿔', re.I)
 EDIT_DELETE = re.compile(r'삭제|지워|제거|없애|빼\s*줘|취소해', re.I)
 INSERT_CMD = re.compile(r'넣어|삽입|기입해|적어\s*넣|기록해|추가해|추가하', re.I)
@@ -172,6 +179,7 @@ def execute_edit_command(
     source_filename: str = 'doc.hwpx',
     file_bytes: bytes | None = None,
     ref_summary_cache: str = '',
+    para_index: int | None = None,
 ) -> dict:
     """편집 명령 실행 → pending changes 생성."""
     intent = classify_intent(command)
@@ -308,6 +316,15 @@ def execute_edit_command(
                 'message': 'HWP는 HWPX 변환 후 삭제 명령을 이용하세요.',
                 'changes': 0,
             }
+        if para_index is not None:
+            ch, msg = delete_paragraph_by_index(editor, para_index)
+            if ch:
+                return {
+                    'type': 'edit', 'intent': 'delete',
+                    'message': f'{msg} — 왼쪽에서 확인 후 「모두 적용」',
+                    'changes': 1,
+                }
+            return {'type': 'edit', 'intent': 'delete', 'message': msg, 'changes': 0}
         changes, msg, elapsed = delete_content_from_command(
             editor, command, chat_history=chat_history, source_filename=source_filename)
         applied = 'hwpilot' in msg and len(changes) == 0
@@ -367,6 +384,20 @@ def execute_edit_command(
                 'message': 'HWP 편집 실패 — hwpilot으로 문서 끝 추가를 시도했으나 반영되지 않았습니다.',
                 'changes': 0, 'elapsed': 0.0,
             }
+
+        if para_index is not None:
+            from additional.ai_editor import _extract_insert_payload
+            _, body = _extract_insert_payload(command, chat_history)
+            if not (body or '').strip():
+                body = command
+            ch, msg = insert_after_paragraph_index(editor, para_index, body)
+            if ch:
+                return {
+                    'type': 'edit', 'intent': 'insert',
+                    'message': f'{msg} — 왼쪽에서 확인 후 「모두 적용」',
+                    'changes': 1,
+                }
+            return {'type': 'edit', 'intent': 'insert', 'message': msg, 'changes': 0}
 
         changes, msg, elapsed = insert_content_from_command(
             editor, command, chat_history=chat_history, source_filename=source_filename)
@@ -436,6 +467,16 @@ def execute_edit_command(
             hwp = _try_hwp_bytes_insert(
                 command, source_filename, file_bytes, chat_history, 'rewrite')
             return hwp or _hwp_editor_required_message('rewrite')
+        if para_index is not None:
+            change, msg, elapsed = rewrite_paragraph(
+                editor, para_index, command, reference_context, model, ollama_url)
+            if change:
+                return {
+                    'type': 'edit', 'intent': 'rewrite',
+                    'message': f'{msg} ({elapsed}s)',
+                    'changes': 1, 'elapsed': elapsed,
+                }
+            return {'type': 'edit', 'intent': 'rewrite', 'message': msg, 'changes': 0}
         target = selection_text.strip()
         if not target:
             paras = editor.get_paragraphs()
@@ -443,7 +484,8 @@ def execute_edit_command(
                 target = paras[0]['text']
         if target:
             change, msg, elapsed = rewrite_selection(
-                editor, target, command, reference_context, model, ollama_url)
+                editor, target, command, reference_context, model, ollama_url,
+                paragraph_index=para_index)
             if change:
                 return {
                     'type': 'edit', 'intent': 'rewrite',

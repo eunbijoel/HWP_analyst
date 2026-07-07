@@ -173,6 +173,7 @@ class HWPXEditor:
         self.preview_revision: int = 0
         self._blocks_cache: Optional[list] = None
         self._paragraphs_cache: Optional[list] = None
+        self._block_editor_para_map: Optional[dict[int, int]] = None
         self._saved_bytes_cache: Optional[bytes] = None
         self._saved_bytes_rev: int = -1
         self._modified_runs: set = set()
@@ -798,7 +799,43 @@ class HWPXEditor:
     def _invalidate_structure_cache(self):
         self._blocks_cache = None
         self._paragraphs_cache = None
+        self._block_editor_para_map = None
         self._saved_bytes_cache = None
+
+    def build_block_to_editor_paragraph_map(self) -> dict[int, int]:
+        """미리보기 block paragraph_index → get_paragraphs() index."""
+        if self._block_editor_para_map is not None:
+            return self._block_editor_para_map
+        paras = self.get_paragraphs()
+        mapping: dict[int, int] = {}
+        used: set[int] = set()
+        for block in self.get_document_blocks():
+            if block['type'] != 'paragraph':
+                continue
+            bidx = block['paragraph_index']
+            btxt = block['text']
+            for p in paras:
+                pi = p['index']
+                if pi in used:
+                    continue
+                if p['text'] == btxt or text_locatable_in(btxt, p['text']):
+                    mapping[bidx] = pi
+                    used.add(pi)
+                    break
+        self._block_editor_para_map = mapping
+        return mapping
+
+    def editor_index_for_block(self, block_para_index: int, block_text: str = '') -> Optional[int]:
+        """미리보기 블록 인덱스를 편집 엔진 문단 인덱스로 변환."""
+        mapped = self.build_block_to_editor_paragraph_map().get(block_para_index)
+        if mapped is not None:
+            return mapped
+        if not block_text:
+            return None
+        for p in self.get_paragraphs():
+            if p['text'] == block_text or text_locatable_in(block_text, p['text']):
+                return p['index']
+        return None
 
     def get_saved_bytes(self) -> bytes:
         return self.get_export_bytes()

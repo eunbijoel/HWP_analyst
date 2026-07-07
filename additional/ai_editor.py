@@ -301,8 +301,15 @@ def rewrite_selection(
     reference_context: str = '',
     model: str = 'gemma4',
     ollama_url: str = 'http://localhost:11434',
+    paragraph_index: int | None = None,
 ) -> tuple[Optional[PendingChange], str, float]:
     """선택 텍스트를 지시에 맞게 리라이트 → PendingChange."""
+    if paragraph_index is not None:
+        return rewrite_paragraph(
+            editor, paragraph_index, instruction,
+            reference_context, model, ollama_url,
+        )
+
     selection_text = selection_text.strip()
     if not selection_text:
         return None, '선택 텍스트가 비어 있습니다.', 0.0
@@ -339,6 +346,101 @@ def rewrite_selection(
         selection_text, new_text,
         location=f'선택 편집: {selection_text[:30]}...')
     return ch, summary or '리라이트 완료', elapsed
+
+
+def rewrite_paragraph(
+    editor: HWPXEditor,
+    paragraph_index: int,
+    instruction: str,
+    reference_context: str = '',
+    model: str = 'gemma4',
+    ollama_url: str = 'http://localhost:11434',
+) -> tuple[Optional[PendingChange], str, float]:
+    """문단 인덱스 기준 리라이트 → propose_paragraph_change (안전)."""
+    paras = editor.get_paragraphs()
+    if paragraph_index < 0 or paragraph_index >= len(paras):
+        return None, '문단을 찾지 못했습니다.', 0.0
+    selection_text = paras[paragraph_index]['text']
+    if not selection_text.strip():
+        return None, '빈 문단입니다.', 0.0
+
+    ref_section = f'\n## 참고 자료:\n{reference_context}\n' if reference_context else ''
+    prompt = f"""다음 문서 일부를 사용자 지시에 맞게 다시 작성하세요.
+
+## 사용자 지시:
+{instruction}
+{ref_section}
+## 원문:
+{selection_text}
+
+## 출력 형식 (JSON만):
+{{"rewritten": "수정된 전체 텍스트", "summary": "변경 요약"}}
+
+규칙: 원문 의미 유지, 지시한 문체·분량 준수."""
+
+    start = time.time()
+    data, err = _call_ollama_json(prompt, model, ollama_url)
+    elapsed = round(time.time() - start, 1)
+    if data is None:
+        return None, f'LLM 오류: {err}', elapsed
+
+    new_text = ''
+    summary = ''
+    if isinstance(data, dict):
+        new_text = str(data.get('rewritten', '')).strip()
+        summary = str(data.get('summary', ''))
+    if not new_text:
+        return None, '생성된 텍스트가 없습니다.', elapsed
+
+    ch = editor.propose_paragraph_change(paragraph_index, new_text)
+    return ch, summary or f'문단 {paragraph_index + 1} 리라이트 제안', elapsed
+
+
+def propose_manual_paragraph_edit(
+    editor: HWPXEditor,
+    paragraph_index: int,
+    new_text: str,
+) -> Optional[PendingChange]:
+    """Canvas 직접 수정 → PendingChange (즉시 적용하지 않음)."""
+    paras = editor.get_paragraphs()
+    if paragraph_index < 0 or paragraph_index >= len(paras):
+        return None
+    old = paras[paragraph_index]['text']
+    cleaned = (new_text or '').strip()
+    if not cleaned or cleaned == old.strip():
+        return None
+    return editor.propose_paragraph_change(paragraph_index, cleaned)
+
+
+def delete_paragraph_by_index(
+    editor: HWPXEditor,
+    paragraph_index: int,
+) -> tuple[Optional[PendingChange], str]:
+    """선택 문단 삭제 제안."""
+    paras = editor.get_paragraphs()
+    if paragraph_index < 0 or paragraph_index >= len(paras):
+        return None, '문단을 찾지 못했습니다.'
+    ch = editor.propose_paragraph_change(paragraph_index, '')
+    return ch, f'문단 {paragraph_index + 1} 삭제 제안'
+
+
+def insert_after_paragraph_index(
+    editor: HWPXEditor,
+    paragraph_index: int,
+    body: str,
+) -> tuple[Optional[PendingChange], str]:
+    """선택 문단 아래 삽입 제안."""
+    paras = editor.get_paragraphs()
+    if paragraph_index < 0 or paragraph_index >= len(paras):
+        return None, '문단을 찾지 못했습니다.'
+    body = (body or '').strip()
+    if not body:
+        return None, '삽입할 내용이 비어 있습니다.'
+    anchor = paras[paragraph_index]['text'][:120]
+    ch = editor.propose_insert_after_anchor(anchor, body)
+    if ch is None:
+        return None, '삽입 위치를 찾지 못했습니다.'
+    return ch, f'문단 {paragraph_index + 1} 아래 삽입 제안'
 
 
 def _extract_insert_payload(command: str, chat_history: list | None) -> tuple[str, str]:
