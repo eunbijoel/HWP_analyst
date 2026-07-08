@@ -21,6 +21,9 @@ from additional.ai_editor import (
     replace_hwp_from_command,
     extract_replace_spec,
     apply_table_cell_amount_command,
+    apply_table_cell_ref_command,
+    parse_table_cell_ref,
+    propose_table_label_amount,
 )
 
 
@@ -40,6 +43,13 @@ QUESTION = re.compile(
 )
 TABLE_QUESTION = re.compile(
     r'표\s*\d+.*(?:어떻게|뭐|얼마|소계|합계|알려|돼|계산|뭔지)',
+    re.I,
+)
+TABLE_CELL_REF = re.compile(
+    r'\d+\s*행\s*\d+\s*열|'
+    r'[A-Za-z]+\s*열\s*\d+\s*행|'
+    r'\d+\s*행\s*[A-Za-z]+\s*열|'
+    r'[A-Za-z]\s*열\s*[A-Za-z]\s*행',
     re.I,
 )
 TABLE_CELL_EDIT = re.compile(
@@ -125,6 +135,10 @@ def classify_intent(text: str) -> str:
 
     if TABLE_CELL_EDIT.search(t):
         return 'table_edit'
+    if TABLE_CELL_REF.search(t) and (
+        REPLACE_VERBS.search(t) or re.search(r'(?:으로|로)\s*[\d,]', t)
+    ):
+        return 'replace'
     if APPEND_REF.search(t):
         return 'append_ref'
     if TABLE_QUESTION.search(t) and not (spec and REPLACE_VERBS.search(t)):
@@ -133,6 +147,8 @@ def classify_intent(text: str) -> str:
         if not REPLACE_PATTERN.search(t):
             return 'qa'
 
+    if spec and spec.get('old') and spec.get('new'):
+        return 'replace'
     if spec and (spec.get('line_num') or REPLACE_VERBS.search(t) or REPLACE_PATTERN.search(t)):
         return 'replace'
     if EDIT_DELETE.search(t):
@@ -153,8 +169,6 @@ def classify_intent(text: str) -> str:
         return 'rewrite'
     if QUESTION.search(t):
         return 'qa'
-    if len(t) < 60 and any(w in t for w in ['해줘', '해 주세요', '하세요']):
-        return 'draft'
     return 'qa'
 
 
@@ -248,8 +262,49 @@ def execute_edit_command(
                 }
         if editor is None:
             return _hwp_editor_required_message('replace')
+
+        if TABLE_CELL_REF.search(command) or parse_table_cell_ref(command):
+            changes, msg, elapsed = apply_table_cell_ref_command(editor, command, spec)
+            if changes:
+                return {
+                    'type': 'edit', 'intent': 'replace',
+                    'message': (
+                        f'{msg} — 왼쪽에서 **노란색** 확인 후 「모두 적용」'
+                    ),
+                    'changes': len(changes),
+                    'elapsed': elapsed,
+                }
+            if msg:
+                return {
+                    'type': 'edit', 'intent': 'replace',
+                    'message': msg,
+                    'changes': 0,
+                    'elapsed': elapsed,
+                }
+
         if pair and pair[0] and pair[1]:
             old, new = pair
+            if not re.search(r'\d', old) and re.search(r'[\d,]', new):
+                ch = propose_table_label_amount(
+                    editor, command, old, new, chat_history=chat_history,
+                )
+                if ch:
+                    return {
+                        'type': 'edit', 'intent': 'replace',
+                        'message': (
+                            f'표 셀 변경 제안: "{ch.old_text}" → "{ch.new_text}" '
+                            f'({ch.location}, {ch.id}) — 왼쪽에서 **노란색** 확인 후 「모두 적용」'
+                        ),
+                        'changes': 1,
+                    }
+                return {
+                    'type': 'edit', 'intent': 'replace',
+                    'message': (
+                        f'「{old[:50]}」에 해당하는 표·열을 찾지 못했습니다. '
+                        '예: *표1 8행 5열을 392,400으로 바꿔줘* 또는 앞서 *표1 전년도 매출액*처럼 표 번호를 말해 주세요.'
+                    ),
+                    'changes': 0,
+                }
             ch = editor.propose_table_value_replace(command, old, new)
             if ch:
                 return {
@@ -260,10 +315,23 @@ def execute_edit_command(
                     ),
                     'changes': 1,
                 }
-            ch = editor.propose_replace(old, new, location=f'치환: {old[:20]}')
+            targets = editor.locate_replace_targets(old, new)
+            if not targets:
+                return {
+                    'type': 'edit', 'intent': 'replace',
+                    'message': f'문서에서 "{old[:40]}" 을(를) 찾지 못했습니다.',
+                    'changes': 0,
+                }
+            ch = editor.propose_replace(
+                old, new, location=f'"{old}" → "{new}"',
+            )
+            n = len(targets)
             return {
                 'type': 'edit', 'intent': 'replace',
-                'message': f'"{old}" → "{new}" 변경 제안 ({ch.id}) — 왼쪽에서 노란색 확인 후 「모두 적용」',
+                'message': (
+                    f'"{old}" → "{new}" 치환 제안 ({n}곳) ({ch.id}) — '
+                    '왼쪽에서 **노란색** 확인 후 「모두 적용」'
+                ),
                 'changes': 1,
             }
         if spec and spec.get('line_num') and spec.get('new'):
@@ -501,18 +569,12 @@ def execute_edit_command(
             command, source_filename, file_bytes, chat_history, intent)
         return hwp or _hwp_editor_required_message(intent)
 
-    changes, msg, elapsed = generate_document_draft(
-        editor, command, reference_context, model, ollama_url)
-    if not changes and not EDIT_DELETE.search(command):
-        ins_changes, ins_msg, ins_elapsed = insert_content_from_command(
-            editor, command, chat_history=chat_history, source_filename=source_filename)
-        if ins_changes or 'hwpilot으로 문서에 반영' in ins_msg:
-            return {
-                'type': 'edit', 'intent': 'insert',
-                'message': ins_msg,
-                'changes': len(ins_changes), 'elapsed': ins_elapsed,
-            }
     return {
-        'type': 'edit', 'intent': 'draft',
-        'message': msg, 'changes': len(changes), 'elapsed': elapsed,
+        'type': 'edit',
+        'intent': intent,
+        'message': (
+            '편집 명령을 처리하지 못했습니다. '
+            '예: *데이터공유플랫폼을 데이터쉐어링으로 바꿔줘*, *표1 8행 5열을 …으로*'
+        ),
+        'changes': 0,
     }

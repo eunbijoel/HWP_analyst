@@ -135,9 +135,8 @@ def _map_replace_pending(
             t_idx = block['table_index']
             for r_idx, row in enumerate(block['parsed'].rows):
                 for c_idx, cell in enumerate(row):
-                    if _values_match(ch.old_text, cell):
+                    if _values_match(ch.old_text, str(cell)):
                         pending_cells[_cell_key(t_idx, r_idx, c_idx)] = ch
-                        return
         elif block['type'] == 'paragraph':
             txt = block['text']
             editor_idx = editor.editor_index_for_block(
@@ -145,9 +144,8 @@ def _map_replace_pending(
             )
             if editor_idx is None:
                 continue
-            if text_locatable_in(ch.old_text, txt) or text_locatable_in(ch.new_text, txt):
+            if text_locatable_in(ch.old_text, txt):
                 pending_paras[editor_idx] = ch
-                return
 
 
 def _build_preview_maps(editor: HWPXEditor):
@@ -225,7 +223,21 @@ def _render_paragraph(
     extra_cls = ''
     if pending:
         cls = 'para ch-pending'
-        if pending.change_type == 'replace':
+        if (
+            pending.change_type == 'replace'
+            and pending.old_text
+            and pending.old_text in live_text
+        ):
+            pos = live_text.find(pending.old_text)
+            before = live_text[:pos]
+            after = live_text[pos + len(pending.old_text):]
+            body = (
+                f'{_esc(before)}'
+                f'<span class="old-pending">{_esc(pending.old_text)}</span> '
+                f'<span class="ins">{_esc(pending.new_text)}</span>'
+                f'{_esc(after)}'
+            )
+        elif pending.change_type == 'replace':
             body = (
                 f'<span class="old-pending">{_esc(pending.old_text)}</span> '
                 f'<span class="ins">{_esc(pending.new_text)}</span>'
@@ -345,9 +357,10 @@ def build_preview_html(
 
     parts.append('<div class="legend">')
     parts.append('<span><i class="dot" style="background:#ffc107"></i> 대기 중 (AI 제안)</span>')
-    parts.append('<span><i class="dot" style="background:#2196f3"></i> 선택 문단</span>')
-    parts.append('<span><i class="dot" style="background:#cc0000"></i> 적용된 수정 (한글과 동일)</span>')
-    parts.append('<span><i class="dot" style="background:#008800"></i> 제안된 새 내용</span>')
+    parts.append('<span><i class="dot" style="background:#cc0000"></i> 적용된 수정</span>')
+    parts.append('<span><i class="dot" style="background:#008800"></i> 새 내용</span>')
+    if canvas_mode:
+        parts.append('<span><i class="dot" style="background:#2196f3"></i> 선택 문단</span>')
     parts.append('</div>')
 
     if filename:

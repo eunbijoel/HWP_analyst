@@ -110,41 +110,82 @@ def _on_body_change(fname: str, indices: list[int], rev: int):
             dirty[idx] = parts[i].strip()
 
 
-def _on_table_change(fname: str, t_idx: int, rev: int, nrow: int, ncol: int, baseline: list[list[str]]):
-    """data_editor 변경 → 변경된 셀만 dirty."""
-    key = f"cvs_tbl_{fname}_{t_idx}_{rev}"
-    edited = st.session_state.get(key)
+def _cell_str(val) -> str:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ''
+    return str(val)
+
+
+def _sync_table_dirty(
+    fname: str,
+    state_key: str,
+    t_idx: int,
+    nrow: int,
+    ncol: int,
+    baseline: list[list[str]],
+):
+    """data_editor session state → 변경된 셀만 dirty (DataFrame / EditingState 모두 지원)."""
+    edited = st.session_state.get(state_key)
     if edited is None:
         return
+
     dirty_tbl = _dirty_tables(fname)
+    current: list[list[str]] = [list(row) for row in baseline]
+
+    if isinstance(edited, pd.DataFrame):
+        for r in range(min(nrow, len(edited.index))):
+            for c in range(min(ncol, len(edited.columns))):
+                current[r][c] = _cell_str(edited.iat[r, c])
+    elif isinstance(edited, dict):
+        if 'edited_rows' in edited:
+            for row_id, col_changes in edited.get('edited_rows', {}).items():
+                try:
+                    r = int(row_id)
+                except (TypeError, ValueError):
+                    continue
+                if r < 0 or r >= nrow:
+                    continue
+                for col_id, val in col_changes.items():
+                    try:
+                        c = int(col_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if c < 0 or c >= ncol:
+                        continue
+                    current[r][c] = _cell_str(val)
+        else:
+            try:
+                df = pd.DataFrame(edited)
+                for r in range(min(nrow, len(df.index))):
+                    for c in range(min(ncol, len(df.columns))):
+                        current[r][c] = _cell_str(df.iat[r, c])
+            except (ValueError, TypeError):
+                return
+    else:
+        return
+
     for r in range(nrow):
         for c in range(ncol):
-            val = edited.iloc[r, c]
-            new_val = '' if pd.isna(val) else str(val)
+            new_val = current[r][c]
             old_val = baseline[r][c] if r < len(baseline) and c < len(baseline[r]) else ''
             cell_key = (t_idx, r, c)
             if new_val != old_val:
                 dirty_tbl[cell_key] = new_val
             elif cell_key in dirty_tbl:
                 del dirty_tbl[cell_key]
+
+
+def _on_table_change(fname: str, t_idx: int, rev: int, nrow: int, ncol: int, baseline: list[list[str]]):
+    """레거시 on_change — Streamlit EditingState dict 호환."""
+    _sync_table_dirty(
+        fname, f"cvs_tbl_{fname}_{t_idx}_{rev}", t_idx, nrow, ncol, baseline,
+    )
 
 
 def _on_hwp_table_change(fname: str, t_idx: int, rev: int, nrow: int, ncol: int, baseline: list[list[str]]):
-    key = f"cvs_hwp_tbl_{fname}_{t_idx}_{rev}"
-    edited = st.session_state.get(key)
-    if edited is None:
-        return
-    dirty_tbl = _dirty_tables(fname)
-    for r in range(nrow):
-        for c in range(ncol):
-            val = edited.iloc[r, c]
-            new_val = '' if pd.isna(val) else str(val)
-            old_val = baseline[r][c] if r < len(baseline) and c < len(baseline[r]) else ''
-            cell_key = (t_idx, r, c)
-            if new_val != old_val:
-                dirty_tbl[cell_key] = new_val
-            elif cell_key in dirty_tbl:
-                del dirty_tbl[cell_key]
+    _sync_table_dirty(
+        fname, f"cvs_hwp_tbl_{fname}_{t_idx}_{rev}", t_idx, nrow, ncol, baseline,
+    )
 
 
 def _on_hwp_body_change(fname: str, rev: int, para_count: int):
@@ -384,14 +425,15 @@ def _render_table_editor_hwpx(
         return
     df = pd.DataFrame(padded)
     st.markdown(f"**표 {t_idx + 1}**")
+    state_key = f"cvs_tbl_{fname}_{t_idx}_{rev}"
     st.data_editor(
         df,
-        key=f"cvs_tbl_{fname}_{t_idx}_{rev}",
+        key=state_key,
         use_container_width=True,
         num_rows='fixed',
         hide_index=True,
-        on_change=partial(_on_table_change, fname, t_idx, rev, nrow, ncol, padded),
     )
+    _sync_table_dirty(fname, state_key, t_idx, nrow, ncol, padded)
 
 
 def _render_table_editor_hwp(
@@ -405,14 +447,15 @@ def _render_table_editor_hwp(
         return
     df = pd.DataFrame(padded)
     st.markdown(f"**표 {t_idx + 1}**")
+    state_key = f"cvs_hwp_tbl_{fname}_{t_idx}_{rev}"
     st.data_editor(
         df,
-        key=f"cvs_hwp_tbl_{fname}_{t_idx}_{rev}",
+        key=state_key,
         use_container_width=True,
         num_rows='fixed',
         hide_index=True,
-        on_change=partial(_on_hwp_table_change, fname, t_idx, rev, nrow, ncol, padded),
     )
+    _sync_table_dirty(fname, state_key, t_idx, nrow, ncol, padded)
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +718,11 @@ def render_canvas_editor(
         _render_paragraph_editor_hwpx(
             fname, editor, blocks, block_map, rev, source_hwp=source_hwp,
         )
+
+
+def render_hwpx_download(fname: str, editor: HWPXEditor, source_hwp: str = ''):
+    """HWPX 다운로드 버튼 (미리보기·직접 편집 공통)."""
+    _render_canvas_download(fname, editor, source_hwp)
 
 
 def _render_canvas_download(fname: str, editor: HWPXEditor, source_hwp: str = ''):

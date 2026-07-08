@@ -413,6 +413,16 @@ class HWPXEditor:
             return False
 
         section_name, tbl = all_tables[table_index]
+
+        grid = build_element_grid(tbl)
+        if grid and 0 <= row < len(grid) and 0 <= col < len(grid[row]):
+            tc, _ = grid[row][col]
+            if tc is not None:
+                self._set_cell_text(tc, new_value)
+                self._mark_runs_red(tc)
+                self._mark_section_dirty(section_name)
+                return True
+
         tc = self._get_cell_at(tbl, row, col)
         if tc is None:
             return False
@@ -782,7 +792,7 @@ class HWPXEditor:
         change = PendingChange(
             id=str(uuid.uuid4())[:8],
             change_type='cell',
-            location=f'표{table_index+1} ({row},{col})' + (f' — {context}' if context else ''),
+            location=f'표{table_index+1} ({row+1}행,{col+1}열)' + (f' — {context}' if context else ''),
             old_text=old,
             new_text=new_value,
             table_index=table_index,
@@ -1216,6 +1226,32 @@ class HWPXEditor:
                 old_text=change.old_text, track_changes=track_changes)
 
         if change.change_type == 'replace':
+            if (
+                change.table_index is not None
+                and change.row is not None
+                and change.col is not None
+            ):
+                rows = self.get_table_as_rows(change.table_index)
+                cell_text = ''
+                if change.row < len(rows) and change.col < len(rows[change.row]):
+                    cell_text = str(rows[change.row][change.col])
+                new_cell = _format_replacement(
+                    cell_text, change.old_text or '', change.new_text,
+                )
+                ok = self.edit_table_cell(
+                    change.table_index, change.row, change.col, new_cell,
+                )
+                if ok and track_changes:
+                    all_tables = []
+                    for root in self.section_trees.values():
+                        all_tables.extend(self._get_tables(root))
+                    if change.table_index < len(all_tables):
+                        tc = self._get_cell_at(
+                            all_tables[change.table_index], change.row, change.col,
+                        )
+                        if tc is not None:
+                            self._mark_runs_green(tc)
+                return ok
             if change.old_text:
                 if self.replace_selection(change.old_text, change.new_text, track_changes):
                     return True

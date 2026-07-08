@@ -585,12 +585,16 @@ def extract_replace_spec(text: str) -> Optional[dict]:
         if matches:
             m = matches[-1]
             return {'line_num': None, 'old': m.group(1).strip(), 'new': m.group(2).strip()}
-    m = re.search(
-        r'(.+?)\s*(?:을|를)\s*(.+?)\s*(?:으로|로)\s*(?:바꿔|수정|변경|교체|고쳐)',
-        t, re.S,
-    )
-    if m and len(m.group(1).strip()) >= 2 and len(m.group(2).strip()) >= 1:
-        return {'line_num': None, 'old': m.group(1).strip(), 'new': m.group(2).strip()}
+    for pat in (
+        r'(.+?)\s*에서\s*(.+?)\s*(?:으로|로)\s*(?:바꿔|수정|변경|교체|고쳐|해)',
+        r'(.+?)\s*(?:을|를)\s*(.+?)\s*(?:으로|로)\s*(?:바꿔|수정|변경|교체|고쳐|해)',
+    ):
+        m = re.search(pat, t, re.S)
+        if m:
+            old_s = m.group(1).strip()
+            new_s = m.group(2).strip()
+            if len(old_s) >= 1 and len(new_s) >= 1:
+                return {'line_num': None, 'old': old_s, 'new': new_s}
     return None
 
 
@@ -953,6 +957,215 @@ def delete_hwp_from_command(
     if not indices:
         return None, '문서에서 삭제할 문단을 찾지 못했습니다.', []
     return _apply_hwp_paragraph_deletes(file_bytes, filename, indices)
+
+
+def _col_letters_to_index(letters: str) -> int:
+    """Excel 열 문자 → 0-based index (A=0, B=1, …)."""
+    idx = 0
+    for ch in letters.upper():
+        if not ch.isalpha():
+            continue
+        idx = idx * 26 + (ord(ch) - ord('A') + 1)
+    return max(0, idx - 1)
+
+
+def parse_table_cell_ref(command: str) -> Optional[tuple[int, int, int]]:
+    """명령에서 (table_index, row, col) 0-based 좌표 추출."""
+    t = (command or '').strip()
+    table_idx = 0
+    m_table = re.search(r'표\s*(\d+)', t)
+    if m_table:
+        table_idx = int(m_table.group(1)) - 1
+
+    m = re.search(r'(\d+)\s*행\s*(\d+)\s*열', t)
+    if m:
+        return table_idx, int(m.group(1)) - 1, int(m.group(2)) - 1
+
+    m = re.search(r'([A-Za-z]+)\s*열\s*(\d+)\s*행', t, re.I)
+    if m:
+        return table_idx, int(m.group(2)) - 1, _col_letters_to_index(m.group(1))
+
+    m = re.search(r'(\d+)\s*행\s*([A-Za-z]+)\s*열', t, re.I)
+    if m:
+        return table_idx, int(m.group(1)) - 1, _col_letters_to_index(m.group(2))
+
+    m = re.search(r'([A-Za-z])\s*열\s*([A-Za-z])\s*행', t, re.I)
+    if m:
+        col = ord(m.group(1).upper()) - ord('A')
+        row = ord(m.group(2).upper()) - ord('A')
+        return table_idx, row, col
+
+    m = re.search(r'([A-Za-z]+)\s*열\s*([A-Za-z]+)\s*행', t, re.I)
+    if m and len(m.group(2)) == 1:
+        return table_idx, ord(m.group(2).upper()) - ord('A'), _col_letters_to_index(m.group(1))
+
+    return None
+
+
+def _extract_cell_new_value(command: str, spec: Optional[dict] = None) -> Optional[str]:
+    if spec and spec.get('new'):
+        return str(spec['new']).strip()
+    for pat in (
+        r'(?:을|를)\s*([0-9][0-9,\.]*)\s*(?:으로|로)',
+        r'([0-9][0-9,\.]*)\s*(?:으로|로)\s*(?:바꿔|수정|변경|해)',
+        r'(?:으로|로)\s*([0-9][0-9,\.]*)\s*(?:바꿔|수정|변경|해)',
+    ):
+        m = re.search(pat, command)
+        if m:
+            return m.group(1).strip()
+    m = re.search(r'([\d][\d,]*)', command)
+    return m.group(1).strip() if m else None
+
+
+def apply_table_cell_ref_command(
+    editor: HWPXEditor,
+    command: str,
+    spec: Optional[dict] = None,
+) -> tuple[list, str, float]:
+    """'8행 5열을 …으로' / 'A열 3행' 등 좌표 기반 셀 변경."""
+    ref = parse_table_cell_ref(command)
+    if not ref:
+        return [], '', 0.0
+
+    table_idx, row, col = ref
+    new_val = _extract_cell_new_value(command, spec)
+    if not new_val:
+        return [], '변경할 값을 찾지 못했습니다. 예: *8행 5열을 424,220,900으로 바꿔줘*', 0.0
+
+    if table_idx < 0 or table_idx >= editor.get_table_count():
+        return [], f'표 {table_idx + 1}을 찾지 못했습니다.', 0.0
+
+    rows = editor.get_table_as_rows(table_idx)
+    if not rows:
+        return [], '표가 비어 있습니다.', 0.0
+    if row < 0 or row >= len(rows) or col < 0 or col >= len(rows[row]):
+        return [], (
+            f'표 {table_idx + 1} ({row + 1}행,{col + 1}열) 위치가 범위를 벗어났습니다. '
+            f'(표 크기: {len(rows)}행 × {max(len(r) for r in rows)}열)'
+        ), 0.0
+
+    old = str(rows[row][col]).strip()
+    ch = editor.propose_cell_change(
+        table_idx, row, col, new_val,
+        context=f'표{table_idx + 1} ({row + 1}행,{col + 1}열)',
+    )
+    return [ch], (
+        f'표 셀 변경 제안: "{old}" → "{new_val}" '
+        f'(표{table_idx + 1} ({row + 1}행,{col + 1}열), {ch.id})'
+    ), 0.0
+
+
+def _table_hint_from_context(command: str, chat_history: list | None) -> int | None:
+    """명령·최근 대화에서 표 번호 힌트 (0-based)."""
+    m = re.search(r'표\s*(\d+)', command or '')
+    if m:
+        return int(m.group(1)) - 1
+    for msg in reversed(chat_history or []):
+        text = msg.get('content', '') or ''
+        m = re.search(r'표\s*(\d+)', text)
+        if m:
+            return int(m.group(1)) - 1
+        if re.search(r'표\s*1\b', text) and re.search(r'전년도|매출액|매출', text):
+            return 0
+    return None
+
+
+def _header_columns_for_field(header_rows: list[list[str]], field_label: str) -> list[int]:
+    """'전년도 매출액' 등 필드명과 맞는 헤더 열."""
+    compact = re.sub(r'\s+', '', field_label)
+    patterns: list[str] = []
+    if '전년' in field_label and '매출' in field_label:
+        patterns = ['전년도매출액', '전년매출액', '전년도매출', '전년매출']
+    elif '당기' in field_label and '매출' in field_label:
+        patterns = ['당기매출액', '당기매출']
+    elif '매출' in field_label:
+        patterns = ['매출액', '매출']
+    else:
+        patterns = [compact] if compact else []
+
+    cols: list[int] = []
+    for hrow in header_rows:
+        for c_idx, hcell in enumerate(hrow):
+            hnorm = re.sub(r'\s+', '', str(hcell))
+            if not hnorm:
+                continue
+            for pat in patterns:
+                if pat in hnorm or hnorm in compact:
+                    cols.append(c_idx)
+                    break
+    return list(dict.fromkeys(cols))
+
+
+def propose_table_label_amount(
+    editor: HWPXEditor,
+    command: str,
+    label: str,
+    new_value: str,
+    chat_history: list | None = None,
+) -> Optional[PendingChange]:
+    """'OOO 전년도 매출액을 123,456으로' — 헤더 열 + 행 라벨로 셀 찾기."""
+    table_idx_filter = _table_hint_from_context(command, chat_history)
+
+    skip = {
+        '전년도', '당기', '매출액', '매출', '금액', '수익', '을', '를', '으로', '로',
+        '바꿔', '수정', '변경', '해줘', '주식회사', '주식', '회사',
+    }
+    keywords = [
+        w for w in re.findall(r'[가-힣a-zA-Z0-9]+', label)
+        if len(w) >= 2 and w not in skip and not re.fullmatch(r'[\d,\.]+', w)
+    ]
+    if not keywords:
+        return None
+    primary_kw = max(keywords, key=len)
+
+    best = None
+    best_score = 0
+
+    for t_idx in range(editor.get_table_count()):
+        if table_idx_filter is not None and t_idx != table_idx_filter:
+            continue
+        rows = editor.get_table_as_rows(t_idx)
+        if not rows:
+            continue
+
+        header_rows = rows[:min(4, len(rows))]
+        amount_cols = _header_columns_for_field(header_rows, label)
+        if not amount_cols:
+            continue
+
+        table_bonus = 20 if table_idx_filter is not None and t_idx == table_idx_filter else 0
+
+        for r_idx, row in enumerate(rows):
+            if r_idx < len(header_rows):
+                continue
+            row_text = ' '.join(str(c) for c in row)
+            if primary_kw not in row_text:
+                continue
+            kw_score = sum(3 for kw in keywords if kw in row_text)
+            if kw_score < 3:
+                continue
+
+            for c_idx in amount_cols:
+                if c_idx >= len(row):
+                    continue
+                cell_s = str(row[c_idx]).strip()
+                if not cell_s or not re.search(r'\d', cell_s):
+                    continue
+                if not re.fullmatch(r'[\d,\.\-\s원%]+', cell_s.replace('원', '').strip()):
+                    continue
+                cand_score = kw_score + table_bonus + 15
+                if cand_score > best_score:
+                    best = (t_idx, r_idx, c_idx, cell_s, row_text)
+                    best_score = cand_score
+
+    if not best:
+        return None
+
+    t_idx, r_idx, c_idx, old_cell, row_text = best
+    return editor.propose_cell_change(
+        t_idx, r_idx, c_idx, new_value,
+        context=f'표{t_idx + 1} ({r_idx + 1}행,{c_idx + 1}열) · {row_text[:40]}',
+    )
 
 
 def apply_table_cell_amount_command(
