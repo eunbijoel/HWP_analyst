@@ -109,6 +109,38 @@ class QAEngine:
 
     # --- Rules-first / 조건부 Stage1 helpers ---
 
+    def _extract_keywords(self, question: str) -> list[str]:
+        keywords = []
+        for m in re.finditer(r'[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+', question):
+            token = m.group()
+            keywords.append(token)
+            keywords.extend(p for p in token.split('-') if len(p) > 1)
+        for m in re.finditer(r'[가-힣a-zA-Z0-9]{2,}', question):
+            token = m.group()
+            token = re.sub(r'[이가은는을를의에도]$', '', token)
+            if len(token) >= 2:
+                keywords.append(token)
+        seen = set()
+        out = []
+        for k in keywords:
+            kl = k.lower()
+            if kl not in seen:
+                seen.add(kl)
+                out.append(k)
+        return out
+
+    def _paragraph_matches_keywords(self, text: str, keywords: list[str]) -> bool:
+        tl = text.lower()
+        compact = tl.replace('-', '').replace(' ', '')
+        for kw in keywords:
+            kl = kw.lower()
+            if kl in tl:
+                return True
+            kc = kl.replace('-', '')
+            if len(kc) >= 2 and kc in compact:
+                return True
+        return False
+
     def _years_from_question(self, question: str) -> list[int]:
         return [int(y) for y in re.findall(r'((?:19|20)\d{2})', question)]
 
@@ -500,7 +532,7 @@ JSON만 출력:
     # =========================================================
 
     def _build_table_schema(self, question: str) -> str:
-        keywords = [k for k in re.findall(r'[가-힣a-zA-Z0-9]+', question) if len(k) > 1]
+        keywords = self._extract_keywords(question)
         relevant, other = self._rank_tables_by_relevance(keywords)
         ordered = (relevant + other)[:5]
 
@@ -1155,6 +1187,13 @@ JSON만 출력:
     def _rule_based_answer(self, question: str) -> dict:
         q = question.lower().strip()
 
+        if OVERVIEW_QUESTION.search(question):
+            return {
+                'answer': self._build_overview_context(6000),
+                'source': '문서 본문·표',
+                'confidence': 'medium',
+            }
+
         if any(kw in q for kw in ['예산', '사업비']) and any(kw in q for kw in ['표', '찾아', '관련']):
             return self._find_budget_tables()
         if any(kw in q for kw in ['총 사업비', '총사업비', '전체 예산', '총 예산', '총예산']):
@@ -1319,11 +1358,13 @@ JSON만 출력:
         return {'answer': '\n'.join(parts), 'source': '파싱 결과', 'confidence': 'high'}
 
     def _general_search(self, question: str) -> dict:
-        keywords = [k for k in re.findall(r'[가-힣a-zA-Z0-9]+', question) if len(k) > 1]
-        paras = [p for p in self.paragraphs if any(kw in p for kw in keywords)]
+        keywords = self._extract_keywords(question)
+        paras = [p for p in self.paragraphs if self._paragraph_matches_keywords(p, keywords)]
         tbls = [ts for ts in self.tables if ts.dataframe is not None
-                and any(kw in (ts.caption + ' ' + ' '.join(str(h) for h in ts.headers))
-                        for kw in keywords)]
+                and self._paragraph_matches_keywords(
+                    ts.caption + ' ' + ' '.join(str(h) for h in ts.headers),
+                    keywords,
+                )]
         parts = []
         if paras:
             parts.append(f"관련 문단 {len(paras)}개:")
@@ -1485,7 +1526,7 @@ JSON만 출력:
         if OVERVIEW_QUESTION.search(question):
             return self._build_overview_context(max_context)
 
-        keywords = [k for k in re.findall(r'[가-힣a-zA-Z0-9]+', question) if len(k) > 1]
+        keywords = self._extract_keywords(question)
         relevant, other = self._rank_tables_by_relevance(keywords)
 
         parts = []
@@ -1509,7 +1550,7 @@ JSON만 출력:
                 parts.append(formatted)
                 total += len(formatted)
 
-        rel_paras = [p for p in self.paragraphs if any(kw in p for kw in keywords)]
+        rel_paras = [p for p in self.paragraphs if self._paragraph_matches_keywords(p, keywords)]
         if rel_paras and total < max_context:
             parts.append("\n---\n### 관련 텍스트:")
             for p in rel_paras[:10]:

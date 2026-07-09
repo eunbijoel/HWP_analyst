@@ -14,11 +14,12 @@ import time
 import re
 import hashlib
 from typing import Optional
+from types import SimpleNamespace
 import streamlit as st
 import streamlit.components.v1 as components
 
 from hwp_core.hwp_parser import parse_document
-from hwp_core.hwp_backends import get_backend_status, hwpilot_convert_to_hwpx, hwpilot_read_structure
+from hwp_core.hwp_backends import get_backend_status, hwpilot_convert_to_hwpx
 from hwp_core.table_extractor import extract_tables, detect_numbers_in_text, detect_numbers_in_tables
 from hwp_core.qa_engine import QAEngine
 from hwp_core.llm_client import check_ollama_status, answer_general_question
@@ -33,8 +34,11 @@ from ui.command_router import classify_intent, execute_edit_command
 from ui.canvas_editor import (
     render_canvas_editor, render_canvas_editor_hwp, render_hwpx_download,
 )
+from hwp_core.intel_pipeline import build_intelligence, build_workspace_intelligence
+from ui.intel_panel import render_intel_review, render_workspace_intel
+from ui.document_workspace import render_document_pane, render_excel_split_editor
 
-st.set_page_config(page_title="HWP 문서 분석기", page_icon="📄", layout="wide")
+st.set_page_config(page_title="HWP Analyzer", page_icon="📄", layout="wide")
 
 VIEW_PREVIEW = "미리보기 + 채팅 편집"
 VIEW_DIRECT = "직접 편집"
@@ -57,9 +61,25 @@ def render_scrollable_pane(height: int = DOC_PANE_HEIGHT):
 
 
 GENERAL_KNOWLEDGE_RE = re.compile(
-    r'필요성|중요성|배경|목적|기대효과|의미|정의|개념|요약|정리|bullet|불릿|장점|단점',
+    r'필요성|중요성|배경|기대효과|의미|정의|개념|bullet|불릿|장점|단점',
     re.I,
 )
+
+
+def _has_document_content(documents: list) -> bool:
+    return any(
+        d.get('paragraphs') or d.get('tables')
+        for d in (documents or [])
+    )
+
+
+def _should_use_general_llm(question: str, documents: list) -> bool:
+    """업로드된 문서가 있으면 일반 LLM(문서 없이 답변)으로 보내지 않음."""
+    if _has_document_content(documents):
+        return False
+    if re.search(r'이\s*문서|이\s*자료|이\s*파일|문서\s*에서|올린|업로드', question, re.I):
+        return False
+    return bool(GENERAL_KNOWLEDGE_RE.search(question))
 
 
 def get_reference_context() -> str:
@@ -105,9 +125,12 @@ def get_cached_qa_engine(all_documents: list, scope_key: str) -> QAEngine:
     key = f"qa_engine_{scope_key}_{sig}"
     if key not in st.session_state:
         if len(all_documents) == 1:
+            d0 = all_documents[0]
             st.session_state[key] = QAEngine(
-                paragraphs=d['paragraphs'], table_summaries=d['tables'],
-                text_numbers=d['text_numbers'], table_numbers=d['table_numbers'],
+                paragraphs=d0.get('paragraphs', []),
+                table_summaries=d0.get('tables', []),
+                text_numbers=d0.get('text_numbers', []),
+                table_numbers=d0.get('table_numbers', []),
             )
         else:
             st.session_state[key] = QAEngine(documents=all_documents)
@@ -222,7 +245,27 @@ def enrich_hwp_qa_from_hwpx(doc_payload: dict, hwpx_bytes: bytes, hwpx_name: str
 
 
 def process_document(file_bytes: bytes, filename: str):
-    doc = parse_document(file_bytes=file_bytes, filename=filename)
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in ('.xlsx', '.xls'):
+        ref = parse_reference(file_bytes, filename)
+        # XLSX는 참고 파서가 표 내용을 full_text/paragraphs에도 펼쳐 담으므로
+        # 미리보기에서 문단+표가 중복 렌더링되지 않게 문단은 요약만 유지한다.
+        sheet_count = len(ref.tables)
+        summary_para = (
+            f"엑셀 문서 {filename} · 시트/표 {sheet_count}개"
+            if sheet_count > 0
+            else f"엑셀 문서 {filename}"
+        )
+        doc = SimpleNamespace(
+            filename=filename,
+            file_type=ref.file_type,
+            full_text=ref.full_text,
+            paragraphs=[summary_para],
+            tables_raw=[{'rows': rows, 'caption': '', 'unit': ''} for rows in ref.tables],
+            errors=ref.errors,
+        )
+    else:
+        doc = parse_document(file_bytes=file_bytes, filename=filename)
     tables = extract_tables(doc, document_id=filename)
     tnums = detect_numbers_in_text(doc.full_text, document_id=filename)
     tblnums = detect_numbers_in_tables(tables, document_id=filename)
@@ -404,7 +447,7 @@ def render_chat_panel(
             st.session_state[chat_key].append({'role': 'assistant', 'content': reply})
             st.rerun()
         else:
-            general_mode = use_llm and bool(GENERAL_KNOWLEDGE_RE.search(user_input))
+            general_mode = _should_use_general_llm(user_input, all_documents)
             if general_mode:
                 with st.spinner("일반 답변 생성 중..."):
                     ans = answer_general_question(
@@ -547,6 +590,170 @@ def _render_hwp_chat(
         st.rerun()
 
 
+def _render_file_qa_chat(
+    fname: str,
+    doc_payload: dict,
+    all_documents: list,
+    chat_key: str,
+    input_key: str,
+    model_name: str,
+    ollama_url: str,
+    use_llm: bool,
+    use_streaming: bool,
+    stage1_model: str,
+):
+    """Excel 등 편집기 없는 파일 — Q&A 전용 채팅."""
+    st.caption("질문 — 이 파일만 분석합니다.")
+    with st.container(height=CHAT_SCROLL_HEIGHT, border=False):
+        for msg in st.session_state[chat_key]:
+            with st.chat_message(msg['role']):
+                st.write(msg['content'])
+                if msg.get('chart_data') is not None:
+                    st.bar_chart(msg['chart_data'])
+
+    q = st.chat_input("질문을 입력하세요...", key=input_key)
+    if not q:
+        return
+
+    st.session_state[chat_key].append({'role': 'user', 'content': q})
+    intent = classify_intent(q)
+    if intent != 'qa':
+        st.session_state[chat_key].append({
+            'role': 'assistant',
+            'content': (
+                '이 파일 형식은 채팅 편집을 지원하지 않습니다. '
+                '왼쪽 **직접 편집** 탭에서 수정하거나, 질문 형태로 요청해 주세요.'
+            ),
+        })
+        st.rerun()
+
+    ref_ctx = get_reference_context()
+    qa = get_cached_qa_engine([doc_payload], fname)
+    question = q
+    if ref_ctx:
+        question = f"{q}\n\n[참고자료]\n{ref_ctx[:4000]}"
+    hist = []
+    msgs = st.session_state[chat_key][:-1]
+    for i in range(0, len(msgs) - 1, 2):
+        if i + 1 < len(msgs) and msgs[i]['role'] == 'user' and msgs[i + 1]['role'] == 'assistant':
+            hist.append({'question': msgs[i]['content'], 'answer': msgs[i + 1]['content']})
+    with st.spinner("분석 중..."):
+        ans = qa.answer(
+            question=question, use_llm=use_llm, model=model_name,
+            ollama_url=ollama_url, stream=use_streaming,
+            stage1_model=stage1_model, history=hist[-3:],
+        )
+    chart = ans.get('chart_data')
+    if ans.get('answer_stream'):
+        with st.chat_message("assistant"):
+            reply_text = st.write_stream(ans['answer_stream'])
+        st.session_state[chat_key].append({
+            'role': 'assistant', 'content': reply_text,
+            'chart_data': chart.get('data') if chart else None,
+        })
+    else:
+        st.session_state[chat_key].append({
+            'role': 'assistant',
+            'content': ans.get('answer', '답변 없음'),
+            'chart_data': chart.get('data') if chart else None,
+        })
+    st.rerun()
+
+
+def render_file_chat(
+    entry: dict,
+    all_documents: list,
+    *,
+    model_name: str,
+    stage1_model: str,
+    use_llm: bool,
+    use_streaming: bool,
+    ollama_url: str,
+    input_suffix: str = '',
+):
+    """파일 전용 채팅 — HWPX/HWP/Excel 공통 진입."""
+    fname = entry['filename']
+    fbytes = entry['file_bytes']
+    doc_payload = entry['doc_payload']
+    chat_key = f"workspace_chat_{fname}"
+    if chat_key not in st.session_state:
+        st.session_state[chat_key] = []
+
+    ext = os.path.splitext(fname)[1].lower()
+    input_key = f"file_chat_{fname}{input_suffix}"
+
+    scoped_docs = [doc_payload]
+
+    if ext == '.hwpx':
+        content_hash = hashlib.sha256(fbytes).hexdigest()[:16]
+        editor = st.session_state.get(f"editor_{fname}_{content_hash}")
+        if editor:
+            render_chat_panel(
+                fname, editor, scoped_docs, chat_key,
+                model_name, stage1_model, use_llm, use_streaming,
+                ollama_url=ollama_url,
+                source_hwp=st.session_state.get(f"hwp_source_{fname}", ''),
+            )
+            return
+
+    if ext == '.hwp':
+        _render_hwp_chat(
+            fname, fbytes, scoped_docs,
+            chat_key, input_key,
+            model_name, ollama_url, use_llm, use_streaming, stage1_model,
+            on_new_bytes=lambda nb, r: set_hwp_working_bytes(fname, nb),
+        )
+        return
+
+    _render_file_qa_chat(
+        fname, doc_payload, scoped_docs,
+        chat_key, input_key,
+        model_name, ollama_url, use_llm, use_streaming, stage1_model,
+    )
+
+
+def render_unified_chat_column(
+    file_entries: list,
+    all_documents: list,
+    *,
+    model_name: str,
+    stage1_model: str,
+    use_llm: bool,
+    use_streaming: bool,
+    ollama_url: str,
+):
+    """오른쪽 통합 채팅 — 이 파일 / 전체."""
+    tab_file, tab_all = st.tabs(["💬 이 파일", "💬 전체"])
+
+    with tab_file:
+        if len(file_entries) > 1:
+            names = [e['filename'] for e in file_entries]
+            chat_fname = st.selectbox(
+                "채팅할 파일",
+                names,
+                key="active_file_chat_target",
+            )
+            entry = next(e for e in file_entries if e['filename'] == chat_fname)
+        else:
+            entry = file_entries[0]
+        render_file_chat(
+            entry, all_documents,
+            model_name=model_name, stage1_model=stage1_model,
+            use_llm=use_llm, use_streaming=use_streaming,
+            ollama_url=ollama_url, input_suffix="_pane",
+        )
+
+    with tab_all:
+        render_workspace_qa_chat(
+            all_documents,
+            model_name=model_name,
+            stage1_model=stage1_model,
+            use_llm=use_llm,
+            use_streaming=use_streaming,
+            ollama_url=ollama_url,
+        )
+
+
 def render_hwp_split_editor(
     fname: str, file_bytes: bytes, all_documents: list,
     model_name: str, ollama_url: str, use_llm: bool,
@@ -569,15 +776,12 @@ def render_hwp_split_editor(
         append_hwp_highlights(fname, result.get('hwp_highlights') or [])
 
     with col_doc:
-        if show_chat:
-            view_mode = st.radio(
-                "보기 방식",
-                [VIEW_PREVIEW, VIEW_DIRECT],
-                horizontal=True,
-                key=f"doc_view_hwp_{fname}",
-            )
-        else:
-            view_mode = VIEW_PREVIEW
+        view_mode = st.radio(
+            "보기 방식",
+            [VIEW_PREVIEW, VIEW_DIRECT],
+            horizontal=True,
+            key=f"doc_view_hwp_{fname}_{'chat' if show_chat else 'tab'}",
+        )
 
         working_bytes = get_hwp_working_bytes(fname, file_bytes)
 
@@ -697,15 +901,12 @@ def render_split_editor(
             _invalidate_hwpx_preview_cache(fname)
             st.rerun()
 
-    if show_chat:
-        view_mode = st.radio(
-            "보기 방식",
-            [VIEW_PREVIEW, VIEW_DIRECT],
-            horizontal=True,
-            key=f"doc_view_{fname}",
-        )
-    else:
-        view_mode = VIEW_PREVIEW
+    view_mode = st.radio(
+        "보기 방식",
+        [VIEW_PREVIEW, VIEW_DIRECT],
+        horizontal=True,
+        key=f"doc_view_{fname}_{'chat' if show_chat else 'tab'}",
+    )
 
     if show_chat:
         col_doc, col_chat = st.columns([3, 2], gap="medium")
@@ -844,29 +1045,12 @@ with st.sidebar:
     else:
         stage1_model = "gemma3:4b"
 
-    st.divider()
-    st.caption("참고자료: PDF·DOCX·XLSX·TXT")
-    ref_files = st.file_uploader(
-        "참고 자료", type=["pdf", "docx", "xlsx", "txt", "hwp", "hwpx"],
-        accept_multiple_files=True, key="ref_uploader", label_visibility="collapsed",
-    )
-    if ref_files:
-        if 'reference_docs' not in st.session_state:
-            st.session_state.reference_docs = []
-        for rf in ref_files:
-            rkey = f"ref_{rf.name}_{rf.size}"
-            if rkey not in st.session_state:
-                st.session_state.reference_docs.append(parse_reference(rf.read(), rf.name))
-                st.session_state[rkey] = True
-        st.caption(f"참고자료 {len(st.session_state.reference_docs)}개 로드됨")
-
-
 # --- 메인 ---
-st.title("한글 문서 분석기")
+st.title("HWP Analyzer")
 
 uploaded_files = st.file_uploader(
-    "한글 문서를 업로드하세요",
-    type=["hwp", "hwpx"],
+    "문서를 업로드하세요 (HWP/HWPX/XLSX)",
+    type=["hwp", "hwpx", "xlsx", "xls"],
     accept_multiple_files=True,
 )
 
@@ -899,9 +1083,17 @@ if uploaded_files:
         if cache_key not in st.session_state:
             with st.spinner(f"{filename} 분석 중..."):
                 doc, tables, tnums, tblnums = process_document(file_bytes, filename)
+                intel = build_intelligence(
+                    paragraphs=doc.paragraphs,
+                    tables=tables,
+                    text_numbers=tnums,
+                    table_numbers=tblnums,
+                    document_id=filename,
+                )
             st.session_state[cache_key] = {
                 'doc': doc, 'tables': tables,
                 'text_numbers': tnums, 'table_numbers': tblnums,
+                'intel': intel,
             }
 
         cached = st.session_state[cache_key]
@@ -912,6 +1104,7 @@ if uploaded_files:
             'text_numbers': cached['text_numbers'],
             'table_numbers': cached['table_numbers'],
             'doc': cached['doc'],
+            'intel': cached.get('intel'),
         }
         all_documents.append(doc_payload)
         file_entries.append({
@@ -923,104 +1116,60 @@ if uploaded_files:
         for err in cached['doc'].errors:
             st.warning(f"[{filename}] {err}")
 
-    if len(file_entries) == 1:
-        entry = file_entries[0]
-        filename = entry['filename']
-        file_bytes = entry['file_bytes']
-        doc_payload = entry['doc_payload']
-        edit_name = filename
-        edit_bytes = file_bytes
+    workspace_intel = build_workspace_intelligence(all_documents)
+    render_workspace_intel(workspace_intel)
 
-        parser_tag = doc_payload['doc'].file_type or 'unknown'
-        note = doc_payload.get('parser_note', '')
-        st.caption(f"파서: {parser_tag}{(' · ' + note) if note else ''} · {get_backend_status().summary()}")
-        st.caption(f"추출: 문단 {len(doc_payload['paragraphs'])}개, 표 {len(doc_payload['tables'])}개")
+    n_files = len(file_entries)
+    st.caption(
+        f"{'단일' if n_files == 1 else '다중'} 파일 · {n_files}개 · {get_backend_status().summary()}"
+    )
 
-        if not doc_payload['paragraphs'] and not doc_payload['tables']:
-            st.error("문서에서 문단·표를 추출하지 못했습니다. pyhwp/hwpilot 설치 및 파일 형식을 확인하세요.")
+    for entry in file_entries:
+        dp = entry['doc_payload']
+        if not dp['paragraphs'] and not dp['tables']:
+            st.warning(f"[{entry['filename']}] 문단·표를 추출하지 못했습니다.")
 
-        if filename.lower().endswith('.hwp') and get_backend_status().hwpilot:
-            render_hwp_split_editor(
-                filename, file_bytes, all_documents,
+    col_doc, col_chat = st.columns([3, 2], gap="medium")
+
+    with col_doc:
+        if n_files == 1:
+            entry = file_entries[0]
+            if entry['doc_payload'].get('intel'):
+                render_intel_review(entry['doc_payload']['intel'])
+            render_document_pane(
+                entry, all_documents,
                 model_name=model_name, ollama_url=ollama_url,
                 use_llm=use_llm, use_streaming=use_streaming,
                 stage1_model=stage1_model,
-            )
-        elif edit_name.lower().endswith('.hwpx'):
-            with st.expander("📋 hwpilot 문서 구조 (표·문단)", expanded=False):
-                if get_backend_status().hwpilot:
-                    struct = hwpilot_read_structure(edit_bytes, edit_name)
-                    if struct:
-                        for si, sec in enumerate(struct.get('sections', [])[:2]):
-                            st.markdown(f"**섹션 {si}** — 문단 {len(sec.get('paragraphs', []))}개, 표 {len(sec.get('tables', []))}개")
-                            for p in sec.get('paragraphs', [])[:8]:
-                                txt = p.get('text') or ''.join(
-                                    r.get('text', '') for r in p.get('runs', []) if isinstance(r, dict))
-                                if txt.strip():
-                                    st.text(f"  · {txt[:120]}")
-                    else:
-                        st.caption("hwpilot read 실패")
-                else:
-                    st.caption("hwpilot 미설치")
-            render_split_editor(
-                edit_name, edit_bytes, all_documents,
-                model_name=model_name, ollama_url=ollama_url,
-                use_llm=use_llm, use_streaming=use_streaming,
-                stage1_model=stage1_model,
+                render_hwp_split_editor=render_hwp_split_editor,
+                render_split_editor=render_split_editor,
+                render_excel_split_editor_fn=render_excel_split_editor,
+                render_scrollable_doc_preview=render_scrollable_doc_preview,
+                render_scrollable_pane=render_scrollable_pane,
             )
         else:
-            render_readonly_split(
-                filename, all_documents[0], file_bytes,
-                model_name=model_name, ollama_url=ollama_url,
-                use_llm=use_llm, use_streaming=use_streaming,
-                stage1_model=stage1_model,
-            )
-    else:
-        st.caption(f"다중 파일 모드 · {len(file_entries)}개 파일")
-        col_doc, col_chat = st.columns([3, 2], gap="medium")
-        with col_doc:
-            tabs = st.tabs([entry['filename'] for entry in file_entries])
+            tabs = st.tabs([e['filename'] for e in file_entries])
             for tab, entry in zip(tabs, file_entries):
                 with tab:
-                    fname = entry['filename']
-                    fbytes = entry['file_bytes']
-                    dp = entry['doc_payload']
-                    parser_tag = dp['doc'].file_type or 'unknown'
-                    st.caption(f"파서: {parser_tag} · 추출 문단 {len(dp['paragraphs'])} / 표 {len(dp['tables'])}")
+                    render_document_pane(
+                        entry, all_documents,
+                        model_name=model_name, ollama_url=ollama_url,
+                        use_llm=use_llm, use_streaming=use_streaming,
+                        stage1_model=stage1_model,
+                        render_hwp_split_editor=render_hwp_split_editor,
+                        render_split_editor=render_split_editor,
+                        render_excel_split_editor_fn=render_excel_split_editor,
+                        render_scrollable_doc_preview=render_scrollable_doc_preview,
+                        render_scrollable_pane=render_scrollable_pane,
+                    )
 
-                    if fname.lower().endswith('.hwp') and get_backend_status().hwpilot:
-                        render_hwp_split_editor(
-                            fname, fbytes, all_documents,
-                            model_name=model_name, ollama_url=ollama_url,
-                            use_llm=use_llm, use_streaming=use_streaming,
-                            stage1_model=stage1_model,
-                            show_chat=False,
-                        )
-                    elif fname.lower().endswith('.hwpx'):
-                        render_split_editor(
-                            fname, fbytes, all_documents,
-                            model_name=model_name, ollama_url=ollama_url,
-                            use_llm=use_llm, use_streaming=use_streaming,
-                            stage1_model=stage1_model,
-                            show_chat=False,
-                        )
-                    else:
-                        render_readonly_split(
-                            fname, dp, fbytes,
-                            model_name=model_name, ollama_url=ollama_url,
-                            use_llm=use_llm, use_streaming=use_streaming,
-                            stage1_model=stage1_model,
-                            show_chat=False,
-                        )
-        with col_chat:
-            render_workspace_qa_chat(
-                all_documents,
-                model_name=model_name,
-                stage1_model=stage1_model,
-                use_llm=use_llm,
-                use_streaming=use_streaming,
-                ollama_url=ollama_url,
-            )
+    with col_chat:
+        render_unified_chat_column(
+            file_entries, all_documents,
+            model_name=model_name, stage1_model=stage1_model,
+            use_llm=use_llm, use_streaming=use_streaming,
+            ollama_url=ollama_url,
+        )
 
 else:
-    st.info("HWP/HWPX를 업로드하세요.")
+    st.info("HWP/HWPX/XLSX 파일을 업로드하세요.")

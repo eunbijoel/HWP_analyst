@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv/
+venv/
+
+# 로컬 테스트 문서 (커밋 제외)
+samples/
+
+# 벤치마크 실행 결과
+benchmarks/results/
+
+# hwpilot 빌드 산출물
+hwpilot/node_modules/
