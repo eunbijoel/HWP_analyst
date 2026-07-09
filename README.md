@@ -1,74 +1,84 @@
 # HWP 문서 분석기
 
-한글 문서(HWP/HWPX)를 업로드해 표·숫자를 구조화하고 로컬 LLM으로 질의응답+AI 편집하는 분석 도구.
+한글(HWP/HWPX)·엑셀 문서를 업로드해 표·숫자를 구조화하고, 로컬 LLM으로 질의응답·AI 편집·자동 검토를 지원하는 내부 문서 분석 도구.
 
-- **한글(HWP/HWPX) 문서를 로컬 LLM 기반으로 분석하여, 문서 내용·표·숫자를 자동 추출하고 질의응답을 지원하는 SW 구현**
-- **향후 예산서, 사업계획서, 성과지표 등 내부 문서를 안전하게 분석·활용할 수 있는 시스템으로 확장**
+- **HWP/HWPX/Excel 문서에서 표·숫자·본문 사실을 추출하고, 질의응답 및 일관성 검토 지원**
+- **예산서·사업계획서·성과지표 등 내부 문서를 로컬 환경에서 안전하게 분석/활용**
 
-0702 ver.
-<img width="1838" height="797" alt="image" src="https://github.com/user-attachments/assets/945bea83-4f5a-42b8-9e66-e586ed982fa7" />
-
-<img width="1861" height="775" alt="image" src="https://github.com/user-attachments/assets/9a2b66dc-f027-4d26-a2e5-6ff7ed40c948" />
+0709 ver.
+<img width="1810" height="812" alt="image" src="https://github.com/user-attachments/assets/bc3e34f0-ebc8-4810-ac42-da78e4982143" />
 
 
 ## 주요 기능
 
-- **문서 분석 / 질의응답** — 표·숫자 자동 추출 후 Ollama 기반 2-Stage Q&A
-- **HWPX 채팅 편집** — 빈칸 채우기, 초안 작성, 표 셀 숫자 수정
-- **미리보기 diff** — 🟡 노란색 = AI 제안, 🔴 빨간색 = 적용된 수정, 🟢 초록 = 새 내용
+- **Excel 분석/HWP/HWPX 편집** — 파일 업로드, 미리보기·직접 수정·다운로드
+- **통합 작업 화면** — 파일 형식별 동일 레이아웃: 왼쪽 미리보기/직접편집, 오른쪽 **💬 이 파일 | 💬 전체** 채팅
+- **자동 검토** — 표 행 합계·합계 행·본문↔표 예산·문서 간 총액 교차 검증 (이슈 있을 때만 패널 표시)
+- **미리보기 diff** — 🟡 AI 제안, 🔴 적용된 수정, 🟢 새 내용
 
 ## 프로젝트 구조
 
 ```
 HWP analysis/
-├── app.py                  # Streamlit 진입점 (streamlit run app.py)
+├── app.py                      # Streamlit 실행
 ├── requirements.txt
+├── hwpilot/                    # Node CLI — .hwp 읽기·변환·편집 (dist/ 번들 또는 npm)
 │
-├── hwp_core/               # 핵심 로직: 파싱, Q&A, 표 그리드, HWPX 편집 엔진
-│   ├── hwp_parser.py       # HWP/HWPX 파싱
-│   ├── hwp_backends.py     # pyhwp/hwpilot CLI 래퍼
-│   ├── table_extractor.py  # 표·숫자 구조화 (Q&A용)
-│   ├── table_grid.py       # 표 그리드·병합셀 파싱 (공통)
-│   ├── qa_engine.py        # 2-Stage LLM 질의응답
-│   └── hwpx_editor.py      # HWPX 편집, pending/applied diff
+├── hwp_core/                   # 핵심 로직
+│   ├── hwp_parser.py           # HWP/HWPX 파싱
+│   ├── hwp_backends.py         # hwpilot / pyhwp / LibreOffice / olefile
+│   ├── table_extractor.py      # 표·숫자 구조화 + 표 그리드·병합셀
+│   ├── qa_engine.py            # 2-Stage LLM 질의응답
+│   ├── llm_client.py           # Ollama 연결·일반 질문
+│   ├── hwpx_editor.py          # HWPX 편집, pending/applied diff
+│   ├── fact_extractor.py       # 표·본문 Fact 추출
+│   ├── consistency_checker.py  # 합계·교차 일관성 검사
+│   └── intel_pipeline.py       # 문서/워크스페이스 intel 조립
 │
-├── ui/                     # 화면·명령 라우팅
-│   ├── document_preview.py # 왼쪽 HTML 미리보기
-│   └── command_router.py   # 채팅 의도 분류·편집 실행
+├── ui/                         # Streamlit UI
+│   ├── document_workspace.py   # HWP/HWPX/Excel 통합 분할 UI
+│   ├── document_preview.py     # HTML 미리보기·diff
+│   ├── command_router.py       # 채팅 의도 분류·편집 실행
+│   ├── canvas_editor.py        # 직접 편집·HWPX 다운로드
+│   ├── intel_panel.py          # 자동 검토 패널
+│   └── session_store.py        # 세션·편집 상태
 │
-└── additional/             # 부가 기능: AI 편집·참고자료·Windows 연동
-    ├── ai_editor.py        # LLM 빈칸/초안/리라이트
-    ├── reference_parser.py # 참고자료(PDF·DOCX 등) 파싱
-    └── windows_agent/      # Windows 한글 COM 브리지 (선택)
-        └── hwp_bridge.py
+├── additional/
+│   ├── ai_editor.py            # LLM 빈칸/초안/리라이트
+│   └── reference_parser.py     # Excel·PDF·DOCX 등 파싱 + 참고자료
+└── 
 ```
+
 ## 설치 및 실행
 
 ```bash
 pip install -r requirements.txt  # pyhwp CLI: hwp5txt, hwp5html
 
-# hwpilot (선택 — HWP 편집·변환·구조화 read)
-npm install -g hwpilot  # npm에 없으면: git clone https://github.com/devxoul/hwpilot && cd hwpilot && npm install -g .
+# hwpilot — .hwp 업로드·편집 시 필요 (repo 번들 또는 전역 설치)
+npm install -g hwpilot
+# 또는: cd hwpilot && npm install   # repo 내 dist/ 사용
 
 streamlit run app.py #실행
 ```
 
 ### 분석·Q&A
+
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                          app.py (Streamlit UI)                           │
-│  파일 업로드 → 세션 캐시 → 2분할 UI (미리보기 + 채팅, 스트리밍 지원)        │
-└──────┬────────────────────┬────────────────────────┬─────────────────────┘
-       │                    │                        │
- ┌─────▼──────────┐  ┌──────▼───────────┐  ┌─────────▼────────────────────┐
- │ hwp_core/      │  │ hwp_core/        │  │ hwp_core/                        │
- │ hwp_parser     │  │ table_extractor  │  │ qa_engine                    │
- │                │  │                  │  │                              │
- │ HWPX: ZIP→XML  │  │ rows→DataFrame   │  │ Stage 1: gemma3:4b           │
- │  병합셀 복원   │──▶│ NumberInfo 탐지  │──▶│  의도·엔티티 추출 + 검증      │
- │ HWP: OLE/변환  │  │ TableSummary     │  │ Pre-compute / Rule-based     │
- │                │  │                  │  │ Stage 2: gemma4 (스트리밍)   │
- └────────────────┘  └──────────────────┘  └──────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                            app.py (Streamlit UI)                                   │
+│  파일 업로드 → process_document() → 세션 캐시 → 2분할 UI (미리보기 + 채팅)           │
+└──────┬──────────────────┬────────────────────┬────────────────────┬─────────────────┘
+       │                  │                    │                    │
+┌──────▼─────────┐ ┌──────▼──────────┐ ┌─────▼────────────┐ ┌────▼──────────────┐
+│ 파싱            │ │ table_extractor │ │ intel_pipeline   │ │ qa_engine         │
+│                │ │                 │ │                  │ │                   │
+│ Excel:         │ │ rows→DataFrame  │ │ fact_extractor   │ │ Stage 1: gemma3:4b│
+│  reference_    │ │ NumberInfo 탐지 │ │ consistency_     │ │  의도·엔티티 추출  │
+│  parser        │─▶│ TableSummary    │─▶│ checker          │─▶│ Pre-compute /    │
+│ HWPX: ZIP→XML  │ │                 │ │ → intel_panel    │ │  Rule-based       │
+│ HWP: hwpilot   │ │                 │ │  (이슈 시만 UI)  │ │ Stage 2: gemma4   │
+│  fallback chain│ │                 │ │                  │ │  (스트리밍)       │
+└────────────────┘ └─────────────────┘ └──────────────────┘ └───────────────────┘
 ```
 
 ```mermaid
@@ -78,8 +88,13 @@ flowchart LR
         FN[filename.ext]
     end
 
-    subgraph Router["parse_document()"]
-        EXT{.hwpx?}
+    subgraph Router["process_document()"]
+        EXT{ext?}
+    end
+
+    subgraph Excel_Path["Excel — openpyxl"]
+        X1[reference_parser]
+        X2[tables_raw + full_text]
     end
 
     subgraph HWPX_Path["HWPX — Pure Python"]
@@ -90,47 +105,50 @@ flowchart LR
     end
 
     subgraph HWP_Path["HWP — Fallback Chain"]
-        F1["① hwpilot read<br/>temp .hwp → CLI JSON"]
-        F2["② pyhwp<br/>hwp5html → BeautifulSoup"]
-        F3["③ hwpilot convert<br/>HWP→HWPX → parse_hwpx"]
+        F1["① hwpilot read"]
+        F2["② pyhwp hwp5html"]
+        F3["③ hwpilot convert → parse_hwpx"]
         F4["④ LibreOffice convert"]
-        F5["⑤ olefile + zlib<br/>BodyText streams"]
+        F5["⑤ olefile + zlib"]
     end
 
     subgraph Enrich["Post-process (CPU)"]
-        ET[extract_tables<br/>TableSummary]
+        ET[extract_tables]
         NT[detect_numbers_in_text]
         NB[detect_numbers_in_tables]
     end
 
-    subgraph Cache["Session Cache"]
-        C["parsed_{fname}_{size}<br/>doc, tables, numbers"]
+    subgraph Intel["자동 검토"]
+        FE[fact_extractor]
+        CC[consistency_checker]
+        IP[intel_pipeline]
+    end
+
+    subgraph Output["Session"]
+        C["doc_payload<br/>tables · numbers · intel"]
+        QA[qa_engine 2-Stage]
     end
 
     B --> EXT
     FN --> EXT
-    EXT -->|yes| HWPX_Path
-    EXT -->|no| HWP_Path
+    EXT -->|.xlsx .xls| Excel_Path
+    EXT -->|.hwpx| HWPX_Path
+    EXT -->|.hwp 등| HWP_Path
+    Excel_Path --> Enrich
+    HWPX_Path --> Enrich
     F1 -->|success| Enrich
     F1 -->|fail| F2
     F2 -->|fail| F3
     F3 -->|fail| F4
     F4 -->|fail| F5
     F5 --> Enrich
-    HWPX_Path --> Enrich
-    Enrich --> C
+    Enrich --> Intel
+    FE --> CC --> IP
+    Intel --> C
+    C --> QA
 ```
 
+0702 ver.
+<img width="1838" height="797" alt="image" src="https://github.com/user-attachments/assets/945bea83-4f5a-42b8-9e66-e586ed982fa7" />
 
-### 편집
-
-HWPX 업로드 시 오른쪽 채팅에서 편집 명령을내면, 제안은 왼쪽 미리보기에 표시되고 **「모두 적용」** 후 HWPX로 저장합니다.
-
-```
-app.py
-  └─ ui/command_router.py     의도 분류 (fill / draft / replace / qa)
-        ├─ additional/ai_editor.py      LLM 빈칸·초안·리라이트
-        └─ hwp_core/hwpx_editor.py          propose_* → pending 변경
-              └─ ui/document_preview.py  노란(제안) / 빨강(적용) HTML 미리보기
-```
-
+<img width="1861" height="775" alt="image" src="https://github.com/user-attachments/assets/9a2b66dc-f027-4d26-a2e5-6ff7ed40c948" />
