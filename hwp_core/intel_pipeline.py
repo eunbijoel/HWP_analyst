@@ -7,8 +7,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .fact_extractor import Fact, extract_facts
+from .fact_extractor import Fact, extract_facts, grounding_stats_for_facts, TOTAL_BUDGET_LABELS
 from .consistency_checker import Issue, check_consistency
+from .concept_resolver import MIN_GROUNDING_CONFIDENCE, GroundingOptions
 
 
 @dataclass
@@ -16,6 +17,7 @@ class IntelResult:
   document_id: str = ""
   facts: list[Fact] = field(default_factory=list)
   issues: list[Issue] = field(default_factory=list)
+  grounding: dict = field(default_factory=dict)
   report_markdown: str = ""
 
   @property
@@ -46,6 +48,17 @@ def _format_report(result: IntelResult) -> str:
   lines = [f"## 자동 검토 — {result.document_id}", ""]
 
   lines.append(f"- 추출 Fact: **{len(result.facts)}**개")
+  if result.grounding:
+    lines.append(
+      f"- 개념 연결(grounding): **{result.grounding.get('coverage_pct', 0)}%** "
+      f"({result.grounding.get('grounded_facts', 0)}/{result.grounding.get('total_facts', 0)})"
+    )
+    llm_n = result.grounding.get("llm_grounded_facts", 0)
+    if llm_n:
+      lines.append(f"- LLM 보조 grounding: **{llm_n}**건")
+    unmatched = result.grounding.get("unmatched_labels") or []
+    if unmatched:
+      lines.append(f"- 미매칭 라벨: {len(unmatched)}개 (YAML synonyms 보강 후보)")
   lines.append(f"- 확인 필요: **{result.warning_count}**건")
   lines.append("")
 
@@ -77,6 +90,7 @@ def build_intelligence(
   text_numbers: list,
   table_numbers: list,
   document_id: str = "",
+  grounding: GroundingOptions | None = None,
 ) -> IntelResult:
   facts = extract_facts(
     paragraphs=paragraphs,
@@ -84,30 +98,38 @@ def build_intelligence(
     text_numbers=text_numbers,
     table_numbers=table_numbers,
     document_id=document_id,
+    grounding=grounding,
   )
   issues = check_consistency(facts, tables, document_id=document_id)
   result = IntelResult(
     document_id=document_id,
     facts=facts,
     issues=issues,
+    grounding=grounding_stats_for_facts(facts),
   )
   result.report_markdown = _format_report(result)
   return result
 
 
-def build_workspace_intelligence(doc_payloads: list[dict]) -> WorkspaceIntel:
-  """다중 문서: 파일별 검토 + (1단계) 총사업비 개념 간단 교차."""
+def build_workspace_intelligence(
+  doc_payloads: list[dict],
+) -> WorkspaceIntel:
+  """다중 문서: 캐시된 intel 재사용 + 문서 간 총사업비 교차만."""
   per_doc: list[IntelResult] = []
   cross: list[Issue] = []
 
   for dp in doc_payloads:
-    doc_id = dp.get("id", "")
+    cached = dp.get("intel")
+    if cached is not None:
+      per_doc.append(cached)
+      continue
     intel = build_intelligence(
       paragraphs=dp.get("paragraphs", []),
       tables=dp.get("tables", []),
       text_numbers=dp.get("text_numbers", []),
       table_numbers=dp.get("table_numbers", []),
-      document_id=doc_id,
+      document_id=dp.get("id", ""),
+      grounding=None,
     )
     per_doc.append(intel)
 
@@ -115,6 +137,9 @@ def build_workspace_intelligence(doc_payloads: list[dict]) -> WorkspaceIntel:
   for intel in per_doc:
     for f in intel.facts:
       if f.concept != "total_budget":
+        continue
+      conf = getattr(f, "concept_confidence", 0.0) or 0.0
+      if conf < MIN_GROUNDING_CONFIDENCE and not TOTAL_BUDGET_LABELS.search(f.raw_label):
         continue
       won = f.value_in_won
       if f.source_type == "table":

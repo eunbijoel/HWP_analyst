@@ -35,7 +35,6 @@ from ui.canvas_editor import (
     render_canvas_editor, render_canvas_editor_hwp, render_hwpx_download,
 )
 from hwp_core.intel_pipeline import build_intelligence, build_workspace_intelligence
-from ui.intel_panel import render_intel_review, render_workspace_intel
 from ui.document_workspace import render_document_pane, render_excel_split_editor
 
 st.set_page_config(page_title="HWP Analyzer", page_icon="📄", layout="wide")
@@ -1116,8 +1115,16 @@ if uploaded_files:
         for err in cached['doc'].errors:
             st.warning(f"[{filename}] {err}")
 
-    workspace_intel = build_workspace_intelligence(all_documents)
-    render_workspace_intel(workspace_intel)
+    if len(all_documents) >= 2:
+        build_workspace_intelligence(all_documents)
+
+    for entry in file_entries:
+        intel = entry['doc_payload'].get('intel')
+        if intel and intel.issues:
+            for issue in intel.issues[:5]:
+                st.warning(f"**{entry['filename']}** — {issue.message}")
+                if issue.source:
+                    st.caption(f"📍 {issue.source}")
 
     n_files = len(file_entries)
     st.caption(
@@ -1134,8 +1141,6 @@ if uploaded_files:
     with col_doc:
         if n_files == 1:
             entry = file_entries[0]
-            if entry['doc_payload'].get('intel'):
-                render_intel_review(entry['doc_payload']['intel'])
             render_document_pane(
                 entry, all_documents,
                 model_name=model_name, ollama_url=ollama_url,

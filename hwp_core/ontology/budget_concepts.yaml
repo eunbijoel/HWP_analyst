@@ -1,0 +1,135 @@
+# 예산서 도메인 개념 사전 (Phase 1 — semantic grounding)
+# 동의어·패턴은 코드 수정 없이 여기서 확장
+
+version: 1
+domain: budget
+
+concepts:
+  total_budget:
+    label_ko: 총사업비
+    value_type: money
+    synonyms:
+      - 총사업비
+      - 사업비 합계
+      - 사업비 총액
+      - 총 예산
+      - 전체 예산
+      - 총액
+      - total budget
+    patterns:
+      - "총\\s*사업비"
+      - "사업비\\s*합계"
+      - "사업비\\s*총액"
+      - "총\\s*예산"
+
+  government_contribution:
+    label_ko: 국비
+    value_type: money
+    synonyms:
+      - 국비
+      - 정부출연
+      - 정부 출연
+      - 정부출연금
+      - 국고보조
+      - 국고 보조
+    patterns:
+      - "국\\s*비"
+      - "정부\\s*출연"
+      - "국고\\s*보조"
+
+  private_contribution:
+    label_ko: 민간부담
+    value_type: money
+    synonyms:
+      - 민간부담
+      - 민간 부담
+      - 민자
+      - 기업부담
+      - 기업 부담
+    patterns:
+      - "민간\\s*부담"
+      - "기업\\s*부담"
+
+  local_contribution:
+    label_ko: 지방비
+    value_type: money
+    synonyms:
+      - 지방비
+      - 지자체부담
+      - 지자체 부담
+      - 자체 부담
+    patterns:
+      - "지방\\s*비"
+      - "지자체\\s*부담"
+
+  planned_amount:
+    label_ko: 계획
+    value_type: money
+    synonyms:
+      - 계획
+      - 계획액
+      - 계획예산
+      - 예산
+      - 배정
+      - 편성
+      - 소요예산
+    patterns:
+      - "계획\\s*예산"
+      - "계획\\s*액?"
+      - "소요\\s*예산"
+      - "예산\\s*배정"
+
+  actual_amount:
+    label_ko: 실행
+    value_type: money
+    synonyms:
+      - 실행
+      - 집행
+      - 실적
+      - 집행액
+      - 집행액
+      - 사용액
+    patterns:
+      - "집행\\s*액?"
+      - "실\\s*적"
+
+  variance:
+    label_ko: 차이
+    value_type: money
+    synonyms:
+      - 차이
+      - 증감
+      - 잔액
+      - 과부족
+    patterns:
+      - "증\\s*감"
+      - "과\\s*부족"
+
+  annual_budget:
+    label_ko: 연도별예산
+    value_type: money
+    synonyms: []
+    patterns:
+      - "(20\\d{2})\\s*년?\\s*(예산|사업비|계획)"
+
+  item_budget:
+    label_ko: 세부항목
+    value_type: money
+    synonyms:
+      - 세부사업
+      - 세부 항목
+      - 단위사업
+    patterns:
+      - "세부\\s*사업"
+      - "단위\\s*사업"
+
+  performance_indicator:
+    label_ko: 성과지표
+    value_type: number
+    synonyms:
+      - 성과지표
+      - 목표치
+      - KPI
+    patterns:
+      - "성과\\s*지표"
+      - "목표\\s*치"

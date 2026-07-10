@@ -10,6 +10,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .concept_resolver import (
+  get_concept_resolver,
+  compute_grounding_stats,
+  GroundingOptions,
+  MIN_GROUNDING_CONFIDENCE,
+)
 from .table_extractor import (
     TableSummary,
     NumberInfo,
@@ -27,6 +33,9 @@ class Fact:
   unit: str = ""
   display_value: str = ""
   concept: Optional[str] = None
+  concept_confidence: float = 0.0
+  grounding_method: str = ""  # exact | substring | pattern | none
+  normalized_label: str = ""
   source_type: str = ""  # table | paragraph
   document_id: str = ""
   table_index: int = -1
@@ -109,19 +118,24 @@ def _row_label(df, row_idx: int, label_cols: list[str]) -> str:
   return " / ".join(parts) if parts else f"행{int(row_idx) + 1}"
 
 
-def _guess_concept(label: str, context: str = "") -> Optional[str]:
-  text = f"{label} {context}"
-  if TOTAL_BUDGET_LABELS.search(text):
-    return "total_budget"
-  if re.search(r"국비|정부|출연", text):
-    return "government_fund"
-  if re.search(r"민간|민자|기업\s*부담", text):
-    return "private_fund"
-  if re.search(r"성과\s*지표|목표\s*치", text):
-    return "performance_indicator"
-  if re.search(r"20\d{2}", text):
-    return "annual_budget"
-  return None
+def _ground_fact_fields(
+  label: str,
+  context: str = "",
+  *,
+  grounding: Optional[GroundingOptions] = None,
+) -> dict:
+  """ontology resolver (+ optional LLM)로 concept + confidence 부여."""
+  resolver = get_concept_resolver()
+  if grounding and grounding.use_llm:
+    gr = resolver.ground_with_llm(label, context, options=grounding)
+  else:
+    gr = resolver.ground(label, context)
+  return {
+    "concept": gr.concept_id,
+    "concept_confidence": gr.confidence,
+    "grounding_method": gr.method,
+    "normalized_label": gr.normalized_text,
+  }
 
 
 def _label_from_money_context(context: str) -> str:
@@ -138,9 +152,25 @@ def _label_from_money_context(context: str) -> str:
   return "본문 수치"
 
 
+def _is_code_like_column(df, col: str) -> bool:
+  """비용코드·번호 열은 Fact 추출·검증에서 제외."""
+  col_s = str(col)
+  if any(k in col_s for k in ("코드", "번호", "비용명", "code", "id", "ID")):
+    nums = []
+    for i in range(len(df)):
+      v = _parse_cell_number(str(df.at[i, col_s]))
+      if v is not None:
+        nums.append(v)
+    if nums and max(nums) < 100_000:
+      return True
+  return False
+
+
 def extract_facts_from_tables(
   tables: list[TableSummary],
   document_id: str = "",
+  *,
+  grounding: Optional[GroundingOptions] = None,
 ) -> list[Fact]:
   facts: list[Fact] = []
 
@@ -163,7 +193,7 @@ def extract_facts_from_tables(
     for row_idx in range(len(df)):
       row_label = _row_label(df, row_idx, label_cols)
       for col in numeric_cols:
-        if col in label_cols:
+        if col in label_cols or _is_code_like_column(df, col):
           continue
         cell = str(df.at[row_idx, col]).strip()
         if not cell or not _is_number(cell):
@@ -176,12 +206,13 @@ def extract_facts_from_tables(
         if col not in label_cols and not _is_total_column(col):
           raw_label = f"{row_label} ({col})" if row_label else str(col)
 
+        grounded = _ground_fact_fields(raw_label, str(col), grounding=grounding)
         facts.append(Fact(
           raw_label=raw_label,
           value=num,
           unit=unit,
           display_value=cell,
-          concept=_guess_concept(raw_label, col),
+          **grounded,
           source_type="table",
           document_id=document_id or ts.document_id,
           table_index=ts.index,
@@ -196,6 +227,8 @@ def extract_facts_from_text(
   paragraphs: list[str],
   text_numbers: list[NumberInfo],
   document_id: str = "",
+  *,
+  grounding: Optional[GroundingOptions] = None,
 ) -> list[Fact]:
   facts: list[Fact] = []
 
@@ -220,12 +253,13 @@ def extract_facts_from_text(
     unit = "원" if ni.category == "money" else (ni.unit or "")
     value = float(ni.numeric_value) if ni.numeric_value is not None else 0.0
 
+    grounded = _ground_fact_fields(label, ni.context or "", grounding=grounding)
     facts.append(Fact(
       raw_label=label,
       value=value,
       unit=unit,
       display_value=ni.value,
-      concept=_guess_concept(label, ni.context or ""),
+      **grounded,
       source_type="paragraph",
       document_id=document_id or ni.document_id,
       paragraph_index=para_idx,
@@ -242,8 +276,24 @@ def extract_facts(
   text_numbers: list[NumberInfo],
   table_numbers: list[NumberInfo],
   document_id: str = "",
+  grounding: Optional[GroundingOptions] = None,
 ) -> list[Fact]:
   """표 + 본문 Fact 통합 추출."""
-  facts = extract_facts_from_tables(tables, document_id=document_id)
-  facts.extend(extract_facts_from_text(paragraphs, text_numbers, document_id=document_id))
+  facts = extract_facts_from_tables(tables, document_id=document_id, grounding=grounding)
+  facts.extend(extract_facts_from_text(
+    paragraphs, text_numbers, document_id=document_id, grounding=grounding,
+  ))
   return facts
+
+
+def grounding_stats_for_facts(facts: list[Fact]) -> dict:
+  """grounding 커버리지 요약 (리포트·디버그용)."""
+  stats = compute_grounding_stats(facts)
+  return {
+    "total_facts": stats.total,
+    "grounded_facts": stats.grounded,
+    "llm_grounded_facts": stats.llm_grounded,
+    "coverage_pct": stats.coverage_pct,
+    "unmatched_labels": stats.unmatched_labels[:30],
+    "unmatched_hints": stats.unmatched_hints[:20],
+  }

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .fact_extractor import Fact, TOTAL_BUDGET_LABELS
+from .concept_resolver import MIN_GROUNDING_CONFIDENCE, get_concept_resolver
 from .table_extractor import (
   TableSummary,
   TOTAL_KEYWORDS,
@@ -152,6 +153,44 @@ def check_table_row_totals(ts: TableSummary, document_id: str = "") -> list[Issu
   return issues
 
 
+def _column_concept_id(column_name: str) -> Optional[str]:
+  gr = get_concept_resolver().column_concept(column_name)
+  if gr.confidence >= MIN_GROUNDING_CONFIDENCE:
+    return gr.concept_id
+  return None
+
+
+def _is_budget_value_column(df, col: str, ts: TableSummary) -> bool:
+  """합계 검증 대상 금액 열만 (비용코드 열 제외)."""
+  col_s = str(col)
+  if col_s not in df.columns or _is_total_column(col_s):
+    return False
+
+  concept = _column_concept_id(col_s)
+  if concept in (
+    "planned_amount", "actual_amount", "variance", "total_budget",
+    "government_contribution", "private_contribution", "local_contribution",
+    "item_budget", "annual_budget",
+  ):
+    return True
+
+  nums: list[float] = []
+  for row_idx in range(len(df)):
+    if ts.has_total_row and row_idx == ts.total_row_index:
+      continue
+    v = _parse_cell(str(df.at[row_idx, col_s]))
+    if v is not None:
+      nums.append(v)
+  if not nums:
+    return False
+  return max(nums) >= 10_000
+
+
+def _row_name(df, row_idx: int) -> str:
+  first_col = str(df.columns[0])
+  return str(df.at[row_idx, first_col]).strip() or f"{row_idx + 1}행"
+
+
 def check_table_total_row(ts: TableSummary, document_id: str = "") -> list[Issue]:
   """합계 행 vs 데이터 행 열 합 비교."""
   issues: list[Issue] = []
@@ -164,11 +203,11 @@ def check_table_total_row(ts: TableSummary, document_id: str = "") -> list[Issue
   unit = ts.unit or ""
   total_idx = ts.total_row_index
 
-  check_cols = list(dict.fromkeys(ts.numeric_columns + ts.money_columns))
+  check_cols = [
+    str(c) for c in df.columns
+    if _is_budget_value_column(df, str(c), ts)
+  ]
   for col in check_cols:
-    if col not in df.columns or _is_total_column(str(col)):
-      continue
-
     calculated = compute_column_sum(df, col, exclude_totals=True)
     reported = _parse_cell(str(df.at[total_idx, col]))
     if calculated is None or reported is None:
@@ -194,6 +233,79 @@ def check_table_total_row(ts: TableSummary, document_id: str = "") -> list[Issue
   return issues
 
 
+def check_planned_vs_actual(ts: TableSummary, document_id: str = "") -> list[Issue]:
+  """예실대비: 계획 vs 실행 열, 증감 열 검증."""
+  issues: list[Issue] = []
+  if ts.dataframe is None or ts.dataframe.empty:
+    return issues
+
+  df = ts.dataframe
+  doc = document_id or ts.document_id
+  table_no = ts.index + 1
+  unit = ts.unit or ""
+
+  planned_cols = [str(c) for c in df.columns if _column_concept_id(str(c)) == "planned_amount"]
+  actual_cols = [str(c) for c in df.columns if _column_concept_id(str(c)) == "actual_amount"]
+  variance_cols = [str(c) for c in df.columns if _column_concept_id(str(c)) == "variance"]
+
+  if not planned_cols or not actual_cols:
+    return issues
+
+  pcol, acol = planned_cols[0], actual_cols[0]
+  vcol = variance_cols[0] if variance_cols else None
+
+  for row_idx in range(len(df)):
+    if ts.has_total_row and row_idx == ts.total_row_index:
+      continue
+    row_name = _row_name(df, row_idx)
+    if _is_total_label(row_name):
+      continue
+
+    planned = _parse_cell(str(df.at[row_idx, pcol]))
+    actual = _parse_cell(str(df.at[row_idx, acol]))
+    if planned is None or actual is None:
+      continue
+
+    if vcol:
+      reported_var = _parse_cell(str(df.at[row_idx, vcol]))
+      calc_var = actual - planned
+      if reported_var is not None and not _values_close(reported_var, calc_var):
+        issues.append(Issue(
+          issue_type="variance_mismatch",
+          severity="warning",
+          message=(
+            f"표 {table_no} '{row_name}': "
+            f"증감({reported_var:,.0f}) ≠ 실행-계획({calc_var:,.0f})"
+            + (f" [단위: {unit}]" if unit else "")
+          ),
+          expected=calc_var,
+          actual=reported_var,
+          difference=reported_var - calc_var,
+          source=f"표 {table_no}, {row_idx + 1}행, '{vcol}' 열",
+          document_id=doc,
+        ))
+
+    if actual > planned and not _values_close(actual, planned):
+      overrun = actual - planned
+      if overrun / max(abs(planned), 1.0) > REL_TOL:
+        issues.append(Issue(
+          issue_type="execution_overrun",
+          severity="info",
+          message=(
+            f"표 {table_no} '{row_name}': "
+            f"실행({actual:,.0f}) > 계획({planned:,.0f}), 초과 {overrun:,.0f}"
+            + (f" [단위: {unit}]" if unit else "")
+          ),
+          expected=planned,
+          actual=actual,
+          difference=overrun,
+          source=f"표 {table_no}, {row_idx + 1}행, '{pcol}'↔'{acol}'",
+          document_id=doc,
+        ))
+
+  return issues
+
+
 def _won_value(fact: Fact, table_multiplier: float = 1.0) -> Optional[float]:
   if fact.source_type == "table" and table_multiplier and table_multiplier != 1.0:
     return fact.value * table_multiplier
@@ -201,6 +313,19 @@ def _won_value(fact: Fact, table_multiplier: float = 1.0) -> Optional[float]:
   if won is not None:
     return won
   return fact.value
+
+
+def _fact_has_concept(f: Fact, concept_id: str) -> bool:
+  """ontology grounding (confidence 필터) + total_budget 레거시 패턴."""
+  if f.concept == concept_id:
+    conf = getattr(f, "concept_confidence", 0.0) or 0.0
+    if conf >= MIN_GROUNDING_CONFIDENCE:
+      return True
+  if concept_id == "total_budget" and TOTAL_BUDGET_LABELS.search(f.raw_label):
+    return True
+  ctx = f.column or f.context or ""
+  gr = get_concept_resolver().ground(f.raw_label, ctx)
+  return gr.concept_id == concept_id and gr.confidence >= MIN_GROUNDING_CONFIDENCE
 
 
 def check_body_vs_table(
@@ -214,12 +339,12 @@ def check_body_vs_table(
   body_facts = [
     f for f in facts
     if f.source_type == "paragraph"
-    and (f.concept == "total_budget" or TOTAL_BUDGET_LABELS.search(f.raw_label))
+    and _fact_has_concept(f, "total_budget")
   ]
   table_facts = [
     f for f in facts
     if f.source_type == "table"
-    and (f.concept == "total_budget" or TOTAL_BUDGET_LABELS.search(f.raw_label))
+    and _fact_has_concept(f, "total_budget")
     and (_is_total_label(f.raw_label.split("(")[0].strip()) or TOTAL_BUDGET_LABELS.search(f.raw_label))
   ]
 
@@ -261,6 +386,7 @@ def check_tables(tables: list[TableSummary], document_id: str = "") -> list[Issu
   for ts in tables:
     issues.extend(check_table_row_totals(ts, document_id=document_id))
     issues.extend(check_table_total_row(ts, document_id=document_id))
+    issues.extend(check_planned_vs_actual(ts, document_id=document_id))
   return issues
 
 
