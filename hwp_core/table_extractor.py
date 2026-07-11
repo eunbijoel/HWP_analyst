@@ -533,11 +533,29 @@ def _is_total_row(df: pd.DataFrame, row_idx: int) -> bool:
     return False
 
 
+def resolve_column(df: pd.DataFrame, col):
+    """문자열/정수 열 이름을 DataFrame의 실제 컬럼 키로 맞춤.
+
+    헤더가 없는 표는 columns가 RangeIndex(0,1,2…)인데,
+    메타데이터는 종종 str('2')로 저장되어 KeyError가 난다.
+    """
+    if col in df.columns:
+        return col
+    col_s = str(col)
+    for c in df.columns:
+        if str(c) == col_s:
+            return c
+    return None
+
+
 def compute_column_sum(df: pd.DataFrame, col_name: str,
                        exclude_totals: bool = True) -> Optional[float]:
+    col = resolve_column(df, col_name)
+    if col is None:
+        return None
     total = 0.0
     count = 0
-    for idx, val in df[col_name].items():
+    for idx, val in df[col].items():
         if exclude_totals and _is_total_row(df, idx):
             continue
         cleaned = _normalize_number_str(str(val))

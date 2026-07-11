@@ -23,6 +23,7 @@ from .table_extractor import (
     TOTAL_KEYWORDS,
     _normalize_number_str,
     _is_number,
+    resolve_column,
 )
 
 
@@ -93,26 +94,27 @@ def _is_total_column(col: str) -> bool:
   return any(kw in c for kw in ("합계", "계", "소계", "총계"))
 
 
-def _guess_label_columns(df) -> list[str]:
+def _guess_label_columns(df) -> list:
   cols = []
   for col in df.columns:
     values = df[col].astype(str)
     numeric_count = sum(1 for v in values if v.strip() and _is_number(v))
     if numeric_count <= len(values) * 0.4:
-      cols.append(str(col))
+      cols.append(col)
     if len(cols) >= 2:
       break
   if not cols and len(df.columns):
-    cols = [str(df.columns[0])]
+    cols = [df.columns[0]]
   return cols
 
 
-def _row_label(df, row_idx: int, label_cols: list[str]) -> str:
+def _row_label(df, row_idx: int, label_cols: list) -> str:
   parts = []
   for col in label_cols:
-    if col not in df.columns:
+    key = resolve_column(df, col)
+    if key is None:
       continue
-    val = str(df.at[row_idx, col]).strip()
+    val = str(df.at[row_idx, key]).strip()
     if val and not _is_number(val):
       parts.append(val)
   return " / ".join(parts) if parts else f"행{int(row_idx) + 1}"
@@ -152,13 +154,16 @@ def _label_from_money_context(context: str) -> str:
   return "본문 수치"
 
 
-def _is_code_like_column(df, col: str) -> bool:
+def _is_code_like_column(df, col) -> bool:
   """비용코드·번호 열은 Fact 추출·검증에서 제외."""
-  col_s = str(col)
+  key = resolve_column(df, col)
+  if key is None:
+    return False
+  col_s = str(key)
   if any(k in col_s for k in ("코드", "번호", "비용명", "code", "id", "ID")):
     nums = []
     for i in range(len(df)):
-      v = _parse_cell_number(str(df.at[i, col_s]))
+      v = _parse_cell_number(str(df.at[i, key]))
       if v is not None:
         nums.append(v)
     if nums and max(nums) < 100_000:
@@ -180,12 +185,15 @@ def extract_facts_from_tables(
 
     df = ts.dataframe
     label_cols = _guess_label_columns(df)
+    label_keys = {resolve_column(df, c) for c in label_cols}
+    label_keys.discard(None)
+    meta_num = {str(c) for c in (ts.numeric_columns + ts.money_columns)}
     numeric_cols = [
-      str(c) for c in df.columns
-      if str(c) in ts.numeric_columns + ts.money_columns or _is_number(str(df[c].iloc[0] if len(df) else ""))
+      c for c in df.columns
+      if str(c) in meta_num or _is_number(str(df[c].iloc[0] if len(df) else ""))
     ]
     if not numeric_cols:
-      numeric_cols = [str(c) for c in df.columns if c not in label_cols]
+      numeric_cols = [c for c in df.columns if c not in label_keys]
 
     unit = ts.unit or ""
     multiplier = ts.unit_multiplier or 1.0
@@ -193,20 +201,22 @@ def extract_facts_from_tables(
     for row_idx in range(len(df)):
       row_label = _row_label(df, row_idx, label_cols)
       for col in numeric_cols:
-        if col in label_cols or _is_code_like_column(df, col):
+        key = resolve_column(df, col)
+        if key is None or key in label_keys or _is_code_like_column(df, key):
           continue
-        cell = str(df.at[row_idx, col]).strip()
+        cell = str(df.at[row_idx, key]).strip()
         if not cell or not _is_number(cell):
           continue
         num = _parse_cell_number(cell)
         if num is None:
           continue
 
+        col_s = str(key)
         raw_label = row_label
-        if col not in label_cols and not _is_total_column(col):
-          raw_label = f"{row_label} ({col})" if row_label else str(col)
+        if key not in label_keys and not _is_total_column(col_s):
+          raw_label = f"{row_label} ({col_s})" if row_label else col_s
 
-        grounded = _ground_fact_fields(raw_label, str(col), grounding=grounding)
+        grounded = _ground_fact_fields(raw_label, col_s, grounding=grounding)
         facts.append(Fact(
           raw_label=raw_label,
           value=num,
@@ -217,7 +227,7 @@ def extract_facts_from_tables(
           document_id=document_id or ts.document_id,
           table_index=ts.index,
           row=int(row_idx),
-          column=str(col),
+          column=col_s,
         ))
 
   return facts

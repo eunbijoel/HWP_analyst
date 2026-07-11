@@ -19,6 +19,7 @@ from .table_extractor import (
   _normalize_number_str,
   _is_number,
   compute_column_sum,
+  resolve_column,
 )
 
 
@@ -66,12 +67,16 @@ def _parse_cell(cell: str) -> Optional[float]:
     return None
 
 
-def _year_columns(df, ts: TableSummary) -> list[str]:
-  cols = [str(c) for c in ts.year_columns if str(c) in df.columns]
+def _year_columns(df, ts: TableSummary) -> list:
+  cols = []
+  for c in ts.year_columns:
+    key = resolve_column(df, c)
+    if key is not None:
+      cols.append(key)
   if cols:
     return cols
   return [
-    str(c) for c in df.columns
+    c for c in df.columns
     if re.search(r"20\d{2}", str(c)) and str(c) not in ("",)
   ]
 
@@ -105,7 +110,7 @@ def check_table_row_totals(ts: TableSummary, document_id: str = "") -> list[Issu
 
   df = ts.dataframe
   year_cols = _year_columns(df, ts)
-  total_cols = [str(c) for c in df.columns if _is_total_column(str(c))]
+  total_cols = [c for c in df.columns if _is_total_column(str(c))]
   if not year_cols or not total_cols:
     return issues
 
@@ -116,7 +121,10 @@ def check_table_row_totals(ts: TableSummary, document_id: str = "") -> list[Issu
   for row_idx in range(len(df)):
     row_vals = []
     for col in year_cols:
-      v = _parse_cell(str(df.at[row_idx, col]))
+      key = resolve_column(df, col)
+      if key is None:
+        continue
+      v = _parse_cell(str(df.at[row_idx, key]))
       if v is not None:
         row_vals.append(v)
     if len(row_vals) < 2:
@@ -124,29 +132,33 @@ def check_table_row_totals(ts: TableSummary, document_id: str = "") -> list[Issu
 
     calculated = sum(row_vals)
     for tcol in total_cols:
-      reported = _parse_cell(str(df.at[row_idx, tcol]))
+      tkey = resolve_column(df, tcol)
+      if tkey is None:
+        continue
+      reported = _parse_cell(str(df.at[row_idx, tkey]))
       if reported is None:
         continue
       if _values_close(calculated, reported):
         continue
 
-      first_col = str(df.columns[0])
-      row_name = str(df.at[row_idx, first_col]).strip() or f"{row_idx + 1}행"
+      first_key = df.columns[0]
+      row_name = str(df.at[row_idx, first_key]).strip() or f"{row_idx + 1}행"
       if _is_total_label(row_name):
         continue
 
+      tcol_s = str(tkey)
       issues.append(Issue(
         issue_type="row_sum_mismatch",
         severity="warning",
         message=(
           f"표 {table_no} '{row_name}' 행: "
-          f"연도별 합({calculated:,.0f}) ≠ '{tcol}'({reported:,.0f})"
+          f"연도별 합({calculated:,.0f}) ≠ '{tcol_s}'({reported:,.0f})"
           + (f" [단위: {unit}]" if unit else "")
         ),
         expected=calculated,
         actual=reported,
         difference=reported - calculated,
-        source=f"표 {table_no}, {row_idx + 1}행, '{tcol}' 열",
+        source=f"표 {table_no}, {row_idx + 1}행, '{tcol_s}' 열",
         document_id=doc,
       ))
 
@@ -160,12 +172,13 @@ def _column_concept_id(column_name: str) -> Optional[str]:
   return None
 
 
-def _is_budget_value_column(df, col: str, ts: TableSummary) -> bool:
+def _is_budget_value_column(df, col, ts: TableSummary) -> bool:
   """합계 검증 대상 금액 열만 (비용코드 열 제외)."""
-  col_s = str(col)
-  if col_s not in df.columns or _is_total_column(col_s):
+  key = resolve_column(df, col)
+  if key is None or _is_total_column(str(key)):
     return False
 
+  col_s = str(key)
   concept = _column_concept_id(col_s)
   if concept in (
     "planned_amount", "actual_amount", "variance", "total_budget",
@@ -178,7 +191,7 @@ def _is_budget_value_column(df, col: str, ts: TableSummary) -> bool:
   for row_idx in range(len(df)):
     if ts.has_total_row and row_idx == ts.total_row_index:
       continue
-    v = _parse_cell(str(df.at[row_idx, col_s]))
+    v = _parse_cell(str(df.at[row_idx, key]))
     if v is not None:
       nums.append(v)
   if not nums:
@@ -187,8 +200,8 @@ def _is_budget_value_column(df, col: str, ts: TableSummary) -> bool:
 
 
 def _row_name(df, row_idx: int) -> str:
-  first_col = str(df.columns[0])
-  return str(df.at[row_idx, first_col]).strip() or f"{row_idx + 1}행"
+  first_key = df.columns[0]
+  return str(df.at[row_idx, first_key]).strip() or f"{row_idx + 1}행"
 
 
 def check_table_total_row(ts: TableSummary, document_id: str = "") -> list[Issue]:
@@ -204,29 +217,33 @@ def check_table_total_row(ts: TableSummary, document_id: str = "") -> list[Issue
   total_idx = ts.total_row_index
 
   check_cols = [
-    str(c) for c in df.columns
-    if _is_budget_value_column(df, str(c), ts)
+    c for c in df.columns
+    if _is_budget_value_column(df, c, ts)
   ]
   for col in check_cols:
-    calculated = compute_column_sum(df, col, exclude_totals=True)
-    reported = _parse_cell(str(df.at[total_idx, col]))
+    key = resolve_column(df, col)
+    if key is None:
+      continue
+    calculated = compute_column_sum(df, key, exclude_totals=True)
+    reported = _parse_cell(str(df.at[total_idx, key]))
     if calculated is None or reported is None:
       continue
     if _values_close(calculated, reported):
       continue
 
+    col_s = str(key)
     issues.append(Issue(
       issue_type="column_total_mismatch",
       severity="warning",
       message=(
-        f"표 {table_no} '{col}' 열: "
+        f"표 {table_no} '{col_s}' 열: "
         f"세부 합({calculated:,.0f}) ≠ 합계행({reported:,.0f})"
         + (f" [단위: {unit}]" if unit else "")
       ),
       expected=calculated,
       actual=reported,
       difference=reported - calculated,
-      source=f"표 {table_no}, 합계행, '{col}' 열",
+      source=f"표 {table_no}, 합계행, '{col_s}' 열",
       document_id=doc,
     ))
 
@@ -244,9 +261,9 @@ def check_planned_vs_actual(ts: TableSummary, document_id: str = "") -> list[Iss
   table_no = ts.index + 1
   unit = ts.unit or ""
 
-  planned_cols = [str(c) for c in df.columns if _column_concept_id(str(c)) == "planned_amount"]
-  actual_cols = [str(c) for c in df.columns if _column_concept_id(str(c)) == "actual_amount"]
-  variance_cols = [str(c) for c in df.columns if _column_concept_id(str(c)) == "variance"]
+  planned_cols = [c for c in df.columns if _column_concept_id(str(c)) == "planned_amount"]
+  actual_cols = [c for c in df.columns if _column_concept_id(str(c)) == "actual_amount"]
+  variance_cols = [c for c in df.columns if _column_concept_id(str(c)) == "variance"]
 
   if not planned_cols or not actual_cols:
     return issues
