@@ -19,6 +19,8 @@
 
 ## 프로젝트 구조
 
+> **구조 스터디:** [SW 구조](../.cursor/projects/home-eunbi/canvases/hwp-analyser-architecture.canvas.tsx)  
+
 ```
 HWP analysis/
 ├── app.py                      # Streamlit 진입점
