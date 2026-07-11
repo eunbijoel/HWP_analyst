@@ -19,8 +19,7 @@
 
 ## 프로젝트 구조
 
-> **구조 스터디:** [SW 구조](../.cursor/projects/home-eunbi/canvases/hwp-analyser-architecture.canvas.tsx)  
-
+> **구조 지도:** [ARCHITECTURE.md](./ARCHITECTURE.md) — Local · Server · LLM, 업로드 경로, Ollama/보안  
 ```
 HWP analysis/
 ├── app.py                      # Streamlit 진입점
