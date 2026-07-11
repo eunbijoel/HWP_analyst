@@ -11,42 +11,47 @@
 
 ## 주요 기능
 
-- **Excel 분석/HWP/HWPX 편집** — 파일 업로드, 미리보기·직접 수정·다운로드
-- **통합 작업 화면** — 파일 형식별 동일 레이아웃: 왼쪽 미리보기/직접편집, 오른쪽 **💬 이 파일 | 💬 전체** 채팅
-- **자동 검토** — 표 행 합계·합계 행·본문↔표 예산·문서 간 총액 교차 검증 (이슈 있을 때만 패널 표시)
-- **미리보기 diff** — 🟡 AI 제안, 🔴 적용된 수정, 🟢 새 내용
+- **문서 분석·질의응답** — HWP/HWPX/Excel 업로드 후 표·숫자 추출, Ollama 기반 2-Stage Q&A
+- **통합 작업 화면** — 왼쪽 미리보기/직접편집, 오른쪽 **💬 이 파일 | 💬 전체** 채팅
+- **HWP/HWPX 편집** — 채팅 명령·캔버스 직접 편집, 미리보기 diff (🟡 제안 / 🔴 적용 / 🟢 신규)
+- **Excel** — 표 미리보기·`data_editor` 수정·xlsx 다운로드
+- **자동 검토** — 업로드 시 합계·예실대비·문서 간 수치 일관성 검사; **이슈 있을 때만** 화면에 알림
 
 ## 프로젝트 구조
 
+> **구조 스터디:** [SW 구조](../.cursor/projects/home-eunbi/canvases/hwp-analyser-architecture.canvas.tsx)  
+
 ```
 HWP analysis/
-├── app.py                      # Streamlit 실행
+├── app.py                      # Streamlit 진입점
 ├── requirements.txt
-├── hwpilot/                    # Node CLI — .hwp 읽기·변환·편집 (dist/ 번들 또는 npm)
+├── hwpilot/                    # Node CLI — .hwp 읽기·변환·편집
 │
-├── hwp_core/                   # 핵심 로직
-│   ├── hwp_parser.py           # HWP/HWPX 파싱
-│   ├── hwp_backends.py         # hwpilot / pyhwp / LibreOffice / olefile
-│   ├── table_extractor.py      # 표·숫자 구조화 + 표 그리드·병합셀
-│   ├── qa_engine.py            # 2-Stage LLM 질의응답
-│   ├── llm_client.py           # Ollama 연결·일반 질문
-│   ├── hwpx_editor.py          # HWPX 편집, pending/applied diff
-│   ├── fact_extractor.py       # 표·본문 Fact 추출
-│   ├── consistency_checker.py  # 합계·교차 일관성 검사
-│   └── intel_pipeline.py       # 문서/워크스페이스 intel 조립
+├── hwp_core/
+│   ├── ontology/
+│   │   └── budget_concepts.yaml   # 예산 도메인 개념 사전 (동의어·패턴)
+│   ├── concept_resolver.py        # 라벨 → concept_id (semantic grounding)
+│   ├── hwp_parser.py              # HWP/HWPX 파싱
+│   ├── hwp_backends.py            # hwpilot / pyhwp / LibreOffice / olefile
+│   ├── table_extractor.py         # 표·숫자 구조화
+│   ├── fact_extractor.py          # Fact 추출 (concept + value + source)
+│   ├── consistency_checker.py     # 규칙 기반 일관성 검증
+│   ├── intel_pipeline.py          # intel 파이프라인 조립
+│   ├── qa_engine.py               # 2-Stage LLM Q&A
+│   ├── llm_client.py              # Ollama 연결
+│   └── hwpx_editor.py             # HWPX 편집
 │
-├── ui/                         # Streamlit UI
-│   ├── document_workspace.py   # HWP/HWPX/Excel 통합 분할 UI
-│   ├── document_preview.py     # HTML 미리보기·diff
-│   ├── command_router.py       # 채팅 의도 분류·편집 실행
-│   ├── canvas_editor.py        # 직접 편집·HWPX 다운로드
-│   ├── intel_panel.py          # 자동 검토 패널
-│   └── session_store.py        # 세션·편집 상태
+├── ui/
+│   ├── document_workspace.py      # HWP/HWPX/Excel 통합 분할 UI
+│   ├── document_preview.py        # HTML 미리보기·diff
+│   ├── command_router.py          # 채팅 의도 분류·편집 실행
+│   ├── canvas_editor.py           # 직접 편집
+│   └── session_store.py           # 세션·편집 상태
 │
-├── additional/
-│   ├── ai_editor.py            # LLM 빈칸/초안/리라이트
-│   └── reference_parser.py     # Excel·PDF·DOCX 등 파싱 + 참고자료
-└── 
+└── additional/
+    ├── ai_editor.py               # LLM 빈칸/초안/리라이트
+    └── reference_parser.py        # Excel·PDF·DOCX 등 파싱
+```
 ```
 
 ## 설치 및 실행
@@ -70,17 +75,16 @@ streamlit run app.py #실행
 └──────┬──────────────────┬────────────────────┬────────────────────┬─────────────────┘
        │                  │                    │                    │
 ┌──────▼─────────┐ ┌──────▼──────────┐ ┌─────▼────────────┐ ┌────▼──────────────┐
-│ 파싱            │ │ table_extractor │ │ intel_pipeline   │ │ qa_engine         │
+│ 파싱            │ │ table_extractor │ │ intel_pipeline   │ │ qa_engine        │
 │                │ │                 │ │                  │ │                   │
 │ Excel:         │ │ rows→DataFrame  │ │ fact_extractor   │ │ Stage 1: gemma3:4b│
 │  reference_    │ │ NumberInfo 탐지 │ │ consistency_     │ │  의도·엔티티 추출  │
-│  parser        │─▶│ TableSummary    │─▶│ checker          │─▶│ Pre-compute /    │
+│  parser        │─▶│ TableSummary  │─▶│ checker         │─▶│ Pre-compute /  │
 │ HWPX: ZIP→XML  │ │                 │ │ → intel_panel    │ │  Rule-based       │
 │ HWP: hwpilot   │ │                 │ │  (이슈 시만 UI)  │ │ Stage 2: gemma4   │
 │  fallback chain│ │                 │ │                  │ │  (스트리밍)       │
 └────────────────┘ └─────────────────┘ └──────────────────┘ └───────────────────┘
 ```
-
 ```mermaid
 flowchart LR
     subgraph Input
@@ -118,7 +122,8 @@ flowchart LR
         NB[detect_numbers_in_tables]
     end
 
-    subgraph Intel["자동 검토"]
+    subgraph Intel["지능 서비스 (1단계)"]
+        CR[concept_resolver<br/>ontology YAML]
         FE[fact_extractor]
         CC[consistency_checker]
         IP[intel_pipeline]
@@ -126,7 +131,7 @@ flowchart LR
 
     subgraph Output["Session"]
         C["doc_payload<br/>tables · numbers · intel"]
-        QA[qa_engine 2-Stage]
+        QA[qa_engine]
     end
 
     B --> EXT
@@ -142,11 +147,17 @@ flowchart LR
     F3 -->|fail| F4
     F4 -->|fail| F5
     F5 --> Enrich
-    Enrich --> Intel
-    FE --> CC --> IP
-    Intel --> C
+    Enrich --> CR
+    CR --> FE --> CC --> IP
+    IP --> C
     C --> QA
 ```
+
+### 지능 서비스 (1단계)
+
+업로드된 문서에서 표·본문의 라벨을 예산 도메인 **ontology**(`budget_concepts.yaml`)와 매칭해 **concept_id**로 연결(`ConceptResolver`). 
+매칭된 결과는 **Fact**(개념 + 값 + 단위 + 출처)로 정리되고, `consistency_checker`가 표 합계·계획/실행·문서 간 수치 등을 **규칙 기반**으로 검증. 
+숫자 판단과 계산은 코드가 담당하고, LLM은 Q&A·설명에 사용합니다. 검토 이슈가 있을 때만 화면에 알림. 
 
 0702 ver.
 <img width="1838" height="797" alt="image" src="https://github.com/user-attachments/assets/945bea83-4f5a-42b8-9e66-e586ed982fa7" />
