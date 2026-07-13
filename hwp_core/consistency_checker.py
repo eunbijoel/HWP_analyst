@@ -13,6 +13,7 @@ from typing import Optional
 
 from .fact_extractor import Fact, TOTAL_BUDGET_LABELS
 from .concept_resolver import MIN_GROUNDING_CONFIDENCE, get_concept_resolver
+from .rule_registry import get_rule, rule_enabled
 from .table_extractor import (
   TableSummary,
   TOTAL_KEYWORDS,
@@ -33,14 +34,32 @@ class Issue:
   difference: Optional[float] = None
   source: str = ""
   document_id: str = ""
+  table_index: Optional[int] = None  # 0-based
+  row_index: Optional[int] = None    # 0-based (DataFrame / 표 데이터 행)
 
   @property
   def is_ok(self) -> bool:
     return self.severity == "info" and self.issue_type == "match"
 
 
-REL_TOL = 0.02  # 2% 허용 오차
-ABS_TOL = 1.0   # 반올림·단위 오차
+# YAML 없을 때 fallback (rule_registry 로드 실패 시)
+_FALLBACK_REL = 0.02
+_FALLBACK_ABS = 1.0
+
+
+def _tol(rule_id: str) -> tuple[float, float]:
+  try:
+    cfg = get_rule(rule_id)
+    return float(cfg.get("rel_tol", _FALLBACK_REL)), float(cfg.get("abs_tol", _FALLBACK_ABS))
+  except Exception:
+    return _FALLBACK_REL, _FALLBACK_ABS
+
+
+def _severity(rule_id: str, key: str = "severity", default: str = "warning") -> str:
+  try:
+    return str(get_rule(rule_id).get(key) or default)
+  except Exception:
+    return default
 
 
 def _is_total_label(text: str) -> bool:
@@ -81,14 +100,21 @@ def _year_columns(df, ts: TableSummary) -> list:
   ]
 
 
-def _values_close(a: float, b: float, rel: float = REL_TOL) -> bool:
+def _values_close(
+  a: float,
+  b: float,
+  rel: float | None = None,
+  abs_tol: float | None = None,
+) -> bool:
   if a is None or b is None:
     return False
+  r = _FALLBACK_REL if rel is None else rel
+  at = _FALLBACK_ABS if abs_tol is None else abs_tol
   diff = abs(a - b)
-  if diff <= ABS_TOL:
+  if diff <= at:
     return True
   denom = max(abs(a), abs(b), 1.0)
-  return diff / denom <= rel
+  return diff / denom <= r
 
 
 def _format_num(n: float, unit: str = "") -> str:
@@ -104,6 +130,10 @@ def _format_num(n: float, unit: str = "") -> str:
 
 def check_table_row_totals(ts: TableSummary, document_id: str = "") -> list[Issue]:
   """각 행: 연도(숫자)열 합 vs 합계열 비교."""
+  if not rule_enabled("row_sum"):
+    return []
+  rel, abs_tol = _tol("row_sum")
+  sev = _severity("row_sum")
   issues: list[Issue] = []
   if ts.dataframe is None or ts.dataframe.empty:
     return issues
@@ -138,7 +168,7 @@ def check_table_row_totals(ts: TableSummary, document_id: str = "") -> list[Issu
       reported = _parse_cell(str(df.at[row_idx, tkey]))
       if reported is None:
         continue
-      if _values_close(calculated, reported):
+      if _values_close(calculated, reported, rel=rel, abs_tol=abs_tol):
         continue
 
       first_key = df.columns[0]
@@ -149,8 +179,7 @@ def check_table_row_totals(ts: TableSummary, document_id: str = "") -> list[Issu
       tcol_s = str(tkey)
       issues.append(Issue(
         issue_type="row_sum_mismatch",
-        severity="warning",
-        message=(
+        severity=sev,        message=(
           f"표 {table_no} '{row_name}' 행: "
           f"연도별 합({calculated:,.0f}) ≠ '{tcol_s}'({reported:,.0f})"
           + (f" [단위: {unit}]" if unit else "")
@@ -160,6 +189,8 @@ def check_table_row_totals(ts: TableSummary, document_id: str = "") -> list[Issu
         difference=reported - calculated,
         source=f"표 {table_no}, {row_idx + 1}행, '{tcol_s}' 열",
         document_id=doc,
+        table_index=ts.index,
+        row_index=row_idx,
       ))
 
   return issues
@@ -206,6 +237,10 @@ def _row_name(df, row_idx: int) -> str:
 
 def check_table_total_row(ts: TableSummary, document_id: str = "") -> list[Issue]:
   """합계 행 vs 데이터 행 열 합 비교."""
+  if not rule_enabled("column_total"):
+    return []
+  rel, abs_tol = _tol("column_total")
+  sev = _severity("column_total")
   issues: list[Issue] = []
   if ts.dataframe is None or not ts.has_total_row or ts.total_row_index < 0:
     return issues
@@ -228,13 +263,13 @@ def check_table_total_row(ts: TableSummary, document_id: str = "") -> list[Issue
     reported = _parse_cell(str(df.at[total_idx, key]))
     if calculated is None or reported is None:
       continue
-    if _values_close(calculated, reported):
+    if _values_close(calculated, reported, rel=rel, abs_tol=abs_tol):
       continue
 
     col_s = str(key)
     issues.append(Issue(
       issue_type="column_total_mismatch",
-      severity="warning",
+      severity=sev,
       message=(
         f"표 {table_no} '{col_s}' 열: "
         f"세부 합({calculated:,.0f}) ≠ 합계행({reported:,.0f})"
@@ -245,6 +280,8 @@ def check_table_total_row(ts: TableSummary, document_id: str = "") -> list[Issue
       difference=reported - calculated,
       source=f"표 {table_no}, 합계행, '{col_s}' 열",
       document_id=doc,
+      table_index=ts.index,
+      row_index=total_idx,
     ))
 
   return issues
@@ -252,6 +289,19 @@ def check_table_total_row(ts: TableSummary, document_id: str = "") -> list[Issue
 
 def check_planned_vs_actual(ts: TableSummary, document_id: str = "") -> list[Issue]:
   """예실대비: 계획 vs 실행 열, 증감 열 검증."""
+  if not rule_enabled("planned_vs_actual"):
+    return []
+  try:
+    cfg = get_rule("planned_vs_actual")
+  except KeyError:
+    cfg = {}
+  rel, abs_tol = _tol("planned_vs_actual")
+  planned_id = str(cfg.get("planned_concept") or "planned_amount")
+  actual_id = str(cfg.get("actual_concept") or "actual_amount")
+  variance_id = str(cfg.get("variance_concept") or "variance")
+  var_sev = str(cfg.get("variance_severity") or "warning")
+  over_sev = str(cfg.get("overrun_severity") or "info")
+
   issues: list[Issue] = []
   if ts.dataframe is None or ts.dataframe.empty:
     return issues
@@ -261,9 +311,9 @@ def check_planned_vs_actual(ts: TableSummary, document_id: str = "") -> list[Iss
   table_no = ts.index + 1
   unit = ts.unit or ""
 
-  planned_cols = [c for c in df.columns if _column_concept_id(str(c)) == "planned_amount"]
-  actual_cols = [c for c in df.columns if _column_concept_id(str(c)) == "actual_amount"]
-  variance_cols = [c for c in df.columns if _column_concept_id(str(c)) == "variance"]
+  planned_cols = [c for c in df.columns if _column_concept_id(str(c)) == planned_id]
+  actual_cols = [c for c in df.columns if _column_concept_id(str(c)) == actual_id]
+  variance_cols = [c for c in df.columns if _column_concept_id(str(c)) == variance_id]
 
   if not planned_cols or not actual_cols:
     return issues
@@ -286,10 +336,12 @@ def check_planned_vs_actual(ts: TableSummary, document_id: str = "") -> list[Iss
     if vcol:
       reported_var = _parse_cell(str(df.at[row_idx, vcol]))
       calc_var = actual - planned
-      if reported_var is not None and not _values_close(reported_var, calc_var):
+      if reported_var is not None and not _values_close(
+        reported_var, calc_var, rel=rel, abs_tol=abs_tol,
+      ):
         issues.append(Issue(
           issue_type="variance_mismatch",
-          severity="warning",
+          severity=var_sev,
           message=(
             f"표 {table_no} '{row_name}': "
             f"증감({reported_var:,.0f}) ≠ 실행-계획({calc_var:,.0f})"
@@ -300,14 +352,16 @@ def check_planned_vs_actual(ts: TableSummary, document_id: str = "") -> list[Iss
           difference=reported_var - calc_var,
           source=f"표 {table_no}, {row_idx + 1}행, '{vcol}' 열",
           document_id=doc,
+          table_index=ts.index,
+          row_index=row_idx,
         ))
 
-    if actual > planned and not _values_close(actual, planned):
+    if actual > planned and not _values_close(actual, planned, rel=rel, abs_tol=abs_tol):
       overrun = actual - planned
-      if overrun / max(abs(planned), 1.0) > REL_TOL:
+      if overrun / max(abs(planned), 1.0) > rel:
         issues.append(Issue(
           issue_type="execution_overrun",
-          severity="info",
+          severity=over_sev,
           message=(
             f"표 {table_no} '{row_name}': "
             f"실행({actual:,.0f}) > 계획({planned:,.0f}), 초과 {overrun:,.0f}"
@@ -318,6 +372,8 @@ def check_planned_vs_actual(ts: TableSummary, document_id: str = "") -> list[Iss
           difference=overrun,
           source=f"표 {table_no}, {row_idx + 1}행, '{pcol}'↔'{acol}'",
           document_id=doc,
+          table_index=ts.index,
+          row_index=row_idx,
         ))
 
   return issues
@@ -350,19 +406,32 @@ def check_body_vs_table(
   tables: list[TableSummary],
   document_id: str = "",
 ) -> list[Issue]:
-  """본문 총사업비류 vs 표 동일 개념 비교."""
+  """본문 vs 표 동일 개념 비교 (concept는 rules YAML)."""
+  if not rule_enabled("body_vs_table"):
+    return []
+  try:
+    cfg = get_rule("body_vs_table")
+  except KeyError:
+    cfg = {}
+  concept = str(cfg.get("concept") or "total_budget")
+  sev = str(cfg.get("severity") or "warning")
+  rel, abs_tol = _tol("body_vs_table")
   issues: list[Issue] = []
 
   body_facts = [
     f for f in facts
     if f.source_type == "paragraph"
-    and _fact_has_concept(f, "total_budget")
+    and _fact_has_concept(f, concept)
   ]
   table_facts = [
     f for f in facts
     if f.source_type == "table"
-    and _fact_has_concept(f, "total_budget")
-    and (_is_total_label(f.raw_label.split("(")[0].strip()) or TOTAL_BUDGET_LABELS.search(f.raw_label))
+    and _fact_has_concept(f, concept)
+    and (
+      concept != "total_budget"
+      or _is_total_label(f.raw_label.split("(")[0].strip())
+      or TOTAL_BUDGET_LABELS.search(f.raw_label)
+    )
   ]
 
   if not body_facts or not table_facts:
@@ -378,11 +447,11 @@ def check_body_vs_table(
       t_val = _won_value(tf, mult_by_table.get(tf.table_index, 1.0))
       if t_val is None:
         continue
-      if _values_close(b_val, t_val):
+      if _values_close(b_val, t_val, rel=rel, abs_tol=abs_tol):
         continue
       issues.append(Issue(
         issue_type="body_table_mismatch",
-        severity="warning",
+        severity=sev,
         message=(
           f"본문 '{bf.raw_label}'({bf.display_value}) vs "
           f"표 {tf.table_index + 1}({tf.display_value}): 금액 불일치"
@@ -392,6 +461,8 @@ def check_body_vs_table(
         difference=t_val - b_val,
         source=f"본문 ↔ 표 {tf.table_index + 1}, {tf.row + 1}행",
         document_id=document_id or bf.document_id,
+        table_index=tf.table_index,
+        row_index=tf.row,
       ))
       break
 

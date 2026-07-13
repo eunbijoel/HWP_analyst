@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from .fact_extractor import Fact, extract_facts, grounding_stats_for_facts, TOTAL_BUDGET_LABELS
 from .consistency_checker import Issue, check_consistency
 from .concept_resolver import MIN_GROUNDING_CONFIDENCE, GroundingOptions
+from .rule_registry import get_rule, rule_enabled
 
 
 @dataclass
@@ -134,12 +135,26 @@ def build_workspace_intelligence(
     per_doc.append(intel)
 
   total_budgets: list[tuple[str, float, str]] = []
+  if not rule_enabled("cross_doc"):
+    return WorkspaceIntel(per_document=per_doc, cross_issues=cross)
+
+  try:
+    cfg = get_rule("cross_doc")
+  except KeyError:
+    cfg = {}
+  concept = str(cfg.get("concept") or "total_budget")
+  sev = str(cfg.get("severity") or "warning")
+  rel = float(cfg.get("rel_tol", 0.02))
+  abs_tol = float(cfg.get("abs_tol", 1.0))
+
   for intel in per_doc:
     for f in intel.facts:
-      if f.concept != "total_budget":
+      if f.concept != concept:
         continue
       conf = getattr(f, "concept_confidence", 0.0) or 0.0
-      if conf < MIN_GROUNDING_CONFIDENCE and not TOTAL_BUDGET_LABELS.search(f.raw_label):
+      if conf < MIN_GROUNDING_CONFIDENCE and not (
+        concept == "total_budget" and TOTAL_BUDGET_LABELS.search(f.raw_label)
+      ):
         continue
       won = f.value_in_won
       if f.source_type == "table":
@@ -153,13 +168,16 @@ def build_workspace_intelligence(
   if len(total_budgets) >= 2:
     base_doc, base_val, base_src = total_budgets[0]
     for other_doc, other_val, other_src in total_budgets[1:]:
-      if abs(base_val - other_val) <= max(abs(base_val), abs(other_val), 1.0) * 0.02:
+      diff = abs(base_val - other_val)
+      if diff <= abs_tol:
+        continue
+      if diff / max(abs(base_val), abs(other_val), 1.0) <= rel:
         continue
       cross.append(Issue(
         issue_type="cross_doc_mismatch",
-        severity="warning",
+        severity=sev,
         message=(
-          f"문서 간 총사업비 불일치: {base_doc} vs {other_doc}"
+          f"문서 간 {concept} 불일치: {base_doc} vs {other_doc}"
         ),
         expected=base_val,
         actual=other_val,

@@ -137,10 +137,15 @@ def render_excel_split_editor(
   render_scrollable_pane: Callable,
 ):
   """Excel — HWPX와 동일한 보기 방식 토글 + 표 직접 편집."""
+  from ui.issue_panel import get_jump_for
+
   tables = doc_payload.get("tables", [])
   doc = doc_payload.get("doc")
   paragraphs = doc_payload.get("paragraphs", [])
   tables_raw = [t.get("rows", []) for t in getattr(doc, "tables_raw", [])]
+  jump = get_jump_for(fname)
+  jump_t = jump.get("table_index") if jump else None
+  jump_r = jump.get("row_index") if jump else None
 
   view_mode = st.radio(
     "보기 방식",
@@ -150,21 +155,48 @@ def render_excel_split_editor(
   )
 
   st.markdown(f"### 📄 {fname}")
+  if jump:
+    st.info(
+      f"검토 이슈 위치 · {jump.get('source') or '표/행'}"
+      + (f" — {jump.get('message')}" if jump.get("message") else "")
+    )
 
   if view_mode == VIEW_PREVIEW:
     st.caption("문서 미리보기")
-    preview_html = build_preview_from_text(paragraphs, tables_raw, filename=fname)
+    preview_html = build_preview_from_text(
+      paragraphs, tables_raw, filename=fname,
+      highlight_table=jump_t, highlight_row=jump_r,
+    )
     render_scrollable_doc_preview(preview_html, iframe_height=iframe_height)
   else:
     st.caption("표 셀을 직접 수정할 수 있습니다. 수정 후 다른 셀을 클릭하거나 Tab으로 편집을 확정하세요.")
     with render_scrollable_pane(height=doc_pane_height):
       if not tables:
         st.info("편집할 표가 없습니다.")
-      for idx, ts in enumerate(tables):
+      # 점프 대상 표를 먼저 보여 스크롤 부담 감소
+      order = list(range(len(tables)))
+      if jump_t is not None and 0 <= jump_t < len(tables):
+        order = [jump_t] + [i for i in order if i != jump_t]
+      for idx in order:
+        ts = tables[idx]
         base_df = ts.dataframe.copy() if ts.dataframe is not None else pd.DataFrame()
         if base_df.empty:
           continue
-        st.markdown(f"**표 {idx + 1}**")
+        title = f"**표 {idx + 1}**"
+        if jump_t == idx:
+          title += " · 이슈 위치"
+        st.markdown(title)
+        if jump_t == idx and jump_r is not None and 0 <= jump_r < len(base_df):
+          def _hl(row, _r=jump_r):
+            if row.name == base_df.index[_r]:
+              return ["background-color: #fff3cd"] * len(row)
+            return [""] * len(row)
+          st.dataframe(
+            base_df.style.apply(_hl, axis=1),
+            use_container_width=True,
+            hide_index=True,
+          )
+          st.caption(f"하이라이트: {jump_r + 1}행 (아래 편집기에서 수정)")
         widget_key = _excel_widget_key(fname, idx)
         edited_df = st.data_editor(
           base_df,
@@ -200,10 +232,18 @@ def render_generic_split_editor(
   render_scrollable_pane: Callable,
 ):
   """기타 읽기 전용 문서 — 동일 토글 UI."""
+  from ui.issue_panel import get_jump_for
+
   doc = doc_payload.get("doc")
   paragraphs = doc_payload.get("paragraphs", [])
   tables_raw = [t.get("rows", []) for t in getattr(doc, "tables_raw", [])]
-  preview_html = build_preview_from_text(paragraphs, tables_raw, filename=fname)
+  jump = get_jump_for(fname)
+  jump_t = jump.get("table_index") if jump else None
+  jump_r = jump.get("row_index") if jump else None
+  preview_html = build_preview_from_text(
+    paragraphs, tables_raw, filename=fname,
+    highlight_table=jump_t, highlight_row=jump_r,
+  )
 
   view_mode = st.radio(
     "보기 방식",
@@ -212,6 +252,8 @@ def render_generic_split_editor(
     key=f"doc_view_gen_{fname}",
   )
   st.markdown(f"### 📄 {fname}")
+  if jump:
+    st.info(f"검토 이슈 위치 · {jump.get('source') or '표/행'}")
 
   if view_mode == VIEW_PREVIEW:
     render_scrollable_doc_preview(preview_html, iframe_height=iframe_height)
@@ -219,16 +261,29 @@ def render_generic_split_editor(
     with render_scrollable_pane():
       tables = doc_payload.get("tables", [])
       if tables:
-        for idx, ts in enumerate(tables):
+        order = list(range(len(tables)))
+        if jump_t is not None and 0 <= jump_t < len(tables):
+          order = [jump_t] + [i for i in order if i != jump_t]
+        for idx in order:
+          ts = tables[idx]
           if ts.dataframe is not None and not ts.dataframe.empty:
-            st.markdown(f"**표 {idx + 1}**")
-            st.data_editor(
-              ts.dataframe,
-              key=f"gen_tbl_{fname}_{idx}",
-              use_container_width=True,
-              disabled=True,
-              hide_index=True,
-            )
+            label = f"**표 {idx + 1}**" + (" · 이슈 위치" if jump_t == idx else "")
+            st.markdown(label)
+            df = ts.dataframe
+            if jump_t == idx and jump_r is not None and 0 <= jump_r < len(df):
+              def _hl(row, _r=jump_r, _df=df):
+                if row.name == _df.index[_r]:
+                  return ["background-color: #fff3cd"] * len(row)
+                return [""] * len(row)
+              st.dataframe(df.style.apply(_hl, axis=1), use_container_width=True, hide_index=True)
+            else:
+              st.data_editor(
+                df,
+                key=f"gen_tbl_{fname}_{idx}",
+                use_container_width=True,
+                disabled=True,
+                hide_index=True,
+              )
       else:
         for i, p in enumerate(paragraphs):
           st.text_area(f"문단 {i + 1}", value=p, height=100, key=f"gen_para_{fname}_{i}", disabled=True)

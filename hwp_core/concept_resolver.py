@@ -248,19 +248,15 @@ class ConceptResolver:
   ) -> GroundingResult:
     raw = f"{label} {context}".strip() if context else str(label or "").strip()
     norm = normalize_label(label or "")
+    from .prompt_registry import render_prompt
+
     catalog = self.concept_catalog()
-    prompt = f"""다음 라벨이 예산서 ontology 중 어떤 concept_id에 해당하는지 분류하세요.
-해당 없으면 concept_id를 null로.
-
-라벨: {label}
-맥락: {context or '(없음)'}
-
-concept 목록:
-{json.dumps(catalog, ensure_ascii=False, indent=2)}
-
-JSON만 출력:
-{{"concept_id": "total_budget 또는 null", "confidence": 0.0~1.0, "reason": "한 줄"}}
-"""
+    prompt = render_prompt(
+      "grounding.classify_label",
+      label=label,
+      context=context or "(없음)",
+      catalog_json=json.dumps(catalog, ensure_ascii=False, indent=2),
+    )
     parsed, err = generate_json(
       prompt,
       options.model,
@@ -322,6 +318,12 @@ JSON만 출력:
 @lru_cache(maxsize=1)
 def get_concept_resolver() -> ConceptResolver:
   return ConceptResolver()
+
+
+def reload_concept_resolver() -> ConceptResolver:
+  """ontology YAML 변경 후 인덱스 재적재."""
+  get_concept_resolver.cache_clear()
+  return get_concept_resolver()
 
 
 def compute_grounding_stats(

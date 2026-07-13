@@ -144,12 +144,9 @@ def answer_general_question(
     use_streaming: bool,
 ) -> dict:
     """문서 근거형 QA 대신 일반 LLM 답변."""
-    prompt = f"""다음 질문에 한국어로 간결하고 실무적으로 답하세요.
-요청이 bullet point 형식이면 해당 형식으로 답하세요.
+    from .prompt_registry import render_prompt
 
-질문:
-{question}
-"""
+    prompt = render_prompt("general.answer", question=question)
     result = generate(
         prompt, model, ollama_url,
         stream=use_streaming,

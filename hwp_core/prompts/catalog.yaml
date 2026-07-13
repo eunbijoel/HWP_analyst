@@ -1,0 +1,33 @@
+# Prompt catalog — id → file + version
+# 판단·계산은 코드, 프롬프트는 버전된 파일로 관리
+
+prompts:
+  system.hwp_analyst:
+    path: system/hwp_analyst.v1.md
+    version: "1.0"
+    description: HWP 문서 분석 시스템 규칙
+
+  stage1.entity_extract:
+    path: stage1/entity_extract.v1.md
+    version: "1.0"
+    description: 의도·엔티티·지표 JSON 추출
+
+  stage2.answer:
+    path: stage2/answer.v1.md
+    version: "1.0"
+    description: 문서 근거형 최종 답변 (memory 슬롯 포함)
+
+  stage2.pandas_code:
+    path: stage2/pandas_code.v1.md
+    version: "1.0"
+    description: DataFrame 질의용 pandas 코드 생성
+
+  general.answer:
+    path: general/answer.v1.md
+    version: "1.0"
+    description: 문서 없는 일반 질의응답
+
+  grounding.classify_label:
+    path: grounding/classify_label.v1.md
+    version: "1.0"
+    description: 라벨 → ontology concept_id 분류

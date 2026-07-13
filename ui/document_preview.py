@@ -58,6 +58,15 @@ table.hwpx-tbl td, table.hwpx-tbl th {
 }
 table.hwpx-tbl th { background: #f0f0f0; font-weight: 600; }
 .cell-empty { background: #fafafa; color: #ccc; }
+tr.issue-row td, tr.issue-row th {
+    background: #fff3cd !important;
+    outline: 2px solid #ff9800;
+}
+.tbl-wrap.issue-table {
+    outline: 3px solid #ff5722;
+    border-radius: 4px;
+    box-shadow: 0 0 14px rgba(255, 152, 0, .45);
+}
 /* 대기 중 (AI 제안) */
 .ch-pending { background: #fff8e1; outline: 2px solid #ffc107; }
 /* 선택된 문단 (Canvas) */
@@ -482,6 +491,8 @@ def build_preview_from_text(
     tables: list[list[list[str]]],
     filename: str = '',
     applied_changes: list[dict] | None = None,
+    highlight_table: int | None = None,
+    highlight_row: int | None = None,
 ) -> str:
     applied_by_line: dict[int, dict] = {}
     for ch in applied_changes or []:
@@ -492,6 +503,7 @@ def build_preview_from_text(
     parts = [PREVIEW_CSS, '<div class="doc-preview"><div class="doc-page">']
     parts.append('<div class="legend">')
     parts.append('<span><i class="dot" style="background:#cc0000"></i> 적용된 수정 (한글과 동일)</span>')
+    parts.append('<span><i class="dot" style="background:#ff9800"></i> 검토 이슈 위치</span>')
     parts.append('</div>')
     if filename:
         parts.append(f'<div class="doc-title">📄 {_esc(filename)}</div>')
@@ -519,14 +531,39 @@ def build_preview_from_text(
     for t_idx, rows in enumerate(tables[:20]):
         if not rows:
             continue
-        parts.append(f'<div class="tbl-wrap"><div class="tbl-caption">표 {t_idx+1}</div>')
+        wrap_cls = 'tbl-wrap issue-table' if highlight_table == t_idx else 'tbl-wrap'
+        parts.append(
+            f'<div class="{wrap_cls}" id="table-{t_idx}">'
+            f'<div class="tbl-caption">표 {t_idx+1}</div>'
+        )
         parts.append('<table class="hwpx-tbl"><tbody>')
-        for r_idx, row in enumerate(rows[:30]):
+        for r_idx, row in enumerate(rows[:50]):
+            # raw 표: 0행=헤더인 경우가 많음 → dataframe row_index N ≈ raw N+1
+            highlight_raw = None
+            if highlight_table == t_idx and highlight_row is not None:
+                highlight_raw = highlight_row + 1 if len(rows) > 1 else highlight_row
+            tr_cls = ' class="issue-row"' if (
+                highlight_raw is not None and r_idx == highlight_raw
+            ) else ''
             tag = 'th' if r_idx == 0 else 'td'
-            parts.append('<tr>')
+            rid = f' id="issue-row-{t_idx}-{r_idx}"' if tr_cls else ''
+            parts.append(f'<tr{tr_cls}{rid}>')
             for cell in row:
                 parts.append(f'<{tag}>{_esc(cell)}</{tag}>')
             parts.append('</tr>')
         parts.append('</tbody></table></div>')
     parts.append('</div></div>')
+    if highlight_table is not None:
+        parts.append(
+            '<script>'
+            f'var t=document.getElementById("table-{highlight_table}");'
+            'if(t){t.scrollIntoView({behavior:"smooth",block:"center"});}'
+            + (
+                f'var r=document.getElementById("issue-row-{highlight_table}-'
+                f'{(highlight_row + 1) if highlight_row is not None else 0}");'
+                'if(r){r.scrollIntoView({behavior:"smooth",block:"center"});}'
+                if highlight_row is not None else ''
+            )
+            + '</script>'
+        )
     return '\n'.join(parts)

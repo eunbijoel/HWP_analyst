@@ -16,6 +16,7 @@ from .table_extractor import (
     compute_column_sum, find_max_value_in_table, filter_table_by_year,
 )
 from .llm_client import generate as _llm_generate, check_ollama_status
+from .prompt_registry import format_memory_section, render_prompt
 
 
 SUM_KEYWORDS = ['합계', '합산', '총합', '합', '더해', '합쳐', '총', '전체 합', '다 더', 'sum', '합을']
@@ -32,19 +33,6 @@ DATA_QUESTION = re.compile(
     r'표\s*\d|연구개발비|사업비|예산|매출|인건비|합계|소계|\d{4}\s*년',
     re.I,
 )
-
-
-SYSTEM_PROMPT = """당신은 한글(HWP) 문서 분석 전문가입니다.
-
-## 핵심 규칙:
-1. 반드시 제공된 문서 데이터에만 근거하여 답변하세요. 추측 금지.
-2. 표 읽기: 행 헤더(첫 번째~두 번째 열)와 열 헤더(첫 번째 행)의 교차점에서 값을 찾으세요.
-3. 단위 주의: [단위: 천원]이면 실제 금액 = 표 숫자 × 1,000원.
-4. 근거 표시: "표 N의 'A' 행, 'B' 열" 형태로 출처를 명시하세요.
-5. **사전 계산 결과가 제공되면 그 결과를 신뢰하고 활용하세요.** 사전 계산은 표 데이터를 프로그래밍으로 정확히 추출·계산한 것입니다.
-6. 계산이 필요하면 과정을 단계별로 보여주세요.
-7. 확실하지 않으면 "문서에서 명확히 확인되지 않음"이라고 표시하세요."""
-
 
 def _format_value_with_unit(raw_val: str, numeric_val: Optional[float], unit: str) -> str:
     """단위가 있으면 실제값을 병기. 예: '120,000 (천원 = 1억 2,000만원)'"""
@@ -237,13 +225,25 @@ class QAEngine:
                stream: bool = False, stage1_model: str = "gemma3:4b",
                history: list = None,
                run_stage1: bool | None = None,
-               benchmark: bool = False) -> dict:
-        """Rules-first pre-compute → 조건부 Stage1 → Stage2."""
+               benchmark: bool = False,
+               memory: str | None = None,
+               use_memory: bool = True) -> dict:
+        """Rules-first pre-compute → 조건부 Stage1 → Stage2.
+
+        memory: 장기 기억 텍스트. None이면 MemoryStore에서 질문 기준으로 조회.
+        use_memory=False 이면 주입 안 함.
+        """
         enable_stage1 = run_stage1 if run_stage1 is not None else use_llm
         t_start = time.time()
         history = history or []
         q = question.strip()
 
+        if use_memory and memory is None:
+            try:
+                from .memory_store import get_memory_store
+                memory = get_memory_store().format_for_prompt(q)
+            except Exception:
+                memory = ""
         rules_entities = self._find_entities_in_question(q)
         rules_metrics = self._find_metrics_in_question(q)
         target_years = self._years_from_question(q)
@@ -315,12 +315,12 @@ class QAEngine:
             if stream:
                 result = self._llm_answer_stream(
                     question, model, ollama_url, rule_result, pre_computed,
-                    history=history,
+                    history=history, memory=memory,
                 )
             else:
                 result = self._llm_answer(
                     question, model, ollama_url, rule_result, pre_computed,
-                    history=history,
+                    history=history, memory=memory,
                 )
             if chart_data:
                 result['chart_data'] = chart_data
@@ -397,23 +397,13 @@ class QAEngine:
             history_text = self._format_history(history)
             history_section = f"\n이전 대화:\n{history_text}\n"
 
-        prompt = f"""질문에서 엔티티와 지표를 추출하세요.
-
-규칙:
-- entities: 질문에 직접 언급된 기관명/회사명만. 반드시 아래 헤더 목록에 있는 이름만 사용.
-- metrics: 질문에 직접 언급된 지표만. 질문에 없는 지표는 절대 추가하지 마세요.
-- intent: 반드시 하나만 선택 (lookup, sum, max, filter, compare, summary 중 하나)
-- years: 질문에 명시된 연도 숫자만. "1년차"는 연도가 아닙니다.
-- 이전 대화에서 언급된 엔티티/지표가 현재 질문에서 생략("거기", "그것", "앞에서 말한")되었으면 이전 대화에서 찾아 포함하세요.
-
-헤더 목록: {header_names[:30]}
-지표 목록: {', '.join(metric_list)}
-{history_section}
-질문: {question}
-
-JSON만 출력:
-{{"intent": "lookup", "entities": [], "metrics": [], "years": []}}"""
-
+        prompt = render_prompt(
+            "stage1.entity_extract",
+            header_names=', '.join(header_names[:30]),
+            metric_list=', '.join(metric_list),
+            history_section=history_section,
+            question=question,
+        )
         try:
             llm_result = _llm_generate(
                 prompt, model, ollama_url,
@@ -561,27 +551,11 @@ JSON만 출력:
 
     def _generate_pandas_code(self, question: str, schema: str,
                               model: str, ollama_url: str) -> Optional[str]:
-        prompt = f"""당신은 pandas 전문가입니다. DataFrame에서 질문에 답하는 Python 코드를 작성하세요.
-
-## 사용 가능한 변수
-- tables: dict[int, pd.DataFrame]  (키는 표 번호, 0부터 시작)
-- pd: pandas 모듈
-
-## 규칙
-1. 결과를 반드시 `result` 변수에 문자열로 저장하세요.
-2. 행/열 이름으로 찾을 때는 str.contains()로 부분 매칭하세요.
-3. 숫자가 문자열이면: .str.replace(',','').astype(float) 로 변환하세요.
-4. 코드만 출력하세요. 설명이나 마크다운 블록(```)은 쓰지 마세요.
-5. 에러가 나지 않도록 .empty 체크, try/except를 사용하세요.
-
-## DataFrame 스키마
-{schema}
-
-## 질문
-{question}
-
-## Python 코드:
-"""
+        prompt = render_prompt(
+            "stage2.pandas_code",
+            schema=schema,
+            question=question,
+        )
         try:
             llm_result = _llm_generate(
                 prompt, model, ollama_url,
@@ -1385,7 +1359,8 @@ JSON만 출력:
     def _llm_answer(self, question: str, model: str, ollama_url: str,
                     rule_result: dict, pre_computed: str,
                     history: list = None,
-                    include_rule_hint: bool = True) -> dict:
+                    include_rule_hint: bool = True,
+                    memory: str | None = None) -> dict:
         context = self._build_context(question)
         rule_hint = rule_result.get('answer', '')
 
@@ -1402,17 +1377,16 @@ JSON만 출력:
             history_text = self._format_history(history)
             history_section = f"\n## 이전 대화 (맥락 참고용):\n{history_text}\n"
 
-        prompt = f"""{SYSTEM_PROMPT}
-
-## 문서에서 추출된 데이터:
-
-{context}
-{pre_section}{rule_section}{history_section}
-## 사용자 질문:
-{question}
-
-## 답변 (근거 표시 필수):"""
-
+        prompt = render_prompt(
+            "stage2.answer",
+            system_prompt=render_prompt("system.hwp_analyst"),
+            context=context,
+            pre_section=pre_section,
+            rule_section=rule_section,
+            history_section=history_section,
+            memory_section=format_memory_section(memory),
+            question=question,
+        )
         start_time = time.time()
 
         try:
@@ -1452,7 +1426,8 @@ JSON만 출력:
     def _llm_answer_stream(self, question: str, model: str, ollama_url: str,
                            rule_result: dict, pre_computed: str,
                            history: list = None,
-                           include_rule_hint: bool = True) -> dict:
+                           include_rule_hint: bool = True,
+                           memory: str | None = None) -> dict:
         context = self._build_context(question)
         rule_hint = rule_result.get('answer', '')
 
@@ -1469,17 +1444,16 @@ JSON만 출력:
             history_text = self._format_history(history)
             history_section = f"\n## 이전 대화 (맥락 참고용):\n{history_text}\n"
 
-        prompt = f"""{SYSTEM_PROMPT}
-
-## 문서에서 추출된 데이터:
-
-{context}
-{pre_section}{rule_section}{history_section}
-
-## 사용자 질문:
-{question}
-
-## 답변 (근거 표시 필수):"""
+        prompt = render_prompt(
+            "stage2.answer",
+            system_prompt=render_prompt("system.hwp_analyst"),
+            context=context,
+            pre_section=pre_section,
+            rule_section=rule_section,
+            history_section=history_section,
+            memory_section=format_memory_section(memory),
+            question=question,
+        )
 
         start_time = time.time()
 

@@ -1,0 +1,37 @@
+# 예산 문서 검증 규칙 (계산은 코드, 정책은 이 파일)
+version: 1
+domain: budget
+
+defaults:
+  rel_tol: 0.02
+  abs_tol: 1.0
+
+rules:
+  row_sum:
+    enabled: true
+    severity: warning
+
+  column_total:
+    enabled: true
+    severity: warning
+
+  planned_vs_actual:
+    enabled: true
+    planned_concept: planned_amount
+    actual_concept: actual_amount
+    variance_concept: variance
+    variance_severity: warning
+    overrun_severity: info
+    # 초과 비율이 rel_tol 넘을 때만 overrun issue
+
+  body_vs_table:
+    enabled: true
+    concept: total_budget
+    severity: warning
+
+  cross_doc:
+    enabled: true
+    concept: total_budget
+    severity: warning
+    rel_tol: 0.02
+    abs_tol: 1.0

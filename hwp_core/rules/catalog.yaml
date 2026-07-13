@@ -1,0 +1,26 @@
+# 규칙 카탈로그 — ontology / prompts 와 같은 패턴
+# enabled: false 인 규칙은 실행하지 않음
+
+version: 1
+domain: budget
+
+rules:
+  row_sum:
+    path: budget_checks.yaml
+    description: 행 연도열 합 vs 합계열
+
+  column_total:
+    path: budget_checks.yaml
+    description: 열 세부합 vs 합계행
+
+  planned_vs_actual:
+    path: budget_checks.yaml
+    description: 계획 vs 실행·증감
+
+  body_vs_table:
+    path: budget_checks.yaml
+    description: 본문 vs 표 (개념 교차)
+
+  cross_doc:
+    path: budget_checks.yaml
+    description: 문서 간 총액 교차
