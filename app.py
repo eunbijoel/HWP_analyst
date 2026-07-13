@@ -1,7 +1,9 @@
 """
-HWP 문서 분석기 - 2분할 inline AI 스타일 UI
-왼쪽: 문서 미리보기 (변경 색상 표시)  |  오른쪽: 채팅/명령
+HWP 문서 분석기
+왼쪽: 문서 미리보기 |  오른쪽: 채팅/명령
 """
+
+#환경 세팅
 
 import sys
 import os
@@ -38,6 +40,7 @@ from hwp_core.intel_pipeline import build_intelligence, build_workspace_intellig
 from ui.document_workspace import render_document_pane, render_excel_split_editor
 from ui.issue_panel import (
     FOCUS_DOC_KEY,
+    ISSUE_JUMP_KEY,
     pop_pending_chat,
     render_issue_alerts,
 )
@@ -1224,21 +1227,44 @@ if uploaded_files:
         col_doc, col_chat = st.columns([3, 2], gap="medium")
 
         with col_doc:
-            if n_files > 1:
-                st.selectbox("현재 문서", names, key=FOCUS_DOC_KEY)
-            focus_name = st.session_state[FOCUS_DOC_KEY]
-            entry = next(e for e in active_entries if e['filename'] == focus_name)
-            render_document_pane(
-                entry, active_documents,
-                model_name=model_name, ollama_url=ollama_url,
-                use_llm=use_llm, use_streaming=use_streaming,
-                stage1_model=stage1_model,
-                render_hwp_split_editor=render_hwp_split_editor,
-                render_split_editor=render_split_editor,
-                render_excel_split_editor_fn=render_excel_split_editor,
-                render_scrollable_doc_preview=render_scrollable_doc_preview,
-                render_scrollable_pane=render_scrollable_pane,
-            )
+            if n_files == 1:
+                render_document_pane(
+                    active_entries[0], active_documents,
+                    model_name=model_name, ollama_url=ollama_url,
+                    use_llm=use_llm, use_streaming=use_streaming,
+                    stage1_model=stage1_model,
+                    render_hwp_split_editor=render_hwp_split_editor,
+                    render_split_editor=render_split_editor,
+                    render_excel_split_editor_fn=render_excel_split_editor,
+                    render_scrollable_doc_preview=render_scrollable_doc_preview,
+                    render_scrollable_pane=render_scrollable_pane,
+                )
+            else:
+                # 점프 대상 파일을 맨 앞 탭으로 (이 위치로 클릭 시)
+                jump = st.session_state.get(ISSUE_JUMP_KEY) or {}
+                jump_name = jump.get("filename")
+                if jump_name in names:
+                    st.info(f"📌 검토 위치 → **{jump_name}** 탭")
+                    ordered = (
+                        [e for e in active_entries if e["filename"] == jump_name]
+                        + [e for e in active_entries if e["filename"] != jump_name]
+                    )
+                else:
+                    ordered = active_entries
+                tabs = st.tabs([e["filename"] for e in ordered])
+                for tab, entry in zip(tabs, ordered):
+                    with tab:
+                        render_document_pane(
+                            entry, active_documents,
+                            model_name=model_name, ollama_url=ollama_url,
+                            use_llm=use_llm, use_streaming=use_streaming,
+                            stage1_model=stage1_model,
+                            render_hwp_split_editor=render_hwp_split_editor,
+                            render_split_editor=render_split_editor,
+                            render_excel_split_editor_fn=render_excel_split_editor,
+                            render_scrollable_doc_preview=render_scrollable_doc_preview,
+                            render_scrollable_pane=render_scrollable_pane,
+                        )
 
         with col_chat:
             render_unified_chat_column(
