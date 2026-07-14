@@ -14,8 +14,8 @@ prompts:
 
   stage2.answer:
     path: stage2/answer.v1.md
-    version: "1.0"
-    description: 문서 근거형 최종 답변 (memory 슬롯 포함)
+    version: "1.1"
+    description: 문서 근거형 최종 답변 (memory·issue 슬롯 포함)
 
   stage2.pandas_code:
     path: stage2/pandas_code.v1.md

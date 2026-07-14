@@ -3,17 +3,53 @@ version: 1
 domain: budget
 
 defaults:
-  rel_tol: 0.02
-  abs_tol: 1.0
+  rel_tol: 0.02          # 상대 허용오차 (2%)
+  abs_tol: 1.0           # 절대 허용오차
+  min_confidence: 0.85   # grounding 이하면 개념 매칭 안 함
+
+# concept_id별 허용오차·신뢰도 (없으면 defaults / 규칙값)
+# 총액·국비는 엄격, 증감·세부항목은 표기 오차 여유
+concept_tol:
+  total_budget:
+    rel_tol: 0.01
+    abs_tol: 1.0
+    min_confidence: 0.85
+  government_contribution:
+    rel_tol: 0.01
+    abs_tol: 1.0
+  private_contribution:
+    rel_tol: 0.02
+    abs_tol: 1.0
+  local_contribution:
+    rel_tol: 0.02
+    abs_tol: 1.0
+  planned_amount:
+    rel_tol: 0.02
+    abs_tol: 1.0
+  actual_amount:
+    rel_tol: 0.02
+    abs_tol: 1.0
+  variance:
+    rel_tol: 0.05
+    abs_tol: 10.0
+    min_confidence: 0.80
+  annual_budget:
+    rel_tol: 0.02
+    abs_tol: 1.0
+  item_budget:
+    rel_tol: 0.03
+    abs_tol: 10.0
 
 rules:
   row_sum:
     enabled: true
     severity: warning
+    # 행 합은 개념 없이 구조 검증 → defaults
 
   column_total:
     enabled: true
     severity: warning
+    # 열 concept이 잡히면 해당 concept_tol 사용
 
   planned_vs_actual:
     enabled: true
@@ -22,7 +58,8 @@ rules:
     variance_concept: variance
     variance_severity: warning
     overrun_severity: info
-    # 초과 비율이 rel_tol 넘을 때만 overrun issue
+    # 증감 검증 → variance concept_tol
+    # 초과 판정 → actual/planned 중 더 엄격한 rel
 
   body_vs_table:
     enabled: true
@@ -33,5 +70,3 @@ rules:
     enabled: true
     concept: total_budget
     severity: warning
-    rel_tol: 0.02
-    abs_tol: 1.0

@@ -46,11 +46,11 @@ from ui.issue_panel import (
 )
 from ui.doc_work_panel import render_doc_fill_chat_result, run_doc_fill_from_chat
 from ui.review_home import render_review_home
-from ui.brand import PRODUCT_NAME, hero, inject_theme, next_hint
+from ui.brand import PRODUCT_NAME, LOGO_PATH, hero, inject_theme, next_hint, sidebar_brand
 
 st.set_page_config(
     page_title=PRODUCT_NAME,
-    page_icon="✦",
+    page_icon=str(LOGO_PATH) if LOGO_PATH.is_file() else "✦",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -898,7 +898,7 @@ def render_hwp_split_editor(
         st.session_state[chat_key] = []
 
     if show_chat:
-        col_doc, col_chat = st.columns([3, 2], gap="medium")
+        col_doc, col_chat = st.columns([5, 3], gap="medium")
     else:
         col_doc = st.container()
         col_chat = None
@@ -1041,7 +1041,7 @@ def render_split_editor(
     )
 
     if show_chat:
-        col_doc, col_chat = st.columns([3, 2], gap="medium")
+        col_doc, col_chat = st.columns([5, 3], gap="medium")
     else:
         col_doc = st.container()
         col_chat = None
@@ -1095,7 +1095,7 @@ def render_readonly_split(
     preview_html = build_preview_from_text(doc_data['paragraphs'], tables_raw, filename=fname)
 
     if show_chat:
-        col_doc, col_chat = st.columns([3, 2])
+        col_doc, col_chat = st.columns([5, 3])
     else:
         col_doc = st.container()
         col_chat = None
@@ -1196,8 +1196,7 @@ def render_sidebar_file_checkboxes(filenames: list[str]) -> list[str]:
 
 # --- 사이드바 ---
 with st.sidebar:
-    st.markdown(f"### {PRODUCT_NAME}")
-    st.caption("로컬 처리 · 원본 보존")
+    sidebar_brand()
     st.markdown("---")
     with st.expander("연결 · 모델", expanded=False):
         ollama_url = st.text_input("Ollama URL", value="http://localhost:11434", key="sidebar_ollama_url")
@@ -1317,7 +1316,7 @@ else:
             names = [e['filename'] for e in active_entries]
             if st.session_state.get(FOCUS_DOC_KEY) not in names:
                 st.session_state[FOCUS_DOC_KEY] = names[0]
-            col_doc, col_chat = st.columns([3, 2], gap="large")
+            col_doc, col_chat = st.columns([5, 3], gap="large")
             with col_doc:
                 if n_files == 1:
                     render_document_pane(

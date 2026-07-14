@@ -38,12 +38,34 @@ def resolve_issue_location(issue: Any) -> tuple[Optional[int], Optional[int]]:
   return table_index, row_index
 
 
+def _issue_payload(issue: Any) -> dict:
+  """session_state용 직렬화 가능한 Issue 페이로드."""
+  if hasattr(issue, "to_context_dict"):
+    return issue.to_context_dict()
+  return {
+    "rule_id": getattr(issue, "issue_type", None) or getattr(issue, "rule_id", ""),
+    "issue_type": getattr(issue, "issue_type", ""),
+    "severity": getattr(issue, "severity", ""),
+    "message": getattr(issue, "message", "") or "",
+    "expected": getattr(issue, "expected", None),
+    "actual": getattr(issue, "actual", None),
+    "difference": getattr(issue, "difference", None),
+    "source": getattr(issue, "source", "") or "",
+    "document_id": getattr(issue, "document_id", "") or "",
+    "table_index": getattr(issue, "table_index", None),
+    "row_index": getattr(issue, "row_index", None),
+  }
+
+
 def build_explain_question(filename: str, issue: Any) -> str:
+  """채팅에 보일 짧은 질문. 숫자·판정은 issues 페이로드가 권위."""
   loc = issue.source or "(위치 미상)"
+  rule = getattr(issue, "issue_type", "") or ""
   return (
     f"다음 검토 이슈를 설명해 주세요. "
     f"숫자는 고치지 말고, 왜 발생했는지와 표에서 확인할 칸·수정 시 체크리스트만 알려 주세요.\n\n"
     f"파일: {filename}\n"
+    f"규칙: {rule}\n"
     f"이슈: {issue.message}\n"
     f"위치: {loc}"
   )
@@ -65,8 +87,7 @@ def jump_to_issue(filename: str, issue: Any) -> None:
   st.session_state[view_key] = VIEW_DIRECT
   # 일반 미리보기 파일도 직접 편집 쪽으로
   gen_key = f"doc_view_gen_{filename}"
-  if gen_key in st.session_state or True:
-    st.session_state[gen_key] = VIEW_DIRECT
+  st.session_state[gen_key] = VIEW_DIRECT
 
 
 def queue_issue_chat(filename: str, issue: Any) -> None:
@@ -74,15 +95,24 @@ def queue_issue_chat(filename: str, issue: Any) -> None:
   st.session_state[PENDING_CHAT_KEY] = {
     "filename": filename,
     "question": build_explain_question(filename, issue),
+    "issue": _issue_payload(issue),
   }
 
 
-def pop_pending_chat(filename: str) -> Optional[str]:
+def pop_pending_chat(filename: str) -> Optional[dict]:
+  """대기 중인 이슈 채팅 페이로드를 꺼내 반환. {filename, question, issue?}."""
   pending = st.session_state.get(PENDING_CHAT_KEY)
   if not pending or pending.get("filename") != filename:
     return None
   del st.session_state[PENDING_CHAT_KEY]
-  return pending.get("question") or None
+  return pending
+
+
+def peek_pending_chat(filename: str) -> Optional[dict]:
+  pending = st.session_state.get(PENDING_CHAT_KEY)
+  if not pending or pending.get("filename") != filename:
+    return None
+  return pending
 
 
 def get_jump_for(filename: str) -> Optional[dict]:
@@ -101,7 +131,7 @@ def clear_jump_if(filename: str) -> None:
 
 
 def render_issue_alerts(file_entries: list[dict], max_per_file: int = 5) -> None:
-  """파일별 이슈 카드: [이 위치로] [채팅으로 설명]."""
+  """파일별 이슈 카드 — 사람 말 버튼."""
   any_issue = False
   for entry in file_entries:
     fname = entry["filename"]
@@ -112,16 +142,18 @@ def render_issue_alerts(file_entries: list[dict], max_per_file: int = 5) -> None
       any_issue = True
       uid = _issue_uid(fname, issue, idx)
       with st.container(border=True):
-        st.markdown(f"**{fname}** — {issue.message}")
+        st.markdown(f"**{issue.message}**")
+        bit = fname
         if issue.source:
-          st.caption(f"📍 {issue.source}")
+          bit += f" · {issue.source}"
+        st.caption(bit)
         c1, c2 = st.columns(2)
         with c1:
-          if st.button("이 위치로", key=f"jump_{uid}", use_container_width=True):
+          if st.button("문서로 이동", key=f"jump_{uid}", use_container_width=True):
             jump_to_issue(fname, issue)
             st.rerun()
         with c2:
-          if st.button("채팅으로 설명", key=f"chat_{uid}", use_container_width=True):
+          if st.button("AI에게 물어보기", key=f"chat_{uid}", use_container_width=True):
             queue_issue_chat(fname, issue)
             st.rerun()
   if not any_issue:

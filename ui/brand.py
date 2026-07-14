@@ -2,10 +2,27 @@
 
 from __future__ import annotations
 
+import base64
+from pathlib import Path
+
 import streamlit as st
 
 PRODUCT_NAME = "HWP Analyst"
 PRODUCT_TAGLINE = ""
+LOGO_PATH = Path(__file__).resolve().parent / "logo.png"
+
+_logo_data_uri_cache: str | None = None
+
+
+def _logo_data_uri() -> str:
+  global _logo_data_uri_cache
+  if _logo_data_uri_cache is None:
+    if LOGO_PATH.is_file():
+      encoded = base64.b64encode(LOGO_PATH.read_bytes()).decode("ascii")
+      _logo_data_uri_cache = f"data:image/png;base64,{encoded}"
+    else:
+      _logo_data_uri_cache = ""
+  return _logo_data_uri_cache
 
 
 APP_CSS = """
@@ -41,24 +58,33 @@ html, body, [class*="css"] {
     var(--bg) !important;
 }
 
-/* Hide Streamlit chrome noise */
+/* Hide Streamlit chrome noise — 사이드바 토글(stToolbar)은 유지 */
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header[data-testid="stHeader"] {background: transparent;}
-[data-testid="stToolbar"] {display: none;}
 
-.block-container {
+/* 메인 콘텐츠만 wide — 사이드바 폭은 Streamlit 기본 유지 */
+section.main .block-container,
+[data-testid="stMainBlockContainer"] {
   padding-top: 1.4rem !important;
   padding-bottom: 4rem !important;
-  max-width: 1180px !important;
+  max-width: 100% !important;
+  padding-left: clamp(1rem, 2vw, 2.5rem) !important;
+  padding-right: clamp(1rem, 2vw, 2.5rem) !important;
+}
+
+[data-testid="stAppViewContainer"] > section.main > div {
+  max-width: 100%;
 }
 
 [data-testid="stSidebar"] {
   background: #faf9f7 !important;
   border-right: 1px solid var(--line);
+  min-width: 16rem;
 }
 [data-testid="stSidebar"] .block-container {
   padding-top: 1.5rem !important;
+  max-width: 21rem !important;
 }
 
 .hx-hero {
@@ -75,6 +101,17 @@ header[data-testid="stHeader"] {background: transparent;}
   letter-spacing: -0.03em;
   margin: 0 0 .35rem 0;
   color: var(--ink);
+}
+.hx-hero-row {
+  display: flex;
+  align-items: center;
+  gap: 1.35rem;
+}
+.hx-hero-logo {
+  height: 9rem;
+  width: auto;
+  flex-shrink: 0;
+  display: block;
 }
 .hx-hero p {
   margin: 0;
@@ -195,11 +232,26 @@ def inject_theme() -> None:
 
 
 def hero(title: str, subtitle: str = "") -> None:
+  uri = _logo_data_uri()
+  logo = f'<img class="hx-hero-logo" src="{uri}" alt="" />' if uri else ""
   sub = f"<p>{subtitle}</p>" if (subtitle or "").strip() else ""
   st.markdown(
-    f'<div class="hx-hero"><h1>{title}</h1>{sub}</div>',
+    f'<div class="hx-hero"><div class="hx-hero-row">{logo}<div><h1>{title}</h1>{sub}</div></div></div>',
     unsafe_allow_html=True,
   )
+
+
+def sidebar_brand(*, caption: str = "로컬 처리 · 원본 보존") -> None:
+  if LOGO_PATH.is_file():
+    logo_col, title_col = st.columns([1, 4], gap="small", vertical_alignment="center")
+    with logo_col:
+      st.image(str(LOGO_PATH), width=34)
+    with title_col:
+      st.markdown(f"**{PRODUCT_NAME}**")
+  else:
+    st.markdown(f"### {PRODUCT_NAME}")
+  if caption:
+    st.caption(caption)
 
 
 def kpi_row(items: list[tuple[str, str]]) -> None:

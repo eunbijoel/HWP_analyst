@@ -16,7 +16,7 @@ from .table_extractor import (
     compute_column_sum, find_max_value_in_table, filter_table_by_year,
 )
 from .llm_client import generate as _llm_generate, check_ollama_status
-from .prompt_registry import format_memory_section, render_prompt
+from .prompt_registry import format_issue_section, format_memory_section, render_prompt
 
 
 SUM_KEYWORDS = ['합계', '합산', '총합', '합', '더해', '합쳐', '총', '전체 합', '다 더', 'sum', '합을']
@@ -227,16 +227,20 @@ class QAEngine:
                run_stage1: bool | None = None,
                benchmark: bool = False,
                memory: str | None = None,
-               use_memory: bool = True) -> dict:
+               use_memory: bool = True,
+               issues: list | None = None) -> dict:
         """Rules-first pre-compute → 조건부 Stage1 → Stage2.
 
         memory: 장기 기억 텍스트. None이면 MemoryStore에서 질문 기준으로 조회.
         use_memory=False 이면 주입 안 함.
+        issues: 검토 Issue(객체 또는 dict) 목록. Stage2 issue_section에 주입.
+                LLM 꺼져 있으면 필드 기반 결정적 설명만 반환.
         """
         enable_stage1 = run_stage1 if run_stage1 is not None else use_llm
         t_start = time.time()
         history = history or []
         q = question.strip()
+        issues = list(issues) if issues else []
 
         if use_memory and memory is None:
             try:
@@ -315,13 +319,27 @@ class QAEngine:
             if stream:
                 result = self._llm_answer_stream(
                     question, model, ollama_url, rule_result, pre_computed,
-                    history=history, memory=memory,
+                    history=history, memory=memory, issues=issues,
                 )
             else:
                 result = self._llm_answer(
                     question, model, ollama_url, rule_result, pre_computed,
-                    history=history, memory=memory,
+                    history=history, memory=memory, issues=issues,
                 )
+            if chart_data:
+                result['chart_data'] = chart_data
+        elif issues:
+            from .consistency_checker import deterministic_issue_explanation
+
+            det = deterministic_issue_explanation(issues)
+            answer_text = det
+            if pre_computed:
+                answer_text = f"{det}\n\n---\n(참고 · 표 사전 계산)\n{pre_computed}"
+            result = {
+                'answer': answer_text,
+                'source': '검토 이슈 구조',
+                'confidence': 'high',
+            }
             if chart_data:
                 result['chart_data'] = chart_data
         elif pre_computed:
@@ -336,6 +354,11 @@ class QAEngine:
             if chart_data:
                 rule_result['chart_data'] = chart_data
             result = rule_result
+
+        if issues:
+            from .consistency_checker import _as_issue_dict
+
+            result['issues_context'] = [_as_issue_dict(i) for i in issues]
 
         if benchmark:
             s1_entities = stage1_result.get('entities', []) if stage1_result else []
@@ -1360,7 +1383,8 @@ class QAEngine:
                     rule_result: dict, pre_computed: str,
                     history: list = None,
                     include_rule_hint: bool = True,
-                    memory: str | None = None) -> dict:
+                    memory: str | None = None,
+                    issues: list | None = None) -> dict:
         context = self._build_context(question)
         rule_hint = rule_result.get('answer', '')
 
@@ -1385,6 +1409,7 @@ class QAEngine:
             rule_section=rule_section,
             history_section=history_section,
             memory_section=format_memory_section(memory),
+            issue_section=format_issue_section(issues),
             question=question,
         )
         start_time = time.time()
@@ -1427,7 +1452,8 @@ class QAEngine:
                            rule_result: dict, pre_computed: str,
                            history: list = None,
                            include_rule_hint: bool = True,
-                           memory: str | None = None) -> dict:
+                           memory: str | None = None,
+                           issues: list | None = None) -> dict:
         context = self._build_context(question)
         rule_hint = rule_result.get('answer', '')
 
@@ -1452,6 +1478,7 @@ class QAEngine:
             rule_section=rule_section,
             history_section=history_section,
             memory_section=format_memory_section(memory),
+            issue_section=format_issue_section(issues),
             question=question,
         )
 

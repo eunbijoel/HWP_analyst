@@ -9,8 +9,8 @@ from dataclasses import dataclass, field
 
 from .fact_extractor import Fact, extract_facts, grounding_stats_for_facts, TOTAL_BUDGET_LABELS
 from .consistency_checker import Issue, check_consistency
-from .concept_resolver import MIN_GROUNDING_CONFIDENCE, GroundingOptions
-from .rule_registry import get_rule, rule_enabled
+from .concept_resolver import GroundingOptions
+from .rule_registry import get_rule, resolve_min_confidence, resolve_tol, rule_enabled
 
 
 @dataclass
@@ -144,15 +144,15 @@ def build_workspace_intelligence(
     cfg = {}
   concept = str(cfg.get("concept") or "total_budget")
   sev = str(cfg.get("severity") or "warning")
-  rel = float(cfg.get("rel_tol", 0.02))
-  abs_tol = float(cfg.get("abs_tol", 1.0))
+  rel, abs_tol = resolve_tol("cross_doc", concept)
+  min_conf = resolve_min_confidence("cross_doc", concept)
 
   for intel in per_doc:
     for f in intel.facts:
       if f.concept != concept:
         continue
       conf = getattr(f, "concept_confidence", 0.0) or 0.0
-      if conf < MIN_GROUNDING_CONFIDENCE and not (
+      if conf < min_conf and not (
         concept == "total_budget" and TOTAL_BUDGET_LABELS.search(f.raw_label)
       ):
         continue
@@ -163,11 +163,11 @@ def build_workspace_intelligence(
             won = f.value * (ts.unit_multiplier or 1.0)
             break
       if won is not None:
-        total_budgets.append((intel.document_id, won, f.source_hint()))
+        total_budgets.append((intel.document_id, won, f.source_hint(), conf))
 
   if len(total_budgets) >= 2:
-    base_doc, base_val, base_src = total_budgets[0]
-    for other_doc, other_val, other_src in total_budgets[1:]:
+    base_doc, base_val, base_src, base_conf = total_budgets[0]
+    for other_doc, other_val, other_src, other_conf in total_budgets[1:]:
       diff = abs(base_val - other_val)
       if diff <= abs_tol:
         continue
@@ -184,6 +184,10 @@ def build_workspace_intelligence(
         difference=other_val - base_val,
         source=f"{base_src} ↔ {other_src}",
         document_id=f"{base_doc} | {other_doc}",
+        concept_id=concept,
+        rel_tol=rel,
+        abs_tol=abs_tol,
+        grounding_confidence=min(base_conf, other_conf),
       ))
 
   return WorkspaceIntel(per_document=per_doc, cross_issues=cross)

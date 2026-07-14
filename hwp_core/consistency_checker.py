@@ -9,11 +9,17 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from .fact_extractor import Fact, TOTAL_BUDGET_LABELS
-from .concept_resolver import MIN_GROUNDING_CONFIDENCE, get_concept_resolver
-from .rule_registry import get_rule, rule_enabled
+from .concept_resolver import get_concept_resolver
+from .rule_registry import (
+  get_rule,
+  resolve_min_confidence,
+  resolve_tol,
+  rule_enabled,
+  stricter_tol,
+)
 from .table_extractor import (
   TableSummary,
   TOTAL_KEYWORDS,
@@ -36,10 +42,158 @@ class Issue:
   document_id: str = ""
   table_index: Optional[int] = None  # 0-based
   row_index: Optional[int] = None    # 0-based (DataFrame / 표 데이터 행)
+  concept_id: Optional[str] = None
+  rel_tol: Optional[float] = None
+  abs_tol: Optional[float] = None
+  grounding_confidence: Optional[float] = None
 
   @property
   def is_ok(self) -> bool:
     return self.severity == "info" and self.issue_type == "match"
+
+  @property
+  def rule_id(self) -> str:
+    """YAML 규칙 id와 동일하게 쓰는 별칭 (issue_type)."""
+    return self.issue_type
+
+  def to_context_dict(self) -> dict[str, Any]:
+    """QAEngine / session_state용 JSON-직렬화 가능 페이로드."""
+    return {
+      "rule_id": self.issue_type,
+      "issue_type": self.issue_type,
+      "severity": self.severity,
+      "message": self.message,
+      "expected": self.expected,
+      "actual": self.actual,
+      "difference": self.difference,
+      "source": self.source,
+      "document_id": self.document_id,
+      "table_index": self.table_index,
+      "row_index": self.row_index,
+      "concept_id": self.concept_id,
+      "rel_tol": self.rel_tol,
+      "abs_tol": self.abs_tol,
+      "grounding_confidence": self.grounding_confidence,
+    }
+
+  @classmethod
+  def from_context_dict(cls, data: dict[str, Any]) -> "Issue":
+    rule = data.get("rule_id") or data.get("issue_type") or "unknown"
+    return cls(
+      issue_type=str(rule),
+      severity=str(data.get("severity") or "warning"),
+      message=str(data.get("message") or ""),
+      expected=data.get("expected"),
+      actual=data.get("actual"),
+      difference=data.get("difference"),
+      source=str(data.get("source") or ""),
+      document_id=str(data.get("document_id") or ""),
+      table_index=data.get("table_index"),
+      row_index=data.get("row_index"),
+      concept_id=data.get("concept_id"),
+      rel_tol=data.get("rel_tol"),
+      abs_tol=data.get("abs_tol"),
+      grounding_confidence=data.get("grounding_confidence"),
+    )
+
+
+def _as_issue_dict(item: Any) -> dict[str, Any]:
+  if isinstance(item, Issue):
+    return item.to_context_dict()
+  if isinstance(item, dict):
+    return dict(item)
+  raise TypeError(f"Unsupported issue payload: {type(item)!r}")
+
+
+def format_issues_for_prompt(issues: list | None) -> str:
+  """Stage2용 구조화 이슈 블록. 비어 있으면 빈 문자열."""
+  payloads = [_as_issue_dict(i) for i in (issues or [])]
+  if not payloads:
+    return ""
+  lines = [
+    "## 검토 엔진이 확정한 이슈 "
+    "(숫자·판정은 아래만 신뢰 — 재계산·수정·새 숫자 제안 금지):",
+  ]
+  for i, p in enumerate(payloads, 1):
+    rule = p.get("rule_id") or p.get("issue_type") or "?"
+    lines.append(f"### 이슈 {i}")
+    lines.append(f"- rule_id: {rule}")
+    lines.append(f"- severity: {p.get('severity', '')}")
+    lines.append(f"- message: {p.get('message', '')}")
+    if p.get("expected") is not None:
+      lines.append(f"- expected: {p['expected']}")
+    if p.get("actual") is not None:
+      lines.append(f"- actual: {p['actual']}")
+    if p.get("difference") is not None:
+      lines.append(f"- difference: {p['difference']}")
+    if p.get("concept_id"):
+      lines.append(f"- concept_id: {p['concept_id']}")
+    if p.get("rel_tol") is not None or p.get("abs_tol") is not None:
+      lines.append(f"- tol: rel={p.get('rel_tol')}, abs={p.get('abs_tol')}")
+    if p.get("grounding_confidence") is not None:
+      lines.append(f"- grounding_confidence: {p['grounding_confidence']}")
+    if p.get("source"):
+      lines.append(f"- source: {p['source']}")
+    if p.get("document_id"):
+      lines.append(f"- document_id: {p['document_id']}")
+    if p.get("table_index") is not None:
+      lines.append(f"- table_index (0-based): {p['table_index']}")
+    if p.get("row_index") is not None:
+      lines.append(f"- row_index (0-based): {p['row_index']}")
+  return "\n".join(lines) + "\n"
+
+
+def deterministic_issue_explanation(issues: list | None) -> str:
+  """LLM 없이 이슈 필드만으로 설명·체크리스트 생성."""
+  payloads = [_as_issue_dict(i) for i in (issues or [])]
+  if not payloads:
+    return ""
+  parts: list[str] = []
+  for i, p in enumerate(payloads, 1):
+    rule = p.get("rule_id") or p.get("issue_type") or "?"
+    prefix = f"이슈 {i}. " if len(payloads) > 1 else ""
+    lines = [
+      f"{prefix}**{p.get('message') or rule}**",
+      f"- 규칙: `{rule}` · 심각도: {p.get('severity') or '-'}",
+    ]
+    if p.get("source"):
+      lines.append(f"- 위치: {p['source']}")
+    loc_bits = []
+    if p.get("table_index") is not None:
+      loc_bits.append(f"표 {int(p['table_index']) + 1}")
+    if p.get("row_index") is not None:
+      loc_bits.append(f"{int(p['row_index']) + 1}행")
+    if loc_bits:
+      lines.append(f"- 좌표: {', '.join(loc_bits)}")
+    if p.get("expected") is not None or p.get("actual") is not None:
+      lines.append(
+        f"- 엔진 판정 숫자: expected={p.get('expected')}, "
+        f"actual={p.get('actual')}, difference={p.get('difference')}"
+      )
+      tol_note = ""
+      if p.get("rel_tol") is not None or p.get("abs_tol") is not None:
+        tol_note = (
+          f" (적용 허용오차 rel={p.get('rel_tol')}, abs={p.get('abs_tol')}"
+          + (f", concept={p.get('concept_id')}" if p.get("concept_id") else "")
+          + ")"
+        )
+      lines.append(
+        "- 왜 발생했는지: 규칙이 기댓값과 표/본문 값을 비교했을 때 "
+        f"허용 오차를 넘는 차이가 났습니다{tol_note}. "
+        "(숫자는 위 값을 그대로 보세요.)"
+      )
+    else:
+      lines.append(
+        "- 왜 발생했는지: 규칙 조건을 만족하지 않아 플래그되었습니다. "
+        "추가 숫자는 문서에서만 확인하세요."
+      )
+    lines.append("- 수정 시 체크리스트:")
+    lines.append("  1. 위 위치의 칸·행이 맞는지 확인")
+    lines.append("  2. expected/actual 중 어느 쪽이 원본과 다른지 대조")
+    lines.append("  3. 단위(원/천원)와 합계 행·열 정의가 규칙과 같은지 확인")
+    lines.append("  4. 고친 뒤 같은 규칙으로 다시 검토")
+    parts.append("\n".join(lines))
+  return "\n\n".join(parts)
 
 
 # YAML 없을 때 fallback (rule_registry 로드 실패 시)
@@ -47,12 +201,18 @@ _FALLBACK_REL = 0.02
 _FALLBACK_ABS = 1.0
 
 
-def _tol(rule_id: str) -> tuple[float, float]:
+def _tol(rule_id: str, concept_id: str | None = None) -> tuple[float, float]:
   try:
-    cfg = get_rule(rule_id)
-    return float(cfg.get("rel_tol", _FALLBACK_REL)), float(cfg.get("abs_tol", _FALLBACK_ABS))
+    return resolve_tol(rule_id, concept_id)
   except Exception:
     return _FALLBACK_REL, _FALLBACK_ABS
+
+
+def _min_conf(rule_id: str, concept_id: str | None = None) -> float:
+  try:
+    return resolve_min_confidence(rule_id, concept_id)
+  except Exception:
+    return 0.85
 
 
 def _severity(rule_id: str, key: str = "severity", default: str = "warning") -> str:
@@ -179,7 +339,8 @@ def check_table_row_totals(ts: TableSummary, document_id: str = "") -> list[Issu
       tcol_s = str(tkey)
       issues.append(Issue(
         issue_type="row_sum_mismatch",
-        severity=sev,        message=(
+        severity=sev,
+        message=(
           f"표 {table_no} '{row_name}' 행: "
           f"연도별 합({calculated:,.0f}) ≠ '{tcol_s}'({reported:,.0f})"
           + (f" [단위: {unit}]" if unit else "")
@@ -191,14 +352,28 @@ def check_table_row_totals(ts: TableSummary, document_id: str = "") -> list[Issu
         document_id=doc,
         table_index=ts.index,
         row_index=row_idx,
+        rel_tol=rel,
+        abs_tol=abs_tol,
       ))
 
   return issues
 
 
-def _column_concept_id(column_name: str) -> Optional[str]:
+def _column_concept_id(
+  column_name: str,
+  *,
+  rule_id: str | None = None,
+  min_confidence: float | None = None,
+) -> Optional[str]:
   gr = get_concept_resolver().column_concept(column_name)
-  if gr.confidence >= MIN_GROUNDING_CONFIDENCE:
+  if gr.concept_id is None:
+    return None
+  thresh = (
+    min_confidence
+    if min_confidence is not None
+    else _min_conf(rule_id or "column_total", gr.concept_id)
+  )
+  if gr.confidence >= thresh:
     return gr.concept_id
   return None
 
@@ -210,7 +385,7 @@ def _is_budget_value_column(df, col, ts: TableSummary) -> bool:
     return False
 
   col_s = str(key)
-  concept = _column_concept_id(col_s)
+  concept = _column_concept_id(col_s, rule_id="column_total")
   if concept in (
     "planned_amount", "actual_amount", "variance", "total_budget",
     "government_contribution", "private_contribution", "local_contribution",
@@ -239,7 +414,6 @@ def check_table_total_row(ts: TableSummary, document_id: str = "") -> list[Issue
   """합계 행 vs 데이터 행 열 합 비교."""
   if not rule_enabled("column_total"):
     return []
-  rel, abs_tol = _tol("column_total")
   sev = _severity("column_total")
   issues: list[Issue] = []
   if ts.dataframe is None or not ts.has_total_row or ts.total_row_index < 0:
@@ -259,6 +433,8 @@ def check_table_total_row(ts: TableSummary, document_id: str = "") -> list[Issue
     key = resolve_column(df, col)
     if key is None:
       continue
+    concept = _column_concept_id(str(key), rule_id="column_total")
+    rel, abs_tol = _tol("column_total", concept)
     calculated = compute_column_sum(df, key, exclude_totals=True)
     reported = _parse_cell(str(df.at[total_idx, key]))
     if calculated is None or reported is None:
@@ -282,6 +458,9 @@ def check_table_total_row(ts: TableSummary, document_id: str = "") -> list[Issue
       document_id=doc,
       table_index=ts.index,
       row_index=total_idx,
+      concept_id=concept,
+      rel_tol=rel,
+      abs_tol=abs_tol,
     ))
 
   return issues
@@ -295,12 +474,17 @@ def check_planned_vs_actual(ts: TableSummary, document_id: str = "") -> list[Iss
     cfg = get_rule("planned_vs_actual")
   except KeyError:
     cfg = {}
-  rel, abs_tol = _tol("planned_vs_actual")
   planned_id = str(cfg.get("planned_concept") or "planned_amount")
   actual_id = str(cfg.get("actual_concept") or "actual_amount")
   variance_id = str(cfg.get("variance_concept") or "variance")
   var_sev = str(cfg.get("variance_severity") or "warning")
   over_sev = str(cfg.get("overrun_severity") or "info")
+
+  var_rel, var_abs = _tol("planned_vs_actual", variance_id)
+  over_rel, over_abs = stricter_tol(
+    _tol("planned_vs_actual", planned_id),
+    _tol("planned_vs_actual", actual_id),
+  )
 
   issues: list[Issue] = []
   if ts.dataframe is None or ts.dataframe.empty:
@@ -311,9 +495,18 @@ def check_planned_vs_actual(ts: TableSummary, document_id: str = "") -> list[Iss
   table_no = ts.index + 1
   unit = ts.unit or ""
 
-  planned_cols = [c for c in df.columns if _column_concept_id(str(c)) == planned_id]
-  actual_cols = [c for c in df.columns if _column_concept_id(str(c)) == actual_id]
-  variance_cols = [c for c in df.columns if _column_concept_id(str(c)) == variance_id]
+  planned_cols = [
+    c for c in df.columns
+    if _column_concept_id(str(c), rule_id="planned_vs_actual") == planned_id
+  ]
+  actual_cols = [
+    c for c in df.columns
+    if _column_concept_id(str(c), rule_id="planned_vs_actual") == actual_id
+  ]
+  variance_cols = [
+    c for c in df.columns
+    if _column_concept_id(str(c), rule_id="planned_vs_actual") == variance_id
+  ]
 
   if not planned_cols or not actual_cols:
     return issues
@@ -337,7 +530,7 @@ def check_planned_vs_actual(ts: TableSummary, document_id: str = "") -> list[Iss
       reported_var = _parse_cell(str(df.at[row_idx, vcol]))
       calc_var = actual - planned
       if reported_var is not None and not _values_close(
-        reported_var, calc_var, rel=rel, abs_tol=abs_tol,
+        reported_var, calc_var, rel=var_rel, abs_tol=var_abs,
       ):
         issues.append(Issue(
           issue_type="variance_mismatch",
@@ -354,11 +547,16 @@ def check_planned_vs_actual(ts: TableSummary, document_id: str = "") -> list[Iss
           document_id=doc,
           table_index=ts.index,
           row_index=row_idx,
+          concept_id=variance_id,
+          rel_tol=var_rel,
+          abs_tol=var_abs,
         ))
 
-    if actual > planned and not _values_close(actual, planned, rel=rel, abs_tol=abs_tol):
+    if actual > planned and not _values_close(
+      actual, planned, rel=over_rel, abs_tol=over_abs,
+    ):
       overrun = actual - planned
-      if overrun / max(abs(planned), 1.0) > rel:
+      if overrun / max(abs(planned), 1.0) > over_rel:
         issues.append(Issue(
           issue_type="execution_overrun",
           severity=over_sev,
@@ -374,6 +572,9 @@ def check_planned_vs_actual(ts: TableSummary, document_id: str = "") -> list[Iss
           document_id=doc,
           table_index=ts.index,
           row_index=row_idx,
+          concept_id=actual_id,
+          rel_tol=over_rel,
+          abs_tol=over_abs,
         ))
 
   return issues
@@ -388,17 +589,23 @@ def _won_value(fact: Fact, table_multiplier: float = 1.0) -> Optional[float]:
   return fact.value
 
 
-def _fact_has_concept(f: Fact, concept_id: str) -> bool:
+def _fact_has_concept(
+  f: Fact,
+  concept_id: str,
+  *,
+  rule_id: str = "body_vs_table",
+) -> bool:
   """ontology grounding (confidence 필터) + total_budget 레거시 패턴."""
+  thresh = _min_conf(rule_id, concept_id)
   if f.concept == concept_id:
     conf = getattr(f, "concept_confidence", 0.0) or 0.0
-    if conf >= MIN_GROUNDING_CONFIDENCE:
+    if conf >= thresh:
       return True
   if concept_id == "total_budget" and TOTAL_BUDGET_LABELS.search(f.raw_label):
     return True
   ctx = f.column or f.context or ""
   gr = get_concept_resolver().ground(f.raw_label, ctx)
-  return gr.concept_id == concept_id and gr.confidence >= MIN_GROUNDING_CONFIDENCE
+  return gr.concept_id == concept_id and gr.confidence >= thresh
 
 
 def check_body_vs_table(
@@ -415,18 +622,18 @@ def check_body_vs_table(
     cfg = {}
   concept = str(cfg.get("concept") or "total_budget")
   sev = str(cfg.get("severity") or "warning")
-  rel, abs_tol = _tol("body_vs_table")
+  rel, abs_tol = _tol("body_vs_table", concept)
   issues: list[Issue] = []
 
   body_facts = [
     f for f in facts
     if f.source_type == "paragraph"
-    and _fact_has_concept(f, concept)
+    and _fact_has_concept(f, concept, rule_id="body_vs_table")
   ]
   table_facts = [
     f for f in facts
     if f.source_type == "table"
-    and _fact_has_concept(f, concept)
+    and _fact_has_concept(f, concept, rule_id="body_vs_table")
     and (
       concept != "total_budget"
       or _is_total_label(f.raw_label.split("(")[0].strip())
@@ -449,6 +656,9 @@ def check_body_vs_table(
         continue
       if _values_close(b_val, t_val, rel=rel, abs_tol=abs_tol):
         continue
+      conf = getattr(bf, "concept_confidence", None) or getattr(
+        tf, "concept_confidence", None,
+      )
       issues.append(Issue(
         issue_type="body_table_mismatch",
         severity=sev,
@@ -463,6 +673,10 @@ def check_body_vs_table(
         document_id=document_id or bf.document_id,
         table_index=tf.table_index,
         row_index=tf.row,
+        concept_id=concept,
+        rel_tol=rel,
+        abs_tol=abs_tol,
+        grounding_confidence=float(conf) if conf is not None else None,
       ))
       break
 

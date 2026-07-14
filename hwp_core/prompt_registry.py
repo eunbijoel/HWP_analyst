@@ -78,6 +78,16 @@ def format_memory_section(memory: str | None) -> str:
   )
 
 
+def format_issue_section(issues: list | None) -> str:
+  """Stage2용 구조화 이슈 블록. consistency_checker.format_issues_for_prompt 위임."""
+  if not issues:
+    return ""
+  from .consistency_checker import format_issues_for_prompt
+
+  text = format_issues_for_prompt(issues).strip()
+  return f"\n{text}\n" if text else ""
+
+
 # 앱 전역에서 재사용하는 기본 레지스트리
 default_registry = PromptRegistry()
 
