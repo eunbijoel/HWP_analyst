@@ -27,7 +27,14 @@ from additional.ai_editor import (
 )
 
 
-EDIT_FILL = re.compile(r'빈칸|채워|채우|기입|입력해|공란', re.I)
+EDIT_FILL = re.compile(
+    r'빈\s*칸|빈칸|공란|'
+    r'(?:채우|채워)(?:\s*줘|\s*주세요|기)?|'
+    r'기입해|입력해|'
+    r'참고\s*자료(?:를|로|로써)?.{0,24}(?:넣(?:어)?|채우|채워|작성|기입|반영|이용)|'
+    r'(?:넣(?:어)?|채우|채워|작성|기입).{0,16}(?:참고\s*자료|엑셀)',
+    re.I,
+)
 EDIT_DRAFT = re.compile(r'초안|작성해|써줘|작성해줘|제안서|계획서.*작성', re.I)
 EDIT_REWRITE = re.compile(
     r'리라이트|다듬|명확하게|개선|짧게|줄여|공문체|기술문서',
@@ -139,6 +146,9 @@ def classify_intent(text: str) -> str:
         REPLACE_VERBS.search(t) or re.search(r'(?:으로|로)\s*[\d,]', t)
     ):
         return 'replace'
+    # 참고자료「요약 삽입」보다 문서 채우기(자연어)를 우선. 「요약」이 있으면 append.
+    if EDIT_FILL.search(t) and not re.search(r'요약', t):
+        return 'fill'
     if APPEND_REF.search(t):
         return 'append_ref'
     if TABLE_QUESTION.search(t) and not (spec and REPLACE_VERBS.search(t)):
@@ -153,8 +163,6 @@ def classify_intent(text: str) -> str:
         return 'replace'
     if EDIT_DELETE.search(t):
         return 'delete'
-    if EDIT_FILL.search(t):
-        return 'fill'
     if INSERT_CMD.search(t) or (INSERT_ANCHOR.search(t) and re.search(r'넣|삽입|추가', t, re.I)):
         return 'insert'
     if KNOWLEDGE_REQUEST.search(t) and not DOC_EDIT_ANCHOR.search(t):

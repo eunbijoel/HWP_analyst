@@ -44,8 +44,17 @@ from ui.issue_panel import (
     pop_pending_chat,
     render_issue_alerts,
 )
+from ui.doc_work_panel import render_doc_fill_chat_result, run_doc_fill_from_chat
+from ui.review_home import render_review_home
+from ui.brand import PRODUCT_NAME, hero, inject_theme, next_hint
 
-st.set_page_config(page_title="HWP Analyzer", page_icon="📄", layout="wide")
+st.set_page_config(
+    page_title=PRODUCT_NAME,
+    page_icon="✦",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+inject_theme()
 
 VIEW_PREVIEW = "미리보기 + 채팅 편집"
 VIEW_DIRECT = "직접 편집"
@@ -152,8 +161,9 @@ def render_workspace_qa_chat(
     use_llm: bool,
     use_streaming: bool,
     ollama_url: str,
+    file_entries: list | None = None,
 ):
-    """다중 파일 공통 Q&A 패널 (편집 명령 제외)."""
+    """다중 파일 공통 Q&A (+ 자연어 문서 채우기)."""
     def _norm_name(s: str) -> str:
         return re.sub(r'[\s_\-\.]+', '', (s or '').lower())
 
@@ -175,7 +185,7 @@ def render_workspace_qa_chat(
     if chat_key not in st.session_state:
         st.session_state[chat_key] = []
 
-    st.caption("공통 질의응답 — 여러 문서를 함께 분석합니다.")
+    st.caption("여러 문서를 함께 — 질문하거나 「참고 자료로 채워줘」처럼 요청하세요.")
     with st.container(height=CHAT_SCROLL_HEIGHT, border=False):
         for msg in st.session_state[chat_key]:
             with st.chat_message(msg['role']):
@@ -186,6 +196,11 @@ def render_workspace_qa_chat(
     q = st.chat_input("여러 문서를 대상으로 질문하세요...", key="multi_chat_input")
     if q:
         st.session_state[chat_key].append({'role': 'user', 'content': q})
+        if _run_fill_in_chat(
+            q, chat_key, file_entries or [], "",
+            model_name=model_name, ollama_url=ollama_url, use_llm=use_llm,
+        ):
+            return
         target_docs = _pick_target_docs(q, all_documents)
         qa_docs = target_docs if target_docs else all_documents
         scope = "multi_all"
@@ -359,6 +374,41 @@ def _set_selected_para(fname: str, para_index: int, text: str):
     st.session_state[f"selection_{fname}"] = text
 
 
+def _on_doc_fill_applied(fname: str, data: bytes):
+    set_hwp_working_bytes(fname, data)
+    _invalidate_hwpx_preview_cache(fname)
+    for k in list(st.session_state.keys()):
+        if k.startswith(f"editor_{fname}_"):
+            del st.session_state[k]
+
+
+def _run_fill_in_chat(
+    user_input: str,
+    chat_key: str,
+    file_entries: list,
+    preferred_target: str,
+    *,
+    model_name: str,
+    ollama_url: str,
+    use_llm: bool,
+) -> bool:
+    """자연어 채우기 의도면 DocFillPipeline 실행 후 True."""
+    if not file_entries or classify_intent(user_input) != "fill":
+        return False
+    with st.spinner("참고 자료를 보고 반영할 내용을 찾는 중…"):
+        reply = run_doc_fill_from_chat(
+            file_entries,
+            command=user_input,
+            preferred_target=preferred_target,
+            model_name=model_name,
+            ollama_url=ollama_url,
+            use_llm=use_llm,
+        )
+    st.session_state[chat_key].append({"role": "assistant", "content": reply})
+    st.rerun()
+    return True
+
+
 def render_chat_panel(
     fname: str,
     editor: HWPXEditor,
@@ -371,8 +421,9 @@ def render_chat_panel(
     ollama_url: str = 'http://localhost:11434',
     source_hwp: str = '',
     canvas_mode: bool = False,
+    file_entries: list | None = None,
 ):
-    st.caption("명령 / 질문 — 예: *빈칸 채워줘*, *초안 작성해줘*, *총 사업비는?*")
+    st.caption("채팅으로 요청하세요 — 예: *참고 자료로 채워줘*, *총 사업비는?*")
 
     sel_key = f"selection_{fname}"
     selected_para_key = f"selected_para_{fname}"
@@ -421,22 +472,30 @@ def render_chat_panel(
                         st.bar_chart(msg['chart_data'])
 
     user_input = st.chat_input("명령 또는 질문을 입력하세요...", key=f"input_{fname}")
-    pending_q = None
+    pending_payload = None
     raw_pending = st.session_state.get("pending_issue_chat")
     if raw_pending and raw_pending.get("filename") == fname:
-        pending_q = raw_pending.get("question")
-        pop_pending_chat(fname)
+        pending_payload = pop_pending_chat(fname)
+    pending_q = (pending_payload or {}).get("question") if pending_payload else None
+    pending_issues = None
+    if pending_payload and pending_payload.get("issue"):
+        pending_issues = [pending_payload["issue"]]
     user_input = pending_q or user_input
 
     if user_input:
         st.session_state[chat_key].append({'role': 'user', 'content': user_input})
+        if not pending_q and _run_fill_in_chat(
+            user_input, chat_key, file_entries or [], fname,
+            model_name=model_name, ollama_url=ollama_url, use_llm=use_llm,
+        ):
+            return
         intent = classify_intent(user_input)
         ref_ctx = get_reference_context()
         selection = st.session_state.get(f"selection_{fname}", '')
         para_sel = _selected_para_state(fname)
         para_index = para_sel['index'] if para_sel else None
 
-        if intent != 'qa' and (_edit_without_llm(intent) or use_llm):
+        if intent != 'qa' and not pending_q and (_edit_without_llm(intent) or use_llm):
             with st.spinner("AI 편집 중..."):
                 result = execute_edit_command(
                     editor, user_input, ref_ctx,
@@ -484,6 +543,7 @@ def render_chat_panel(
                         question=q, use_llm=use_llm, model=model_name,
                         ollama_url=ollama_url, stream=use_streaming,
                         stage1_model=stage1_model, history=hist[-3:],
+                        issues=pending_issues,
                     )
             chart = ans.get('chart_data')
             if ans.get('answer_stream'):
@@ -533,24 +593,32 @@ def _render_hwp_chat(
     use_streaming: bool, stage1_model: str,
     *,
     on_new_bytes=None,
+    file_entries: list | None = None,
 ):
     """HWP/읽기전용 모드 공통 채팅 패널. hwpilot 편집 + Q&A."""
-    st.caption("명령 / 질문 — 예: *A를 B로 바꿔줘*, *삭제해*, *총 사업비는?*")
+    st.caption("채팅으로 요청하세요 — 예: *참고 자료로 채워줘*, *A를 B로 바꿔줘*")
     with st.container(height=CHAT_SCROLL_HEIGHT, border=False):
         for msg in st.session_state[chat_key]:
             with st.chat_message(msg['role']):
                 st.write(msg['content'])
-    pending_q = None
+    pending_payload = None
     raw_pending = st.session_state.get("pending_issue_chat")
     if raw_pending and raw_pending.get("filename") == fname:
-        pending_q = raw_pending.get("question")
+        pending_payload = pop_pending_chat(fname)
+    pending_q = (pending_payload or {}).get("question") if pending_payload else None
+    pending_issues = None
+    if pending_payload and pending_payload.get("issue"):
+        pending_issues = [pending_payload["issue"]]
     q_input = st.chat_input("명령 또는 질문을 입력하세요...", key=input_key)
     q = pending_q or q_input
-    if pending_q:
-        pop_pending_chat(fname)
     if not q:
         return
     st.session_state[chat_key].append({'role': 'user', 'content': q})
+    if not pending_q and _run_fill_in_chat(
+        q, chat_key, file_entries or [], fname,
+        model_name=model_name, ollama_url=ollama_url, use_llm=use_llm,
+    ):
+        return
     intent = classify_intent(q)
     ref_ctx = get_reference_context()
     if intent != 'qa' and not pending_q and get_backend_status().hwpilot and (
@@ -598,6 +666,7 @@ def _render_hwp_chat(
                 question=q, use_llm=use_llm, model=model_name,
                 ollama_url=ollama_url, stream=use_streaming,
                 stage1_model=stage1_model, history=hist[-3:],
+                issues=pending_issues,
             )
         if ans.get('answer_stream'):
             with st.chat_message("assistant"):
@@ -621,9 +690,10 @@ def _render_file_qa_chat(
     use_llm: bool,
     use_streaming: bool,
     stage1_model: str,
+    file_entries: list | None = None,
 ):
-    """Excel 등 편집기 없는 파일 — Q&A 전용 채팅."""
-    st.caption("질문 — 이 파일만 분석합니다.")
+    """Excel 등 편집기 없는 파일 — Q&A (+ 워크스페이스 채우기)."""
+    st.caption("질문하거나, 참고 자료로 문서를 채워 달라고 말해 보세요.")
     with st.container(height=CHAT_SCROLL_HEIGHT, border=False):
         for msg in st.session_state[chat_key]:
             with st.chat_message(msg['role']):
@@ -631,26 +701,34 @@ def _render_file_qa_chat(
                 if msg.get('chart_data') is not None:
                     st.bar_chart(msg['chart_data'])
 
-    pending_q = None
+    pending_payload = None
     raw_pending = st.session_state.get("pending_issue_chat")
     if raw_pending and raw_pending.get("filename") == fname:
-        pending_q = raw_pending.get("question")
+        pending_payload = pop_pending_chat(fname)
+    pending_q = (pending_payload or {}).get("question") if pending_payload else None
+    pending_issues = None
+    if pending_payload and pending_payload.get("issue"):
+        pending_issues = [pending_payload["issue"]]
 
     q_input = st.chat_input("질문을 입력하세요...", key=input_key)
     q = pending_q or q_input
-    if pending_q:
-        pop_pending_chat(fname)
     if not q:
         return
 
     st.session_state[chat_key].append({'role': 'user', 'content': q})
+    if not pending_q and _run_fill_in_chat(
+        q, chat_key, file_entries or [], "",
+        model_name=model_name, ollama_url=ollama_url, use_llm=use_llm,
+    ):
+        return
     intent = classify_intent(q)
     if intent != 'qa' and not pending_q:
         st.session_state[chat_key].append({
             'role': 'assistant',
             'content': (
                 '이 파일 형식은 채팅 편집을 지원하지 않습니다. '
-                '왼쪽 **직접 편집** 탭에서 수정하거나, 질문 형태로 요청해 주세요.'
+                'HWP/HWPX를 선택한 뒤 「참고 자료로 채워줘」처럼 요청하거나, '
+                '질문 형태로 물어봐 주세요.'
             ),
         })
         st.rerun()
@@ -670,6 +748,7 @@ def _render_file_qa_chat(
             question=question, use_llm=use_llm, model=model_name,
             ollama_url=ollama_url, stream=use_streaming,
             stage1_model=stage1_model, history=hist[-3:],
+            issues=pending_issues,
         )
     chart = ans.get('chart_data')
     if ans.get('answer_stream'):
@@ -698,6 +777,7 @@ def render_file_chat(
     use_streaming: bool,
     ollama_url: str,
     input_suffix: str = '',
+    file_entries: list | None = None,
 ):
     """파일 전용 채팅 — HWPX/HWP/Excel 공통 진입."""
     fname = entry['filename']
@@ -709,6 +789,7 @@ def render_file_chat(
 
     ext = os.path.splitext(fname)[1].lower()
     input_key = f"file_chat_{fname}{input_suffix}"
+    workspace = file_entries or [entry]
 
     scoped_docs = [doc_payload]
 
@@ -721,8 +802,17 @@ def render_file_chat(
                 model_name, stage1_model, use_llm, use_streaming,
                 ollama_url=ollama_url,
                 source_hwp=st.session_state.get(f"hwp_source_{fname}", ''),
+                file_entries=workspace,
             )
             return
+        # 에디터 세션이 아직 없으면 채우기·Q&A만이라도 동작
+        _render_file_qa_chat(
+            fname, doc_payload, scoped_docs,
+            chat_key, input_key,
+            model_name, ollama_url, use_llm, use_streaming, stage1_model,
+            file_entries=workspace,
+        )
+        return
 
     if ext == '.hwp':
         _render_hwp_chat(
@@ -730,6 +820,7 @@ def render_file_chat(
             chat_key, input_key,
             model_name, ollama_url, use_llm, use_streaming, stage1_model,
             on_new_bytes=lambda nb, r: set_hwp_working_bytes(fname, nb),
+            file_entries=workspace,
         )
         return
 
@@ -737,6 +828,7 @@ def render_file_chat(
         fname, doc_payload, scoped_docs,
         chat_key, input_key,
         model_name, ollama_url, use_llm, use_streaming, stage1_model,
+        file_entries=workspace,
     )
 
 
@@ -772,6 +864,7 @@ def render_unified_chat_column(
             model_name=model_name, stage1_model=stage1_model,
             use_llm=use_llm, use_streaming=use_streaming,
             ollama_url=ollama_url, input_suffix="_pane",
+            file_entries=file_entries,
         )
 
     with tab_all:
@@ -782,7 +875,15 @@ def render_unified_chat_column(
             use_llm=use_llm,
             use_streaming=use_streaming,
             ollama_url=ollama_url,
+            file_entries=file_entries,
         )
+
+    # 탭마다 그리지 않음 — Streamlit은 탭을 모두 실행해 키가 충돌함
+    render_doc_fill_chat_result(
+        file_entries,
+        on_applied=_on_doc_fill_applied,
+        key_prefix="dw_main",
+    )
 
 
 def render_hwp_split_editor(
@@ -1054,30 +1155,29 @@ def _file_active_key(filename: str) -> str:
 
 
 def render_sidebar_file_checkboxes(filenames: list[str]) -> list[str]:
-    """사이드바: 업로드된 파일 중 작업에 포함할 파일을 체크박스로 선택."""
+    """사이드바: 열려 있는 문서."""
     with st.sidebar:
         st.markdown("---")
-        st.subheader("📁 활성 파일")
-        st.caption("체크한 파일만 미리보기·채팅·검토에 사용합니다.")
+        st.markdown("##### 문서")
+        st.caption("작업에 포함할 파일을 선택하세요.")
 
-        # 업로드에서 빠진 파일의 체크 상태 정리
         known = set(filenames)
         for k in list(st.session_state.keys()):
             if k.startswith("file_active_") and k[len("file_active_"):] not in known:
                 del st.session_state[k]
 
         if not filenames:
-            st.caption("업로드된 파일이 없습니다.")
+            st.caption("아직 열린 문서가 없습니다.")
             return []
 
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("전체 선택", use_container_width=True, key="file_select_all"):
+            if st.button("모두", use_container_width=True, key="file_select_all"):
                 for name in filenames:
                     st.session_state[_file_active_key(name)] = True
                 st.rerun()
         with c2:
-            if st.button("전체 해제", use_container_width=True, key="file_select_none"):
+            if st.button("없음", use_container_width=True, key="file_select_none"):
                 for name in filenames:
                     st.session_state[_file_active_key(name)] = False
                 st.rerun()
@@ -1090,50 +1190,55 @@ def render_sidebar_file_checkboxes(filenames: list[str]) -> list[str]:
             if st.checkbox(name, key=key):
                 selected.append(name)
 
-        st.caption(f"{len(selected)} / {len(filenames)}개 선택")
+        st.caption(f"{len(selected)}개 사용 중")
         return selected
 
 
 # --- 사이드바 ---
 with st.sidebar:
-    st.header("⚙️ 설정")
-    ollama_url = st.text_input("Ollama URL", value="http://localhost:11434", key="sidebar_ollama_url")
-    ollama_status = get_cached_ollama_status(ollama_url)
-
-    if ollama_status['status'] == 'running':
-        st.success("Ollama 연결됨")
-        available_models = ollama_status['models']
-        if available_models:
-            gemma4_models = [m for m in available_models if 'gemma4' in m]
-            sorted_models = gemma4_models + [m for m in available_models if m not in gemma4_models]
-            model_name = st.selectbox("모델", sorted_models, index=0)
+    st.markdown(f"### {PRODUCT_NAME}")
+    st.caption("로컬 처리 · 원본 보존")
+    st.markdown("---")
+    with st.expander("연결 · 모델", expanded=False):
+        ollama_url = st.text_input("Ollama URL", value="http://localhost:11434", key="sidebar_ollama_url")
+        ollama_status = get_cached_ollama_status(ollama_url)
+        if ollama_status['status'] == 'running':
+            st.caption("AI 연결됨")
+            available_models = ollama_status['models']
+            if available_models:
+                gemma4_models = [m for m in available_models if 'gemma4' in m]
+                sorted_models = gemma4_models + [m for m in available_models if m not in gemma4_models]
+                model_name = st.selectbox("답변 모델", sorted_models, index=0)
+            else:
+                model_name = st.text_input("답변 모델", value="gemma4", key="sidebar_model_name")
+                available_models = []
         else:
-            model_name = st.text_input("모델", value="gemma4", key="sidebar_model_name")
-    else:
-        st.warning("Ollama 미연결")
-        model_name = "gemma4"
-        available_models = []
+            st.caption("AI 미연결 · 규칙 검토만 가능")
+            model_name = "gemma4"
+            available_models = []
+        use_llm = ollama_status['status'] == 'running'
+        use_streaming = use_llm
+        if use_llm and available_models:
+            small_models = [m for m in available_models
+                            if any(t in m for t in ['gemma3', 'qwen', 'phi4', 'gemma2'])] or available_models
+            stage1_model = st.selectbox("질문 이해 모델", small_models, index=0)
+        else:
+            stage1_model = "gemma3:4b"
 
-    use_llm = ollama_status['status'] == 'running'
-    use_streaming = use_llm
-
-    if use_llm and available_models:
-        small_models = [m for m in available_models
-                        if any(t in m for t in ['gemma3', 'qwen', 'phi4', 'gemma2'])] or available_models
-        stage1_model = st.selectbox("의도 분석", small_models, index=0)
-    else:
-        stage1_model = "gemma3:4b"
-
+# expander widgets always run — variables set above
 # --- 메인 ---
-st.title("HWP Analyzer")
+hero(PRODUCT_NAME)
 
 uploaded_files = st.file_uploader(
-    "문서를 업로드하세요 (HWP/HWPX/XLSX)",
+    "문서 추가",
     type=["hwp", "hwpx", "xlsx", "xls"],
     accept_multiple_files=True,
+    label_visibility="collapsed",
 )
 
-if uploaded_files:
+if not uploaded_files:
+    render_sidebar_file_checkboxes([])
+else:
     uploaded_list = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]
     file_entries = []
     all_documents = []
@@ -1160,7 +1265,7 @@ if uploaded_files:
 
         cache_key = f"parsed_{filename}_{len(file_bytes)}"
         if cache_key not in st.session_state:
-            with st.spinner(f"{filename} 분석 중..."):
+            with st.spinner("문서를 준비하는 중…"):
                 doc, tables, tnums, tblnums = process_document(file_bytes, filename)
                 intel = build_intelligence(
                     paragraphs=doc.paragraphs,
@@ -1193,87 +1298,73 @@ if uploaded_files:
         })
 
         for err in cached['doc'].errors:
-            st.warning(f"[{filename}] {err}")
+            st.warning(f"{filename}: {err}")
 
-    # 사이드바: 업로드는 유지, 체크한 파일만 작업 대상으로
     uploaded_names = [e['filename'] for e in file_entries]
     active_names = set(render_sidebar_file_checkboxes(uploaded_names))
     active_entries = [e for e in file_entries if e['filename'] in active_names]
     active_documents = [e['doc_payload'] for e in active_entries]
 
     if not active_entries:
-        st.info("사이드바에서 작업할 파일을 하나 이상 선택하세요.")
+        next_hint("왼쪽에서 작업할 문서를 하나 이상 선택하세요.")
     else:
         if len(active_documents) >= 2:
             build_workspace_intelligence(active_documents)
 
-        render_issue_alerts(active_entries)
-
         n_files = len(active_entries)
-        st.caption(
-            f"{'단일' if n_files == 1 else '다중'} 파일 · {n_files}개 활성"
-            f" (업로드 {len(file_entries)}개) · {get_backend_status().summary()}"
-        )
 
-        for entry in active_entries:
-            dp = entry['doc_payload']
-            if not dp['paragraphs'] and not dp['tables']:
-                st.warning(f"[{entry['filename']}] 문단·표를 추출하지 못했습니다.")
-
-        names = [e['filename'] for e in active_entries]
-        if st.session_state.get(FOCUS_DOC_KEY) not in names:
-            st.session_state[FOCUS_DOC_KEY] = names[0]
-
-        col_doc, col_chat = st.columns([3, 2], gap="medium")
-
-        with col_doc:
-            if n_files == 1:
-                render_document_pane(
-                    active_entries[0], active_documents,
-                    model_name=model_name, ollama_url=ollama_url,
-                    use_llm=use_llm, use_streaming=use_streaming,
-                    stage1_model=stage1_model,
-                    render_hwp_split_editor=render_hwp_split_editor,
-                    render_split_editor=render_split_editor,
-                    render_excel_split_editor_fn=render_excel_split_editor,
-                    render_scrollable_doc_preview=render_scrollable_doc_preview,
-                    render_scrollable_pane=render_scrollable_pane,
-                )
-            else:
-                # 점프 대상 파일을 맨 앞 탭으로 (이 위치로 클릭 시)
-                jump = st.session_state.get(ISSUE_JUMP_KEY) or {}
-                jump_name = jump.get("filename")
-                if jump_name in names:
-                    st.info(f"📌 검토 위치 → **{jump_name}** 탭")
-                    ordered = (
-                        [e for e in active_entries if e["filename"] == jump_name]
-                        + [e for e in active_entries if e["filename"] != jump_name]
+        def _render_workspace():
+            names = [e['filename'] for e in active_entries]
+            if st.session_state.get(FOCUS_DOC_KEY) not in names:
+                st.session_state[FOCUS_DOC_KEY] = names[0]
+            col_doc, col_chat = st.columns([3, 2], gap="large")
+            with col_doc:
+                if n_files == 1:
+                    render_document_pane(
+                        active_entries[0], active_documents,
+                        model_name=model_name, ollama_url=ollama_url,
+                        use_llm=use_llm, use_streaming=use_streaming,
+                        stage1_model=stage1_model,
+                        render_hwp_split_editor=render_hwp_split_editor,
+                        render_split_editor=render_split_editor,
+                        render_excel_split_editor_fn=render_excel_split_editor,
+                        render_scrollable_doc_preview=render_scrollable_doc_preview,
+                        render_scrollable_pane=render_scrollable_pane,
                     )
                 else:
-                    ordered = active_entries
-                tabs = st.tabs([e["filename"] for e in ordered])
-                for tab, entry in zip(tabs, ordered):
-                    with tab:
-                        render_document_pane(
-                            entry, active_documents,
-                            model_name=model_name, ollama_url=ollama_url,
-                            use_llm=use_llm, use_streaming=use_streaming,
-                            stage1_model=stage1_model,
-                            render_hwp_split_editor=render_hwp_split_editor,
-                            render_split_editor=render_split_editor,
-                            render_excel_split_editor_fn=render_excel_split_editor,
-                            render_scrollable_doc_preview=render_scrollable_doc_preview,
-                            render_scrollable_pane=render_scrollable_pane,
+                    jump = st.session_state.get(ISSUE_JUMP_KEY) or {}
+                    jump_name = jump.get("filename")
+                    if jump_name in names:
+                        ordered = (
+                            [e for e in active_entries if e["filename"] == jump_name]
+                            + [e for e in active_entries if e["filename"] != jump_name]
                         )
+                    else:
+                        ordered = active_entries
+                    tabs = st.tabs([e["filename"] for e in ordered])
+                    for tab, entry in zip(tabs, ordered):
+                        with tab:
+                            render_document_pane(
+                                entry, active_documents,
+                                model_name=model_name, ollama_url=ollama_url,
+                                use_llm=use_llm, use_streaming=use_streaming,
+                                stage1_model=stage1_model,
+                                render_hwp_split_editor=render_hwp_split_editor,
+                                render_split_editor=render_split_editor,
+                                render_excel_split_editor_fn=render_excel_split_editor,
+                                render_scrollable_doc_preview=render_scrollable_doc_preview,
+                                render_scrollable_pane=render_scrollable_pane,
+                            )
+            with col_chat:
+                render_unified_chat_column(
+                    active_entries, active_documents,
+                    model_name=model_name, stage1_model=stage1_model,
+                    use_llm=use_llm, use_streaming=use_streaming,
+                    ollama_url=ollama_url,
+                )
 
-        with col_chat:
-            render_unified_chat_column(
-                active_entries, active_documents,
-                model_name=model_name, stage1_model=stage1_model,
-                use_llm=use_llm, use_streaming=use_streaming,
-                ollama_url=ollama_url,
-            )
-
-else:
-    render_sidebar_file_checkboxes([])
-    st.info("HWP/HWPX/XLSX 파일을 업로드하세요.")
+        render_review_home(
+            active_entries,
+            active_documents,
+            render_workspace=_render_workspace,
+        )

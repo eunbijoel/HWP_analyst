@@ -1001,6 +1001,193 @@ class HWPXEditor:
         self._mark_section_dirty(ref_info.get('section_file'))
         return True
 
+    def _blank_table_cell_template(self, ns: str = "") -> ET.Element:
+        """최소 tc (문서에 표가 없을 때)."""
+        def q(tag: str) -> str:
+            return f"{{{ns}}}{tag}" if ns else tag
+
+        tc = ET.Element(q("tc"))
+        p = ET.SubElement(tc, q("p"))
+        run = ET.SubElement(p, q("run"))
+        ET.SubElement(run, q("t"))
+        addr = ET.SubElement(tc, q("cellAddr"))
+        addr.set("rowAddr", "0")
+        addr.set("colAddr", "0")
+        span = ET.SubElement(tc, q("cellSpan"))
+        span.set("rowSpan", "1")
+        span.set("colSpan", "1")
+        return tc
+
+    def _build_tbl_from_rows(
+        self,
+        rows: list[list[str]],
+        *,
+        template_tbl: ET.Element | None = None,
+        template_tc: ET.Element | None = None,
+        ns: str = "",
+        track_changes: bool = True,
+    ) -> ET.Element:
+        n_rows = len(rows)
+        n_cols = max((len(r) for r in rows), default=0)
+        if n_rows == 0 or n_cols == 0:
+            raise ValueError("빈 표")
+
+        def q(tag: str) -> str:
+            return f"{{{ns}}}{tag}" if ns else tag
+
+        if template_tbl is not None:
+            tbl = copy.deepcopy(template_tbl)
+            # 기존 행 제거, 레이아웃(sz/pos/margin) 유지
+            for child in list(tbl):
+                if local_tag(child.tag) in ("tr", "row"):
+                    tbl.remove(child)
+        else:
+            tbl = ET.Element(q("tbl"))
+
+        tbl.set("rowCnt", str(n_rows))
+        tbl.set("colCnt", str(n_cols))
+        if "numberingType" not in tbl.attrib:
+            tbl.set("numberingType", "TABLE")
+
+        sample = template_tc
+        if sample is None and template_tbl is not None:
+            for tr0 in template_tbl:
+                if local_tag(tr0.tag) not in ("tr", "row"):
+                    continue
+                for tc0 in tr0:
+                    if local_tag(tc0.tag) in ("tc", "cell", "td"):
+                        sample = tc0
+                        break
+                if sample is not None:
+                    break
+        if sample is None:
+            sample = self._blank_table_cell_template(ns)
+
+        # 대략적인 셀 폭 (원본 표 폭 기준)
+        total_w = 46775
+        if template_tbl is not None:
+            for child in template_tbl:
+                if local_tag(child.tag) == "sz":
+                    try:
+                        total_w = int(child.get("width") or total_w)
+                    except ValueError:
+                        pass
+                    break
+        cell_w = max(1200, total_w // max(n_cols, 1))
+        cell_h = 1200
+
+        if "}" in sample.tag:
+            tr_tag = sample.tag.split("}")[0] + "}tr"
+        else:
+            tr_tag = q("tr")
+
+        for ri, row in enumerate(rows):
+            tr = ET.Element(tr_tag)
+            for ci in range(n_cols):
+                val = row[ci] if ci < len(row) else ""
+                tc = copy.deepcopy(sample)
+                for sub in list(tc):
+                    lt = local_tag(sub.tag)
+                    if lt == "cellAddr":
+                        sub.set("rowAddr", str(ri))
+                        sub.set("colAddr", str(ci))
+                    elif lt == "cellSpan":
+                        sub.set("rowSpan", "1")
+                        sub.set("colSpan", "1")
+                    elif lt == "cellSz":
+                        sub.set("width", str(cell_w))
+                        sub.set("height", str(cell_h))
+                self._set_cell_text(tc, str(val))
+                if track_changes:
+                    self._mark_runs_green(tc)
+                tr.append(tc)
+            tbl.append(tr)
+        return tbl
+
+    def insert_table_after_paragraph(
+        self,
+        paragraph_index: int,
+        rows: list[list[str]],
+        track_changes: bool = True,
+    ) -> bool:
+        """문단 뒤에 표 삽입. 가능하면 문서 기존 표 서식을 복제."""
+        if not rows or not any(any(str(c).strip() for c in r) for r in rows):
+            return False
+        paras = self.get_paragraphs()
+        if paragraph_index < 0 or paragraph_index >= len(paras):
+            return False
+        ref_info = paras[paragraph_index]
+        ref_elem = ref_info["elem"]
+        section_name = ref_info.get("section_file", "")
+        root = self.section_trees.get(section_name)
+        if root is None:
+            return False
+        parent_map = {child: parent for parent in root.iter() for child in parent}
+        parent = parent_map.get(ref_elem)
+        if parent is None:
+            return False
+        try:
+            insert_at = list(parent).index(ref_elem) + 1
+        except ValueError:
+            insert_at = len(parent)
+
+        ns = ""
+        if "}" in ref_elem.tag:
+            ns = ref_elem.tag[1:].split("}")[0]
+
+        template_tbl = None
+        template_tc = None
+        best_score = -1
+        for _sf, sroot in self.section_trees.items():
+            for tbl in self._get_tables(sroot):
+                if template_tbl is None:
+                    template_tbl = tbl
+                for tr in tbl:
+                    if local_tag(tr.tag) not in ("tr", "row"):
+                        continue
+                    for tc in tr:
+                        if local_tag(tc.tag) not in ("tc", "cell", "td"):
+                            continue
+                        # 병합·대형 제목 셀보다 단순 셀 선호
+                        span_r, span_c = 1, 1
+                        for sub in tc:
+                            if local_tag(sub.tag) == "cellSpan":
+                                try:
+                                    span_r = int(sub.get("rowSpan") or 1)
+                                    span_c = int(sub.get("colSpan") or 1)
+                                except ValueError:
+                                    pass
+                        texts = [
+                            (e.text or "").strip()
+                            for e in tc.iter()
+                            if local_tag(e.tag) == "t"
+                        ]
+                        text_len = sum(len(t) for t in texts)
+                        score = 100 - min(text_len, 80) - (span_r * span_c - 1) * 20
+                        if score > best_score:
+                            best_score = score
+                            template_tc = tc
+                if template_tbl is not None and template_tc is not None:
+                    break
+            if template_tbl is not None and template_tc is not None:
+                break
+
+        try:
+            new_tbl = self._build_tbl_from_rows(
+                rows,
+                template_tbl=template_tbl,
+                template_tc=template_tc,
+                ns=ns,
+                track_changes=track_changes,
+            )
+        except Exception:
+            return False
+
+        # 캡션 문단은 서식 표와 섞이면 깨질 수 있어 표만 삽입
+        parent.insert(insert_at, new_tbl)
+        self._mark_section_dirty(section_name)
+        return True
+
     def find_table_cell_candidates(
         self, old_value: str, command: str = '',
     ) -> list[tuple[int, int, int, str, int]]:

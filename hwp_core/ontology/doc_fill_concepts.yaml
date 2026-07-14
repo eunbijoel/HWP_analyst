@@ -1,0 +1,90 @@
+# 문서 양식 채우기용 개념 (글 항목 · 인건비 표)
+version: 1
+domain: doc_fill
+
+concepts:
+  rd_necessity:
+    label_ko: 연구개발 필요성
+    value_type: text
+    synonyms:
+      - 연구개발 필요성
+      - 필요성
+      - 추진 배경
+      - 개발 필요성
+    patterns:
+      - "연구\\s*개발\\s*필요성"
+      - "추진\\s*배경"
+
+  rd_objective:
+    label_ko: 연구개발 목표
+    value_type: text
+    synonyms:
+      - 연구개발 목표
+      - 연구 목표
+      - 개발 목표
+      - 목표
+    patterns:
+      - "연구\\s*개발\\s*목표"
+      - "연구\\s*목표"
+
+  expected_effect:
+    label_ko: 기대효과
+    value_type: text
+    synonyms:
+      - 기대효과
+      - 기대 효과
+      - 성과
+      - 파급효과
+    patterns:
+      - "기대\\s*효과"
+      - "파급\\s*효과"
+
+  person_name:
+    label_ko: 성명
+    value_type: text
+    synonyms:
+      - 성명
+      - 이름
+      - 연구원명
+      - 참여연구자
+      - 성 명
+    patterns:
+      - "성\\s*명"
+      - "연구원\\s*명"
+
+  position:
+    label_ko: 직급
+    value_type: text
+    synonyms:
+      - 직급
+      - 직위
+      - 역할
+      - 담당
+    patterns:
+      - "직\\s*급"
+      - "직\\s*위"
+
+  participation_rate:
+    label_ko: 참여율
+    value_type: ratio
+    synonyms:
+      - 참여율
+      - 참여비율
+      - 참여 비율
+      - 투입률
+    patterns:
+      - "참여\\s*율"
+      - "참여\\s*비율"
+
+  labor_cost_cash:
+    label_ko: 현금 인건비
+    value_type: money
+    synonyms:
+      - 현금 인건비
+      - 인건비(현금)
+      - 인건비
+      - 현금인건비
+      - 인건비 현금
+    patterns:
+      - "현금\\s*인건비"
+      - "인건비\\s*\\(?현금\\)?"
