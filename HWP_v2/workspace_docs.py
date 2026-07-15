@@ -16,7 +16,8 @@ from hwp_core.table_extractor import (
     detect_numbers_in_text,
     extract_tables,
 )
-from ui.document_preview import build_preview_from_text, build_preview_html
+from hwp_core.editing.preview_layer import build_preview_html
+from hwp_core.shared.preview.plain import build_preview_from_text
 
 from convert_hwp import hwp_to_hwpx_bytes
 

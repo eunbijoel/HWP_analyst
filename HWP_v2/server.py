@@ -31,16 +31,20 @@ if str(_V2) not in sys.path:
 from hwp_core.hwpx_editor import HWPXEditor  # noqa: E402
 from hwp_core.hwp_parser import parse_document  # noqa: E402
 from hwp_core.llm_client import check_ollama_status, generate  # noqa: E402
-from hwp_core.qa_engine import QAEngine  # noqa: E402
 from hwp_core.doc_agent.pipeline import DocFillPipeline  # noqa: E402
-from ui.document_preview import build_preview_from_text, build_preview_html  # noqa: E402
-from ui.command_router import classify_intent  # noqa: E402
+from hwp_core.shared.preview.plain import build_preview_from_text  # noqa: E402
+from hwp_core.editing.preview_layer import build_preview_html  # noqa: E402
 from convert_hwp import hwpx_to_hwp_bytes  # noqa: E402
 from cell_ai import (  # noqa: E402
     build_cell_prompt,
     build_para_prompt,
     detect_cell_intent,
     shorten_locally,
+)
+from chat_route import (  # noqa: E402
+    compute_label_total,
+    decide_chat_route,
+    resolve_search_edit,
 )
 from workspace_docs import DocSlot, load_doc_slot, slot_list_payload  # noqa: E402
 
@@ -393,28 +397,51 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
     return "\n".join(lines)
 
 
-def _run_workspace_qa(sess: Session, question: str) -> str:
-    docs = _qa_documents(sess)
-    if not docs:
-        return "분석할 문서 내용이 없습니다. HWP/HWPX/Excel을 열어 주세요."
-    if len(docs) == 1:
-        d0 = docs[0]
-        qa = QAEngine(
-            paragraphs=d0.get("paragraphs", []),
-            table_summaries=d0.get("tables", []),
-            text_numbers=d0.get("text_numbers", []),
-            table_numbers=d0.get("table_numbers", []),
+def _explain_pending(sess: Session) -> str:
+    """Narrow editing Q&A — explain proposed changes only."""
+    if not sess.editor:
+        return "활성 편집 문서가 없습니다. HWPX를 연 뒤 제안을 확인하세요."
+    pending = sess.editor.get_pending_changes()
+    if not pending:
+        return (
+            "대기 중인 변경 제안이 없습니다. "
+            "문단/셀을 선택한 뒤 수정 지시를 하거나, "
+            "문서 분석·검토 Q&A는 Product A (Document Intelligence)를 이용하세요."
         )
-    else:
-        qa = QAEngine(documents=docs)
-    ans = qa.answer(
-        question=question,
-        use_llm=True,
-        model=sess.model,
-        ollama_url=sess.ollama_url,
-        stream=False,
+    lines = [f"대기 변경 {len(pending)}건:"]
+    for ch in pending[:20]:
+        loc = getattr(ch, "location", "") or ch.change_type
+        old = (ch.old_text or "")[:40]
+        new = (ch.new_text or "")[:40]
+        lines.append(f"• {loc}: 「{old}」 → 「{new}」 ({ch.id})")
+    if len(pending) > 20:
+        lines.append(f"… 외 {len(pending) - 20}건")
+    lines.append(
+        "\n적용하려면 「모두 적용」, 취소는 「모두 취소」를 사용하세요. "
+        "전체 문서 검증·분석은 Product A로 이동하세요."
     )
-    return (ans.get("answer") or "").strip() or "(빈 응답)"
+    return "\n".join(lines)
+
+
+def _analysis_redirect(question: str) -> str:
+    return (
+        "전체 문서 Q&A·검토·검증은 **HWP Document Intelligence** (Product A)에서 지원합니다.\n"
+        "`streamlit run apps/intelligence/app.py` 또는 `streamlit run app.py`\n\n"
+        "이 편집기(Product B)에서는:\n"
+        "· 문단/셀 선택 후 리라이트\n"
+        "· 빈칸·참고 자료 채우기 (DocFill)\n"
+        "· 제안 설명 (`변경 설명해줘`)\n"
+        "만 지원합니다.\n\n"
+        f"(질문: {question[:120]})"
+    )
+
+
+def _run_workspace_qa(sess: Session, question: str) -> str:
+    """Product B: no full-document QA — explain edits or redirect to Product A."""
+    q = (question or "").strip()
+    if re.search(r"변경|제안|pending|설명|왜\s*바|달라", q, re.I):
+        return _explain_pending(sess)
+    return _analysis_redirect(q)
 
 
 @app.get("/api/session/<sid>")
@@ -630,56 +657,52 @@ def _propose_reply(loc: str, value: str, summary: str) -> str:
     )
 
 
-@app.post("/api/chat")
-def chat():
-    body = request.get_json(force=True) or {}
-    try:
-        sess = _session(body["session_id"])
-    except KeyError:
-        return jsonify({"error": "세션 없음"}), 404
+def _answer_selection_question(sess: Session, user_msg: str) -> str:
+    """Selected location + explanatory question → chat answer only."""
+    context = ""
+    loc = ""
+    if sess.selected_cell is not None and sess.editor:
+        t, r, c = sess.selected_cell
+        rows = sess.editor.get_table_as_rows(t) or []
+        old = ""
+        if r < len(rows) and c < len(rows[r]):
+            old = rows[r][c] or ""
+        loc = f"표{t + 1} ({r + 1}행,{c + 1}열)"
+        context = old
+    elif sess.selected_para is not None and sess.editor:
+        paras = sess.editor.get_paragraphs()
+        sel = sess.selected_para
+        if 0 <= sel < len(paras):
+            context = paras[sel]["text"]
+            loc = f"문단 {sel + 1}"
 
-    user_msg = (body.get("message") or "").strip()
-    if not user_msg:
-        return jsonify({"error": "메시지를 입력하세요"}), 400
+    if not context.strip():
+        return "선택된 내용이 비어 있습니다. 다른 문단/셀을 선택하거나 Product A에서 질문하세요."
 
-    if body.get("ollama_url"):
-        sess.ollama_url = body["ollama_url"]
-    if body.get("model"):
-        sess.model = body["model"]
-
-    sess.chat.append({"role": "user", "content": user_msg})
-    intent = detect_cell_intent(user_msg)
-    route = classify_intent(user_msg)
-    _sync_active(sess)
-
-    sel = sess.selected_para
-    cell = sess.selected_cell
-    has_selection = cell is not None or sel is not None
-
-    # 선택 없음 → 멀티문서 보완(fill) / Q&A
-    if not has_selection:
-        if route == "fill" and len(sess.docs) >= 1:
-            reply = _run_workspace_fill(sess, user_msg)
-            sess.chat.append({"role": "assistant", "content": reply})
-            return jsonify(_state(sess))
-        if len(sess.docs) >= 1:
-            reply = _run_workspace_qa(sess, user_msg)
-            sess.chat.append({"role": "assistant", "content": reply})
-            return jsonify(_state(sess))
-        reply = "문서를 열어 주세요. HWP / HWPX / Excel을 여러 개 올릴 수 있습니다."
-        sess.chat.append({"role": "assistant", "content": reply})
-        return jsonify(_state(sess))
-
-    if not sess.editor:
-        reply = (
-            "활성 문서는 읽기 전용(또는 엑셀)입니다. "
-            "문단·셀 편집은 HWPX 문서를 활성으로 선택하세요. "
-            "질문·보완은 선택 없이 채팅만 하세요."
+    prompt = (
+        "사용자는 문서 일부를 선택한 채 설명·정의·개념을 묻고 있습니다.\n"
+        "문서를 수정하거나 rewritten을 만들지 마세요. 질문에 한국어로만 답하세요.\n"
+        f"위치: {loc}\n"
+        f"선택 내용:\n\"\"\"{context[:1200]}\"\"\"\n"
+        f"질문: {user_msg}\n"
+    )
+    result = generate(
+        prompt, sess.model, sess.ollama_url,
+        temperature=0.2, num_predict=800, timeout=120,
+    )
+    if result.get("error"):
+        return (
+            f"질문에 바로 답하기 어렵습니다 ({result['error']}). "
+            "전체 문서 Q&A는 Product A를 이용하세요."
         )
-        sess.chat.append({"role": "assistant", "content": reply})
-        return jsonify(_state(sess))
+    return (result.get("text") or "").strip() or "답변을 만들지 못했습니다."
 
-    paras = sess.editor.get_paragraphs()
+
+def _apply_selection_rewrite(sess: Session, user_msg: str) -> str:
+    intent = detect_cell_intent(user_msg)
+    cell = sess.selected_cell
+    sel = sess.selected_para
+    paras = sess.editor.get_paragraphs() if sess.editor else []
 
     if cell is not None:
         t, r, c = cell
@@ -700,12 +723,8 @@ def chat():
             if intent == "shorten" and old.strip():
                 det_short = shorten_locally(old, aggressive="더" in user_msg)
                 sess.editor.propose_cell_change(t, r, c, det_short, context="축약")
-                reply = _propose_reply(f"표{t+1} ({r+1}행,{c+1}열)", det_short, "축약")
-                sess.chat.append({"role": "assistant", "content": reply})
-                return jsonify(_state(sess))
-            reply = f"Ollama 오류: {result['error']}"
-            sess.chat.append({"role": "assistant", "content": reply})
-            return jsonify({"error": reply, **_state(sess)}), 502
+                return _propose_reply(f"표{t+1} ({r+1}행,{c+1}열)", det_short, "축약")
+            return f"Ollama 오류: {result['error']}"
 
         rewritten, summary = _parse_json_rewrite(result.get("text") or "")
         if not (rewritten or "").strip():
@@ -713,14 +732,12 @@ def chat():
                 rewritten = shorten_locally(old, aggressive="더" in user_msg)
                 summary = "축약"
             else:
-                reply = "수정문을 만들지 못했습니다. 지시를 더 구체적으로 해 주세요."
-                sess.chat.append({"role": "assistant", "content": reply})
-                return jsonify(_state(sess))
+                return "수정문을 만들지 못했습니다. 지시를 더 구체적으로 해 주세요."
 
         sess.editor.propose_cell_change(t, r, c, rewritten, context=summary)
-        reply = _propose_reply(f"표{t+1} ({r+1}행,{c+1}열)", rewritten, summary or "수정")
+        return _propose_reply(f"표{t+1} ({r+1}행,{c+1}열)", rewritten, summary or "수정")
 
-    elif sel is not None and 0 <= sel < len(paras):
+    if sel is not None and 0 <= sel < len(paras):
         selected_text = paras[sel]["text"]
         prompt = build_para_prompt(old=selected_text, user_msg=user_msg, intent=intent)
         result = generate(
@@ -731,27 +748,152 @@ def chat():
             if intent == "shorten" and selected_text.strip():
                 det_short = shorten_locally(selected_text, aggressive="더" in user_msg)
                 sess.editor.propose_paragraph_change(sel, det_short)
-                reply = _propose_reply(f"문단 {sel + 1}", det_short, "축약")
-                sess.chat.append({"role": "assistant", "content": reply})
-                return jsonify(_state(sess))
-            reply = f"Ollama 오류: {result['error']}"
-            sess.chat.append({"role": "assistant", "content": reply})
-            return jsonify({"error": reply, **_state(sess)}), 502
+                return _propose_reply(f"문단 {sel + 1}", det_short, "축약")
+            return f"Ollama 오류: {result['error']}"
         rewritten, summary = _parse_json_rewrite(result.get("text") or "")
         if not (rewritten or "").strip():
             if intent == "shorten" and selected_text.strip():
                 rewritten = shorten_locally(selected_text, aggressive="더" in user_msg)
                 summary = "축약"
             else:
-                reply = "수정문을 만들지 못했습니다. 지시를 더 구체적으로 해 주세요."
-                sess.chat.append({"role": "assistant", "content": reply})
-                return jsonify(_state(sess))
+                return "수정문을 만들지 못했습니다. 지시를 더 구체적으로 해 주세요."
         sess.editor.propose_paragraph_change(sel, rewritten)
-        reply = _propose_reply(f"문단 {sel + 1}", rewritten, summary or "수정")
+        return _propose_reply(f"문단 {sel + 1}", rewritten, summary or "수정")
+
+    return "선택된 문단/셀이 없습니다. 대상을 선택한 뒤 다시 지시해 주세요."
+
+
+def _apply_propose_target(sess: Session, route) -> str:
+    spec = route.spec
+    tg = route.targets[0]
+    new_text = (spec.new if spec else "") or ""
+    if not new_text.strip():
+        return "바꿀 새 문구가 없습니다. 예: *총사업비를 130억원으로 바꿔줘*"
+
+    if tg.kind == "cell" and tg.table_index is not None:
+        sess.editor.propose_cell_change(
+            tg.table_index, tg.row, tg.col, new_text, context=tg.label,
+        )
+        return _propose_reply(tg.label, new_text, "치환 제안")
+
+    if tg.kind == "paragraph" and tg.para_index is not None:
+        # Replace whole paragraph or substitute needle
+        old = tg.text
+        if spec and spec.old and spec.old in old:
+            rewritten = old.replace(spec.old, new_text, 1)
+        else:
+            rewritten = new_text
+        sess.editor.propose_paragraph_change(tg.para_index, rewritten)
+        return _propose_reply(tg.label, rewritten, "치환 제안")
+
+    return "대상 위치에 제안을 올리지 못했습니다. 문단/셀을 직접 선택해 주세요."
+
+
+def _apply_compute_edit(sess: Session, route) -> str:
+    spec = route.spec
+    label = (spec.label if spec else "") or "합계"
+    value, note = compute_label_total(sess.editor, label)
+    if not value:
+        return note
+
+    # Prefer a cell whose row contains label and last column looks like total
+    from chat_route import EditSpec, find_edit_targets
+
+    targets = find_edit_targets(sess.editor, EditSpec(label=label, new=value))
+    # Also look for rows with "합계"
+    if not targets:
+        targets = find_edit_targets(sess.editor, EditSpec(label="합계", new=value))
+
+    if len(targets) == 1:
+        tg = targets[0]
+        if tg.kind == "cell":
+            sess.editor.propose_cell_change(
+                tg.table_index, tg.row, tg.col, value, context=note,
+            )
+            return _propose_reply(tg.label, value, note)
+        sess.editor.propose_paragraph_change(tg.para_index, value)
+        return _propose_reply(tg.label, value, note)
+    if len(targets) > 1:
+        resolved = resolve_search_edit(
+            sess.editor, f"{label} 합계", EditSpec(label=label, new=value),
+        )
+        if resolved.action == "choose_targets":
+            return f"{note}: {value}\n\n" + resolved.message
+        if resolved.action == "propose_replace":
+            route2 = resolved
+            route2.spec = EditSpec(label=label, new=value)
+            return _apply_propose_target(sess, route2)
+    return (
+        f"{note} 결과: {value}\n"
+        "넣을 합계 셀을 찾지 못했습니다. 합계 셀을 선택한 뒤 "
+        f"「{value}로 수정해줘」라고 지시해 주세요."
+    )
+
+
+@app.post("/api/chat")
+def chat():
+    body = request.get_json(force=True) or {}
+    try:
+        sess = _session(body["session_id"])
+    except KeyError:
+        return jsonify({"error": "세션 없음"}), 404
+
+    user_msg = (body.get("message") or "").strip()
+    if not user_msg:
+        return jsonify({"error": "메시지를 입력하세요"}), 400
+
+    if body.get("ollama_url"):
+        sess.ollama_url = body["ollama_url"]
+    if body.get("model"):
+        sess.model = body["model"]
+
+    sess.chat.append({"role": "user", "content": user_msg})
+    _sync_active(sess)
+
+    sel = sess.selected_para
+    cell = sess.selected_cell
+    has_selection = cell is not None or sel is not None
+
+    decision = decide_chat_route(
+        message=user_msg,
+        has_selection=has_selection,
+        has_editor=bool(sess.editor),
+        has_docs=bool(sess.docs),
+    )
+
+    reply = ""
+    if decision.action == "fill":
+        reply = _run_workspace_fill(sess, user_msg)
+    elif decision.action == "explain_pending":
+        reply = _explain_pending(sess)
+    elif decision.action == "answer_selection":
+        reply = _answer_selection_question(sess, user_msg)
+    elif decision.action == "rewrite_selection":
+        if not sess.editor:
+            reply = (
+                "활성 문서는 읽기 전용(또는 엑셀)입니다. "
+                "문단·셀 편집은 HWPX 문서를 활성으로 선택하세요."
+            )
+        else:
+            reply = _apply_selection_rewrite(sess, user_msg)
+    elif decision.action == "search_edit":
+        resolved = resolve_search_edit(sess.editor, user_msg, decision.spec)
+        if resolved.action == "propose_replace":
+            reply = _apply_propose_target(sess, resolved)
+        elif resolved.action == "compute_edit":
+            reply = _apply_compute_edit(sess, resolved)
+        else:
+            reply = resolved.message
+    elif decision.action == "compute_edit":
+        reply = _apply_compute_edit(sess, decision)
+    elif decision.action == "redirect_a":
+        reply = decision.message
     else:
-        reply = _run_workspace_qa(sess, user_msg)
+        reply = decision.message or "문단이나 표 셀을 선택한 뒤 다시 지시해 주세요."
 
     sess.chat.append({"role": "assistant", "content": reply})
+    if reply.startswith("Ollama 오류:"):
+        return jsonify({"error": reply, **_state(sess)}), 502
     return jsonify(_state(sess))
 
 

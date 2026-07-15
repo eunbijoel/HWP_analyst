@@ -1,0 +1,700 @@
+"""
+Product B edit command execution (mutations).
+
+Intent classification lives in hwp_core.shared.intent_classify.
+"""
+
+import re
+from typing import Optional
+
+from hwp_core.hwpx_editor import HWPXEditor
+from hwp_core.shared.intent_classify import (
+    EDIT_DELETE,
+    TABLE_CELL_REF,
+    classify_intent,
+)
+from hwp_core.shared.replace_spec import extract_replace_spec
+from additional.ai_editor import (
+    generate_blank_fills,
+    generate_document_draft,
+    rewrite_selection,
+    rewrite_paragraph,
+    delete_paragraph_by_index,
+    insert_after_paragraph_index,
+    generate_fill_fallback,
+    insert_content_from_command,
+    delete_content_from_command,
+    delete_hwp_from_command,
+    replace_hwp_from_command,
+    apply_table_cell_amount_command,
+    apply_table_cell_ref_command,
+    parse_table_cell_ref,
+    propose_table_label_amount,
+)
+
+
+def _hwp_editor_required_message(intent: str) -> dict:
+    hints = {
+        'draft': '초안 작성은 HWPX에서 지원됩니다. HWP는 "마지막에 추가해줘"로 본문 삽입을 이용하세요.',
+        'fill': '빈칸 채우기는 HWPX에서 지원됩니다. HWP는 "마지막에 추가해줘" 형식을 이용하세요.',
+        'rewrite': '문단 다듬기는 HWPX에서 지원됩니다.',
+        'replace': '치환은 HWPX에서 지원되거나, "A를 B로 바꿔" 형식을 사용하세요.',
+    }
+    return {
+        'type': 'edit',
+        'intent': intent,
+        'message': hints.get(intent, 'HWP 편집은 "마지막에 추가해줘", "삭제해" 같은 명령을 사용하세요.'),
+        'changes': 0,
+    }
+
+
+def _try_hwp_bytes_insert(
+    command: str,
+    source_filename: str,
+    file_bytes: bytes | None,
+    chat_history: list | None,
+    intent: str,
+) -> Optional[dict]:
+    """editor 없이 .hwp 바이트에 hwpilot 삽입 시도. (insert/draft 전용 — rewrite에 쓰지 말 것)"""
+    from hwp_core.hwp_backends import get_backend_status, hwpilot_apply_content
+    from additional.ai_editor import _extract_insert_payload
+
+    if not file_bytes or not source_filename.lower().endswith('.hwp'):
+        return None
+    if not get_backend_status().hwpilot:
+        return None
+    if intent == 'rewrite':
+        return None
+
+    anchor_hint = '__END__' if re.search(r'마지막|맨\s*끝|문서\s*끝', command, re.I) else ''
+    anchor, body = _extract_insert_payload(command, chat_history)
+    if anchor_hint:
+        anchor = anchor_hint
+    if not body or len(body.strip()) < 20:
+        return None
+
+    new_bytes, msg = hwpilot_apply_content(
+        file_bytes, source_filename, body, anchor=anchor or anchor_hint)
+    if not new_bytes:
+        return None
+    return {
+        'type': 'edit',
+        'intent': intent,
+        'message': f'{msg} — HWP 파일에 반영되었습니다. 다운로드로 저장하세요.',
+        'changes': 1,
+        'elapsed': 0.0,
+        'applied_direct': True,
+        'new_file_bytes': new_bytes,
+    }
+
+
+def _extract_rewrite_target(command: str, selection_text: str = '') -> str:
+    """명령문에서 고칠 원문(제목 등) 추출. 선택 문단이 있으면 우선."""
+    if (selection_text or '').strip():
+        return selection_text.strip()
+    lines = [ln.strip() for ln in (command or '').strip().splitlines() if ln.strip()]
+    if not lines:
+        return ''
+    instr = re.compile(
+        r'짧게|줄여|간결|다듬|리라이트|수정해|바꿔|변경|고쳐|이\s*부분|제목',
+        re.I,
+    )
+    if len(lines) >= 2 and instr.search(lines[-1]):
+        # 마지막 줄이 지시 → 앞줄을 대상 (제목은 보통 첫 줄)
+        head = lines[0]
+        if 2 <= len(head) <= 120:
+            return head
+        return '\n'.join(lines[:-1]).strip()
+    # 「…」 또는 "…" 인용
+    m = re.search(r'[「"“](.+?)[」"”]', command)
+    if m and 2 <= len(m.group(1).strip()) <= 120:
+        return m.group(1).strip()
+    return ''
+
+
+def _shorten_title_locally(text: str) -> str:
+    """LLM 없이 제목형 짧은 축약 (국내·외 / 및 등 군더더기 제거)."""
+    t = (text or '').strip()
+    if not t:
+        return t
+    prefix = ''
+    m = re.match(r'^((\d+[.)]|\([0-9a-zA-Z]+\))\s*)', t)
+    if m:
+        prefix = m.group(1)
+        t = t[m.end():]
+    t = re.sub(r'국내\s*[·･⋅•]\s*외\s*', '', t)
+    t = re.sub(r'국내외\s*', '', t)
+    t = re.sub(r'\s+및\s+', '·', t)
+    t = re.sub(r'(?<=[가-힣])과\s+', '·', t)
+    t = re.sub(r'\s+', ' ', t).strip(' ·')
+    if not t:
+        return (text or '').strip()
+    if len(t) > 28:
+        t = t[:27].rstrip(' ·') + '…'
+    return f'{prefix}{t}'.strip()
+
+
+def _find_hwp_paragraph_index(paragraphs: list[str], target: str, prefer_idx: int | None) -> int | None:
+    if prefer_idx is not None and 0 <= prefer_idx < len(paragraphs):
+        return prefer_idx
+    t = (target or '').strip()
+    if not t:
+        return None
+    for i, p in enumerate(paragraphs):
+        p = (p or '').strip()
+        if p == t or t in p or p in t:
+            return i
+    # 번호 빠진 제목 매칭: "2) 국내…" vs "국내…"
+    t_bare = re.sub(r'^((\d+[.)]|\([0-9a-zA-Z]+\))\s*)', '', t).strip()
+    if t_bare:
+        for i, p in enumerate(paragraphs):
+            p_bare = re.sub(r'^((\d+[.)]|\([0-9a-zA-Z]+\))\s*)', '', (p or '').strip()).strip()
+            if p_bare == t_bare or t_bare in p_bare or p_bare in t_bare:
+                return i
+    return None
+
+
+def _try_hwp_rewrite(
+    command: str,
+    source_filename: str,
+    file_bytes: bytes | None,
+    model: str,
+    ollama_url: str,
+    selection_text: str = '',
+    para_index: int | None = None,
+) -> Optional[dict]:
+    """HWP: rewrite는 문서 끝 삽입이 아니라 해당 문단을 hwpilot으로 치환."""
+    from hwp_core.hwp_backends import (
+        apply_hwpilot_to_bytes,
+        get_backend_status,
+        hwpilot_edit_paragraph,
+    )
+    from hwp_core.hwp_parser import parse_document
+    from hwp_core.llm_client import generate
+
+    if not file_bytes or not source_filename.lower().endswith('.hwp'):
+        return None
+    if not get_backend_status().hwpilot:
+        return {
+            'type': 'edit',
+            'intent': 'rewrite',
+            'message': 'hwpilot이 없어 HWP 문단 수정을 할 수 없습니다. HWPX로 저장 후 열어 주세요.',
+            'changes': 0,
+        }
+
+    target = _extract_rewrite_target(command, selection_text)
+    doc = parse_document(file_bytes=file_bytes, filename=source_filename)
+    paras = list(doc.paragraphs or [])
+    idx = _find_hwp_paragraph_index(paras, target, para_index)
+    if idx is None:
+        return {
+            'type': 'edit',
+            'intent': 'rewrite',
+            'message': (
+                '수정할 문단을 찾지 못했습니다. '
+                '미리보기에서 해당 줄을 선택하거나, 제목을 첫 줄에 넣고 지시를 쓰세요.\n'
+                '예:\n국내·외 기술과 시장 현황\n제목 더 짧게 수정해줘'
+            ),
+            'changes': 0,
+        }
+
+    old = paras[idx] or ''
+    want_short = bool(re.search(r'짧게|줄여|간결|요약', command, re.I))
+    new_text = ''
+    summary = ''
+
+    prompt = (
+        '문서 제목/문단을 사용자 지시에 맞게 고치세요.\n'
+        'rewritten에는 수정된 문장만. "요약했습니다" 같은 메타 문구 금지.\n'
+        f'원문: """{old}"""\n'
+        f'지시: {command}\n'
+        'JSON만: {"rewritten":"...","summary":"..."}'
+    )
+    result = generate(
+        prompt, model, ollama_url,
+        temperature=0.2, num_predict=400, timeout=90,
+    )
+    if not result.get('error'):
+        raw = (result.get('text') or '').strip()
+        try:
+            import json
+            parsed = json.loads(raw)
+            new_text = str(parsed.get('rewritten') or '').strip()
+            summary = str(parsed.get('summary') or '').strip()
+        except Exception:
+            m = re.search(r'\{.*\}', raw, re.S)
+            if m:
+                try:
+                    import json
+                    parsed = json.loads(m.group())
+                    new_text = str(parsed.get('rewritten') or '').strip()
+                    summary = str(parsed.get('summary') or '').strip()
+                except Exception:
+                    pass
+
+    if (not new_text or new_text == old.strip()) and want_short:
+        new_text = _shorten_title_locally(old)
+        summary = summary or '제목 축약'
+    if not new_text or new_text == old.strip():
+        return {
+            'type': 'edit',
+            'intent': 'rewrite',
+            'message': '수정 텍스트를 만들지 못했습니다. 지시를 더 구체적으로 적어 주세요.',
+            'changes': 0,
+        }
+
+    def _edit(path: str) -> tuple[bool, str]:
+        return hwpilot_edit_paragraph(path, int(idx), new_text, old_text=old)
+
+    new_bytes, msg = apply_hwpilot_to_bytes(file_bytes, source_filename, _edit)
+    if not new_bytes:
+        return {
+            'type': 'edit',
+            'intent': 'rewrite',
+            'message': f'문단 수정 실패: {msg}',
+            'changes': 0,
+        }
+    show = new_text if len(new_text) <= 60 else new_text[:57] + '…'
+    return {
+        'type': 'edit',
+        'intent': 'rewrite',
+        'message': (
+            f'문단 {idx + 1} 수정 — 「{show}」'
+            + (f' ({summary})' if summary else '')
+            + ' — HWP에 반영되었습니다. 다운로드로 저장하세요.'
+        ),
+        'changes': 1,
+        'elapsed': 0.0,
+        'applied_direct': True,
+        'new_file_bytes': new_bytes,
+    }
+
+
+def execute_edit_command(
+    editor: Optional[HWPXEditor],
+    command: str,
+    reference_context: str,
+    model: str,
+    ollama_url: str,
+    selection_text: str = '',
+    chat_history: list | None = None,
+    source_filename: str = 'doc.hwpx',
+    file_bytes: bytes | None = None,
+    ref_summary_cache: str = '',
+    para_index: int | None = None,
+) -> dict:
+    """편집 명령 실행 → pending changes 생성."""
+    intent = classify_intent(command)
+    spec = extract_replace_spec(command)
+    pair = (spec['old'], spec['new']) if spec and spec.get('new') else None
+
+    if intent == 'table_edit':
+        if editor is None:
+            return {
+                'type': 'edit', 'intent': 'table_edit',
+                'message': (
+                    '표 셀 금액 수정·소계 재계산은 **HWPX 편집 모드**에서 지원됩니다. '
+                    'HWP 파일은 한글에서 HWPX로 저장 후 업로드하거나, '
+                    'hwpilot이 없을 때는 HWPX 문서를 사용해 주세요.'
+                ),
+                'changes': 0,
+            }
+        changes, msg, elapsed = apply_table_cell_amount_command(editor, command)
+        if changes and re.search(r'계산|소계|합계|재계산', command):
+            m = re.search(r'표\s*(\d+)', command)
+            if m:
+                editor.recalculate_totals(int(m.group(1)) - 1)
+                msg += ' · 소계/합계 행을 재계산했습니다.'
+        return {
+            'type': 'edit', 'intent': 'table_edit',
+            'message': (
+                f'{msg} — 왼쪽에서 **노란색** 확인 후 「모두 적용」'
+                if changes else msg
+            ),
+            'changes': len(changes),
+            'elapsed': elapsed,
+        }
+
+    if intent == 'append_ref':
+        from additional.reference_parser import append_summary_to_document
+        result = append_summary_to_document(
+            editor, command, reference_context, model, ollama_url,
+            chat_history=chat_history, cached_summary=ref_summary_cache,
+            source_filename=source_filename, file_bytes=file_bytes,
+        )
+        return result
+
+    if intent == 'replace':
+        if (
+            editor is None
+            and file_bytes
+            and source_filename.lower().endswith('.hwp')
+        ):
+            from hwp_core.hwp_backends import get_backend_status
+            if get_backend_status().hwpilot:
+                new_bytes, msg, highlights = replace_hwp_from_command(
+                    file_bytes, source_filename, command)
+                if new_bytes:
+                    return {
+                        'type': 'edit', 'intent': 'replace',
+                        'message': f'{msg} — HWP 파일에 반영되었습니다. 다운로드로 저장하세요.',
+                        'changes': len(highlights), 'elapsed': 0.0,
+                        'applied_direct': True,
+                        'new_file_bytes': new_bytes,
+                        'hwp_highlights': highlights,
+                    }
+                return {
+                    'type': 'edit', 'intent': 'replace',
+                    'message': msg or '치환에 실패했습니다.',
+                    'changes': 0, 'elapsed': 0.0,
+                }
+        if editor is None:
+            return _hwp_editor_required_message('replace')
+
+        if TABLE_CELL_REF.search(command) or parse_table_cell_ref(command):
+            changes, msg, elapsed = apply_table_cell_ref_command(editor, command, spec)
+            if changes:
+                return {
+                    'type': 'edit', 'intent': 'replace',
+                    'message': (
+                        f'{msg} — 왼쪽에서 **노란색** 확인 후 「모두 적용」'
+                    ),
+                    'changes': len(changes),
+                    'elapsed': elapsed,
+                }
+            if msg:
+                return {
+                    'type': 'edit', 'intent': 'replace',
+                    'message': msg,
+                    'changes': 0,
+                    'elapsed': elapsed,
+                }
+
+        if pair and pair[0] and pair[1]:
+            old, new = pair
+            if not re.search(r'\d', old) and re.search(r'[\d,]', new):
+                ch = propose_table_label_amount(
+                    editor, command, old, new, chat_history=chat_history,
+                )
+                if ch:
+                    return {
+                        'type': 'edit', 'intent': 'replace',
+                        'message': (
+                            f'표 셀 변경 제안: "{ch.old_text}" → "{ch.new_text}" '
+                            f'({ch.location}, {ch.id}) — 왼쪽에서 **노란색** 확인 후 「모두 적용」'
+                        ),
+                        'changes': 1,
+                    }
+                return {
+                    'type': 'edit', 'intent': 'replace',
+                    'message': (
+                        f'「{old[:50]}」에 해당하는 표·열을 찾지 못했습니다. '
+                        '예: *표1 8행 5열을 392,400으로 바꿔줘* 또는 앞서 *표1 전년도 매출액*처럼 표 번호를 말해 주세요.'
+                    ),
+                    'changes': 0,
+                }
+            ch = editor.propose_table_value_replace(command, old, new)
+            if ch:
+                return {
+                    'type': 'edit', 'intent': 'replace',
+                    'message': (
+                        f'표 셀 변경 제안: "{ch.old_text}" → "{ch.new_text}" '
+                        f'({ch.location}, {ch.id})'
+                    ),
+                    'changes': 1,
+                }
+            targets = editor.locate_replace_targets(old, new)
+            if not targets:
+                return {
+                    'type': 'edit', 'intent': 'replace',
+                    'message': f'문서에서 "{old[:40]}" 을(를) 찾지 못했습니다.',
+                    'changes': 0,
+                }
+            ch = editor.propose_replace(
+                old, new, location=f'"{old}" → "{new}"',
+            )
+            n = len(targets)
+            return {
+                'type': 'edit', 'intent': 'replace',
+                'message': (
+                    f'"{old}" → "{new}" 치환 제안 ({n}곳) ({ch.id}) — '
+                    '왼쪽에서 **노란색** 확인 후 「모두 적용」'
+                ),
+                'changes': 1,
+            }
+        if spec and spec.get('line_num') and spec.get('new'):
+            line = spec['line_num']
+            new = spec['new']
+            paras = editor.get_paragraphs()
+            idx = line - 1
+            if 0 <= idx < len(paras):
+                old = paras[idx]['text']
+                ch = editor.propose_replace(old, new, location=f'{line}줄 치환')
+                return {
+                    'type': 'edit', 'intent': 'replace',
+                    'message': f'{line}줄 "{old[:30]}" → "{new[:30]}" 변경 제안',
+                    'changes': 1,
+                }
+        return {
+            'type': 'edit', 'intent': 'replace',
+            'message': '치환할 내용을 찾지 못했습니다. 예: *9줄 A를 B로 바꿔줘*',
+            'changes': 0,
+        }
+
+    if intent == 'delete':
+        from hwp_core.hwp_backends import get_backend_status
+
+        if (
+            editor is None
+            and file_bytes
+            and source_filename.lower().endswith('.hwp')
+            and get_backend_status().hwpilot
+        ):
+            new_bytes, msg, highlights = delete_hwp_from_command(
+                file_bytes, source_filename, command, chat_history=chat_history)
+            if new_bytes:
+                return {
+                    'type': 'edit', 'intent': 'delete',
+                    'message': f'{msg} — HWP 파일에 반영되었습니다. 다운로드로 저장하세요.',
+                    'changes': len(highlights), 'elapsed': 0.0,
+                    'applied_direct': True,
+                    'new_file_bytes': new_bytes,
+                    'hwp_highlights': highlights,
+                }
+            return {
+                'type': 'edit', 'intent': 'delete',
+                'message': msg or '삭제에 실패했습니다.',
+                'changes': 0, 'elapsed': 0.0,
+            }
+        if editor is None:
+            return {
+                'type': 'edit', 'intent': 'delete',
+                'message': 'HWP는 HWPX 변환 후 삭제 명령을 이용하세요.',
+                'changes': 0,
+            }
+        if para_index is not None:
+            ch, msg = delete_paragraph_by_index(editor, para_index)
+            if ch:
+                return {
+                    'type': 'edit', 'intent': 'delete',
+                    'message': f'{msg} — 왼쪽에서 확인 후 「모두 적용」',
+                    'changes': 1,
+                }
+            return {'type': 'edit', 'intent': 'delete', 'message': msg, 'changes': 0}
+        changes, msg, elapsed = delete_content_from_command(
+            editor, command, chat_history=chat_history, source_filename=source_filename)
+        applied = 'hwpilot' in msg and len(changes) == 0
+        return {
+            'type': 'edit', 'intent': 'delete',
+            'message': msg if changes or applied else f'{msg} — 줄 번호(예: 17줄 삭제) 또는 삭제할 내용을 알려 주세요.',
+            'changes': len(changes),
+            'elapsed': elapsed,
+            'applied_direct': applied,
+        }
+
+    if intent == 'insert':
+        from hwp_core.hwp_backends import get_backend_status, hwpilot_apply_content
+
+        anchor_hint = ''
+        if re.search(r'마지막|맨\s*끝|문서\s*끝', command, re.I):
+            anchor_hint = '__END__'
+
+        if (
+            file_bytes
+            and source_filename.lower().endswith('.hwp')
+            and get_backend_status().hwpilot
+        ):
+            from additional.ai_editor import _extract_insert_payload
+            anchor, body = _extract_insert_payload(command, chat_history)
+            if anchor_hint:
+                anchor = anchor_hint
+            if not body or len(body.strip()) < 20:
+                return {
+                    'type': 'edit', 'intent': 'insert',
+                    'message': (
+                        '삽입할 본문을 찾지 못했습니다. '
+                        '명령에 내용을 넣거나(예: *마지막에 ○○○ 추가해줘*), '
+                        '먼저 Q&A로 초안을 받은 뒤 "마지막에 추가해줘"를 입력하세요.'
+                    ),
+                    'changes': 0, 'elapsed': 0.0,
+                }
+            new_bytes, msg = hwpilot_apply_content(
+                file_bytes, source_filename, body, anchor=anchor or anchor_hint)
+            if new_bytes:
+                return {
+                    'type': 'edit', 'intent': 'insert',
+                    'message': f'{msg} — HWP 파일에 반영되었습니다. 다운로드로 저장하세요.',
+                    'changes': 1, 'elapsed': 0.0,
+                    'applied_direct': True,
+                    'new_file_bytes': new_bytes,
+                }
+            return {
+                'type': 'edit', 'intent': 'insert',
+                'message': msg,
+                'changes': 0, 'elapsed': 0.0,
+            }
+
+        if editor is None:
+            return {
+                'type': 'edit', 'intent': 'insert',
+                'message': 'HWP 편집 실패 — hwpilot으로 문서 끝 추가를 시도했으나 반영되지 않았습니다.',
+                'changes': 0, 'elapsed': 0.0,
+            }
+
+        if para_index is not None:
+            from additional.ai_editor import _extract_insert_payload
+            _, body = _extract_insert_payload(command, chat_history)
+            if not (body or '').strip():
+                body = command
+            ch, msg = insert_after_paragraph_index(editor, para_index, body)
+            if ch:
+                return {
+                    'type': 'edit', 'intent': 'insert',
+                    'message': f'{msg} — 왼쪽에서 확인 후 「모두 적용」',
+                    'changes': 1,
+                }
+            return {'type': 'edit', 'intent': 'insert', 'message': msg, 'changes': 0}
+
+        changes, msg, elapsed = insert_content_from_command(
+            editor, command, chat_history=chat_history, source_filename=source_filename)
+        applied = '반영' in msg or 'hwpilot' in msg
+        return {
+            'type': 'edit', 'intent': 'insert',
+            'message': msg if changes or applied else f'{msg} — 문서에 해당 항목 제목이 있는지 확인해 주세요.',
+            'changes': len(changes),
+            'elapsed': elapsed,
+            'applied_direct': applied,
+        }
+
+    if intent == 'fill':
+        if editor is None:
+            return {'type': 'edit', 'intent': 'fill', 'message': 'HWP는 "마지막에 추가해줘" 형식으로 편집하거나 HWPX 변환 후 이용하세요.', 'changes': 0}
+        changes, msg, elapsed = generate_blank_fills(
+            editor, command, reference_context, model, ollama_url, max_blanks=30)
+        if not changes:
+            fb_changes, fb_msg, fb_elapsed = generate_fill_fallback(
+                editor, command, reference_context, model, ollama_url)
+            if fb_changes:
+                return {
+                    'type': 'edit',
+                    'intent': 'fill',
+                    'message': f'{fb_msg} ({fb_elapsed}s) — 추천 대상 기준으로 생성했습니다.',
+                    'changes': len(fb_changes),
+                    'elapsed': fb_elapsed,
+                }
+            return {
+                'type': 'edit',
+                'intent': 'fill',
+                'message': f'{fb_msg} ({fb_elapsed}s) — 문서 편집 대상이 없어 Q&A로 전환해 질문해도 됩니다.',
+                'changes': 0,
+                'elapsed': fb_elapsed,
+            }
+        return {
+            'type': 'edit', 'intent': 'fill',
+            'message': f'{msg} ({elapsed}s) — 왼쪽 문서에서 노란색으로 표시됩니다.',
+            'changes': len(changes), 'elapsed': elapsed,
+        }
+
+    if intent == 'draft':
+        if editor is None:
+            hwp = _try_hwp_bytes_insert(
+                command, source_filename, file_bytes, chat_history, 'draft')
+            return hwp or _hwp_editor_required_message('draft')
+        changes, msg, elapsed = generate_document_draft(
+            editor, command, reference_context, model, ollama_url)
+        if not changes and not EDIT_DELETE.search(command):
+            ins_changes, ins_msg, ins_elapsed = insert_content_from_command(
+                editor, command, chat_history=chat_history, source_filename=source_filename)
+            if ins_changes or 'hwpilot으로 문서에 반영' in ins_msg:
+                return {
+                    'type': 'edit', 'intent': 'insert',
+                    'message': f'{ins_msg} (초안 JSON 대신 채팅 내용 삽입)',
+                    'changes': len(ins_changes), 'elapsed': ins_elapsed,
+                    'applied_direct': 'hwpilot' in ins_msg,
+                }
+        return {
+            'type': 'edit', 'intent': 'draft',
+            'message': f'{msg} ({elapsed}s)',
+            'changes': len(changes), 'elapsed': elapsed,
+        }
+
+    if intent == 'rewrite':
+        if editor is None:
+            hwp = _try_hwp_rewrite(
+                command, source_filename, file_bytes,
+                model, ollama_url,
+                selection_text=selection_text,
+                para_index=para_index,
+            )
+            return hwp or _hwp_editor_required_message('rewrite')
+        if para_index is not None:
+            change, msg, elapsed = rewrite_paragraph(
+                editor, para_index, command, reference_context, model, ollama_url)
+            if change:
+                return {
+                    'type': 'edit', 'intent': 'rewrite',
+                    'message': f'{msg} ({elapsed}s)',
+                    'changes': 1, 'elapsed': elapsed,
+                }
+            return {'type': 'edit', 'intent': 'rewrite', 'message': msg, 'changes': 0}
+        target = _extract_rewrite_target(command, selection_text)
+        if not target:
+            return {
+                'type': 'edit', 'intent': 'rewrite',
+                'message': (
+                    '어떤 문장을 고칠지 모르겠습니다. '
+                    '미리보기에서 문단을 선택하거나, 제목을 첫 줄에 넣어 주세요.'
+                ),
+                'changes': 0,
+            }
+        # 문서에서 제목 문단 인덱스 확보 후 해당 문단만 리라이트
+        paras = editor.get_paragraphs()
+        found_idx = _find_hwp_paragraph_index(
+            [p.get('text') or '' for p in paras], target, None,
+        )
+        if found_idx is not None:
+            change, msg, elapsed = rewrite_paragraph(
+                editor, found_idx, command, reference_context, model, ollama_url)
+            if change:
+                return {
+                    'type': 'edit', 'intent': 'rewrite',
+                    'message': f'{msg} ({elapsed}s)',
+                    'changes': 1, 'elapsed': elapsed,
+                }
+            # LLM 실패 시 짧게 의도면 로컬 축약 제안
+            if re.search(r'짧게|줄여|간결', command, re.I):
+                short = _shorten_title_locally(paras[found_idx].get('text') or target)
+                ch = editor.propose_paragraph_change(found_idx, short)
+                return {
+                    'type': 'edit', 'intent': 'rewrite',
+                    'message': f'제목 축약 제안: 「{short}」 — 왼쪽에서 「모두 적용」',
+                    'changes': 1, 'elapsed': 0.0,
+                }
+            return {'type': 'edit', 'intent': 'rewrite', 'message': msg, 'changes': 0}
+        change, msg, elapsed = rewrite_selection(
+            editor, target, command, reference_context, model, ollama_url,
+            paragraph_index=para_index)
+        if change:
+            return {
+                'type': 'edit', 'intent': 'rewrite',
+                'message': f'{msg} ({elapsed}s)',
+                'changes': 1, 'elapsed': elapsed,
+            }
+        return {'type': 'edit', 'intent': 'rewrite', 'message': msg, 'changes': 0}
+
+    if editor is None:
+        if intent in ('replace', 'delete'):
+            return _hwp_editor_required_message(intent)
+        hwp = _try_hwp_bytes_insert(
+            command, source_filename, file_bytes, chat_history, intent)
+        return hwp or _hwp_editor_required_message(intent)
+
+    return {
+        'type': 'edit',
+        'intent': intent,
+        'message': (
+            '편집 명령을 처리하지 못했습니다. '
+            '예: *데이터공유플랫폼을 데이터쉐어링으로 바꿔줘*, *표1 8행 5열을 …으로*'
+        ),
+        'changes': 0,
+    }

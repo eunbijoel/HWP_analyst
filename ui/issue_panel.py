@@ -8,11 +8,10 @@ from typing import Any, Optional
 
 import streamlit as st
 
-from ui.document_workspace import VIEW_DIRECT
-
 ISSUE_JUMP_KEY = "issue_jump"
 PENDING_CHAT_KEY = "pending_issue_chat"
 FOCUS_DOC_KEY = "focus_doc"
+VIEW_PREVIEW = "미리보기 + 채팅 편집"
 
 
 def _issue_uid(filename: str, issue: Any, idx: int) -> str:
@@ -82,12 +81,11 @@ def jump_to_issue(filename: str, issue: Any) -> None:
     "source": getattr(issue, "source", "") or "",
     "message": getattr(issue, "message", "") or "",
   }
-  # Excel은 표 행을 보기 위해 직접 편집 모드로
+  # Product A: stay on preview (no canvas / Excel mutate jump)
   view_key = f"doc_view_xlsx_{filename}"
-  st.session_state[view_key] = VIEW_DIRECT
-  # 일반 미리보기 파일도 직접 편집 쪽으로
+  st.session_state[view_key] = VIEW_PREVIEW
   gen_key = f"doc_view_gen_{filename}"
-  st.session_state[gen_key] = VIEW_DIRECT
+  st.session_state[gen_key] = VIEW_PREVIEW
 
 
 def queue_issue_chat(filename: str, issue: Any) -> None:

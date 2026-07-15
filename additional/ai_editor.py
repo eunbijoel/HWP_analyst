@@ -552,50 +552,10 @@ def insert_content_from_command(
 
 
 def extract_replace_spec(text: str) -> Optional[dict]:
-    """치환 명령에서 old/new/line_num 추출."""
-    t = (text or '').strip()
-    m = re.search(
-        r'(\d+)\s*줄\s*(.+?)\s*(?:을|를)\s*(.+?)\s*(?:으로|로)\s*(?:바꿔|수정|변경|교체|고쳐)',
-        t, re.S,
-    )
-    if m:
-        return {
-            'line_num': int(m.group(1)),
-            'old': m.group(2).strip(),
-            'new': m.group(3).strip(),
-        }
-    m = re.search(
-        r'(\d+)\s*줄\s*(?:을|를)?\s*(.+?)\s*(?:으로|로)\s*(?:바꿔|수정|변경|교체|고쳐)',
-        t, re.S,
-    )
-    if m:
-        return {
-            'line_num': int(m.group(1)),
-            'old': '',
-            'new': m.group(2).strip(),
-        }
-    m = re.search(r'[\'""](.+?)[\'""].*?[\'""](.+?)[\'""]', t)
-    if m:
-        return {'line_num': None, 'old': m.group(1).strip(), 'new': m.group(2).strip()}
-    for pat in (
-        r'([0-9][0-9,\.]*)\s*(?:을|를)\s*([0-9][0-9,\.]*)\s*(?:으로|로)\s*(?:바꿔|수정|변경)',
-        r'([0-9][0-9,\.]*)\s*에서\s*([0-9][0-9,\.]*)\s*(?:으로|로)(?:\s*(?:바꿔|수정|변경|해))?',
-    ):
-        matches = list(re.finditer(pat, t))
-        if matches:
-            m = matches[-1]
-            return {'line_num': None, 'old': m.group(1).strip(), 'new': m.group(2).strip()}
-    for pat in (
-        r'(.+?)\s*에서\s*(.+?)\s*(?:으로|로)\s*(?:바꿔|수정|변경|교체|고쳐|해)',
-        r'(.+?)\s*(?:을|를)\s*(.+?)\s*(?:으로|로)\s*(?:바꿔|수정|변경|교체|고쳐|해)',
-    ):
-        m = re.search(pat, t, re.S)
-        if m:
-            old_s = m.group(1).strip()
-            new_s = m.group(2).strip()
-            if len(old_s) >= 1 and len(new_s) >= 1:
-                return {'line_num': None, 'old': old_s, 'new': new_s}
-    return None
+    """치환 명령에서 old/new/line_num 추출 (compat → shared.replace_spec)."""
+    from hwp_core.shared.replace_spec import extract_replace_spec as _shared
+
+    return _shared(text)
 
 
 def replace_hwp_from_command(

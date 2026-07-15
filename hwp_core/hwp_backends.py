@@ -46,14 +46,27 @@ class BackendStatus:
 
 
 def get_backend_status() -> BackendStatus:
+    hwpilot_ok = False
+    base = _hwpilot_base()
+    if base:
+        try:
+            probe = _run_cli(base + ['--help'], timeout=8)
+            hwpilot_ok = probe.returncode == 0
+        except Exception:
+            hwpilot_ok = False
     status = BackendStatus(
         pyhwp_txt=bool(shutil.which('hwp5txt')),
         pyhwp_html=bool(shutil.which('hwp5html')),
-        hwpilot=bool(_hwpilot_base()),
+        hwpilot=hwpilot_ok,
     )
     if not status.pyhwp:
         status.notes.append('pip install pyhwp 후 hwp5txt/hwp5html 사용 가능')
-    if not status.hwpilot:
+    if base and not hwpilot_ok:
+        status.notes.append(
+            'hwpilot CLI 파일은 있으나 의존성 실패 — '
+            'cd hwpilot && npm install'
+        )
+    elif not status.hwpilot:
         status.notes.append(
             'hwpilot: cd "HWP analysis/hwpilot" && npm install && npm run build'
         )
@@ -297,18 +310,33 @@ def hwpilot_find_refs(file_path: str, query: str) -> list[dict]:
 
 
 def hwpilot_convert_to_hwpx(file_bytes: bytes, filename: str = 'doc.hwp') -> Optional[bytes]:
-    """HWP → HWPX 변환."""
+    """HWP → HWPX 변환. 실패 시 None (상세는 hwpilot_convert_to_hwpx_ex)."""
+    data, _ = hwpilot_convert_to_hwpx_ex(file_bytes, filename)
+    return data
+
+
+def hwpilot_convert_to_hwpx_ex(
+    file_bytes: bytes, filename: str = 'doc.hwp',
+) -> tuple[Optional[bytes], str]:
+    """HWP → HWPX. (bytes|None, error_or_ok_note)."""
     if not _hwpilot_base():
-        return None
+        return None, 'hwpilot CLI 없음 (hwpilot/에서 npm install)'
+
+    last_err = ''
 
     def _run(in_path: str, out_path: str) -> Optional[bytes]:
+        nonlocal last_err
         data, err = hwpilot_run(['convert', in_path, out_path, '--force'], timeout=180)
         if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            last_err = err or '출력 hwpx가 비어 있음'
             return None
         with open(out_path, 'rb') as f:
             return f.read()
 
-    return _with_temp_pair(file_bytes, '.hwp', '.hwpx', _run, create_output=False)
+    result = _with_temp_pair(file_bytes, '.hwp', '.hwpx', _run, create_output=False)
+    if result:
+        return result, 'ok'
+    return None, last_err or 'hwpilot 변환 실패'
 
 
 def hwpilot_append_to_end(file_path: str, body: str) -> tuple[bool, str]:
