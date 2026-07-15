@@ -29,15 +29,21 @@ from additional.ai_editor import (
 
 EDIT_FILL = re.compile(
     r'빈\s*칸|빈칸|공란|'
-    r'(?:채우|채워)(?:\s*줘|\s*주세요|기)?|'
+    r'(?:채우|채워|보완|보충|보강)(?:\s*줘|\s*주세요|기|해)?|'
     r'기입해|입력해|'
-    r'참고\s*자료(?:를|로|로써)?.{0,24}(?:넣(?:어)?|채우|채워|작성|기입|반영|이용)|'
-    r'(?:넣(?:어)?|채우|채워|작성|기입).{0,16}(?:참고\s*자료|엑셀)',
+    r'참고\s*자료(?:를|로|로써)?.{0,24}(?:넣(?:어)?|채우|채워|작성|기입|반영|이용|보완)|'
+    r'(?:넣(?:어)?|채우|채워|작성|기입|반영|보완).{0,16}(?:참고\s*자료|엑셀|문서|자료)|'
+    r'(?:두|2)\s*(?:개\s*)?(?:문서|자료|파일).{0,24}(?:보|참고|반영|채|넣|작|보완)|'
+    r'(?:문서|자료|내용).{0,16}(?:보|참고|합쳐).{0,20}(?:보완|반영|채|넣|작)|'
+    r'내용을?\s*보(?:고|아서).{0,20}(?:보완|반영|채|넣|작)',
     re.I,
 )
 EDIT_DRAFT = re.compile(r'초안|작성해|써줘|작성해줘|제안서|계획서.*작성', re.I)
 EDIT_REWRITE = re.compile(
-    r'리라이트|다듬|명확하게|개선|짧게|줄여|공문체|기술문서',
+    r'리라이트|다듬|명확하게|개선|짧게|줄여|간결|공문체|기술문서|'
+    r'제목.{0,20}(?:수정|바꿔|변경|고쳐)|'
+    r'(?:수정|바꿔|변경|고쳐).{0,20}제목|'
+    r'이\s*부분.{0,24}(?:수정|짧게|줄여|다듬|변경)',
     re.I,
 )
 EDIT_REPLACE = re.compile(r'찾아서.*바꿔|치환|전체.*바꿔', re.I)
@@ -105,13 +111,15 @@ def _try_hwp_bytes_insert(
     chat_history: list | None,
     intent: str,
 ) -> Optional[dict]:
-    """editor 없이 .hwp 바이트에 hwpilot 삽입 시도."""
+    """editor 없이 .hwp 바이트에 hwpilot 삽입 시도. (insert/draft 전용 — rewrite에 쓰지 말 것)"""
     from hwp_core.hwp_backends import get_backend_status, hwpilot_apply_content
     from additional.ai_editor import _extract_insert_payload
 
     if not file_bytes or not source_filename.lower().endswith('.hwp'):
         return None
     if not get_backend_status().hwpilot:
+        return None
+    if intent == 'rewrite':
         return None
 
     anchor_hint = '__END__' if re.search(r'마지막|맨\s*끝|문서\s*끝', command, re.I) else ''
@@ -136,6 +144,188 @@ def _try_hwp_bytes_insert(
     }
 
 
+def _extract_rewrite_target(command: str, selection_text: str = '') -> str:
+    """명령문에서 고칠 원문(제목 등) 추출. 선택 문단이 있으면 우선."""
+    if (selection_text or '').strip():
+        return selection_text.strip()
+    lines = [ln.strip() for ln in (command or '').strip().splitlines() if ln.strip()]
+    if not lines:
+        return ''
+    instr = re.compile(
+        r'짧게|줄여|간결|다듬|리라이트|수정해|바꿔|변경|고쳐|이\s*부분|제목',
+        re.I,
+    )
+    if len(lines) >= 2 and instr.search(lines[-1]):
+        # 마지막 줄이 지시 → 앞줄을 대상 (제목은 보통 첫 줄)
+        head = lines[0]
+        if 2 <= len(head) <= 120:
+            return head
+        return '\n'.join(lines[:-1]).strip()
+    # 「…」 또는 "…" 인용
+    m = re.search(r'[「"“](.+?)[」"”]', command)
+    if m and 2 <= len(m.group(1).strip()) <= 120:
+        return m.group(1).strip()
+    return ''
+
+
+def _shorten_title_locally(text: str) -> str:
+    """LLM 없이 제목형 짧은 축약 (국내·외 / 및 등 군더더기 제거)."""
+    t = (text or '').strip()
+    if not t:
+        return t
+    prefix = ''
+    m = re.match(r'^((\d+[.)]|\([0-9a-zA-Z]+\))\s*)', t)
+    if m:
+        prefix = m.group(1)
+        t = t[m.end():]
+    t = re.sub(r'국내\s*[·･⋅•]\s*외\s*', '', t)
+    t = re.sub(r'국내외\s*', '', t)
+    t = re.sub(r'\s+및\s+', '·', t)
+    t = re.sub(r'(?<=[가-힣])과\s+', '·', t)
+    t = re.sub(r'\s+', ' ', t).strip(' ·')
+    if not t:
+        return (text or '').strip()
+    if len(t) > 28:
+        t = t[:27].rstrip(' ·') + '…'
+    return f'{prefix}{t}'.strip()
+
+
+def _find_hwp_paragraph_index(paragraphs: list[str], target: str, prefer_idx: int | None) -> int | None:
+    if prefer_idx is not None and 0 <= prefer_idx < len(paragraphs):
+        return prefer_idx
+    t = (target or '').strip()
+    if not t:
+        return None
+    for i, p in enumerate(paragraphs):
+        p = (p or '').strip()
+        if p == t or t in p or p in t:
+            return i
+    # 번호 빠진 제목 매칭: "2) 국내…" vs "국내…"
+    t_bare = re.sub(r'^((\d+[.)]|\([0-9a-zA-Z]+\))\s*)', '', t).strip()
+    if t_bare:
+        for i, p in enumerate(paragraphs):
+            p_bare = re.sub(r'^((\d+[.)]|\([0-9a-zA-Z]+\))\s*)', '', (p or '').strip()).strip()
+            if p_bare == t_bare or t_bare in p_bare or p_bare in t_bare:
+                return i
+    return None
+
+
+def _try_hwp_rewrite(
+    command: str,
+    source_filename: str,
+    file_bytes: bytes | None,
+    model: str,
+    ollama_url: str,
+    selection_text: str = '',
+    para_index: int | None = None,
+) -> Optional[dict]:
+    """HWP: rewrite는 문서 끝 삽입이 아니라 해당 문단을 hwpilot으로 치환."""
+    from hwp_core.hwp_backends import (
+        apply_hwpilot_to_bytes,
+        get_backend_status,
+        hwpilot_edit_paragraph,
+    )
+    from hwp_core.hwp_parser import parse_document
+    from hwp_core.llm_client import generate
+
+    if not file_bytes or not source_filename.lower().endswith('.hwp'):
+        return None
+    if not get_backend_status().hwpilot:
+        return {
+            'type': 'edit',
+            'intent': 'rewrite',
+            'message': 'hwpilot이 없어 HWP 문단 수정을 할 수 없습니다. HWPX로 저장 후 열어 주세요.',
+            'changes': 0,
+        }
+
+    target = _extract_rewrite_target(command, selection_text)
+    doc = parse_document(file_bytes=file_bytes, filename=source_filename)
+    paras = list(doc.paragraphs or [])
+    idx = _find_hwp_paragraph_index(paras, target, para_index)
+    if idx is None:
+        return {
+            'type': 'edit',
+            'intent': 'rewrite',
+            'message': (
+                '수정할 문단을 찾지 못했습니다. '
+                '미리보기에서 해당 줄을 선택하거나, 제목을 첫 줄에 넣고 지시를 쓰세요.\n'
+                '예:\n국내·외 기술과 시장 현황\n제목 더 짧게 수정해줘'
+            ),
+            'changes': 0,
+        }
+
+    old = paras[idx] or ''
+    want_short = bool(re.search(r'짧게|줄여|간결|요약', command, re.I))
+    new_text = ''
+    summary = ''
+
+    prompt = (
+        '문서 제목/문단을 사용자 지시에 맞게 고치세요.\n'
+        'rewritten에는 수정된 문장만. "요약했습니다" 같은 메타 문구 금지.\n'
+        f'원문: """{old}"""\n'
+        f'지시: {command}\n'
+        'JSON만: {"rewritten":"...","summary":"..."}'
+    )
+    result = generate(
+        prompt, model, ollama_url,
+        temperature=0.2, num_predict=400, timeout=90,
+    )
+    if not result.get('error'):
+        raw = (result.get('text') or '').strip()
+        try:
+            import json
+            parsed = json.loads(raw)
+            new_text = str(parsed.get('rewritten') or '').strip()
+            summary = str(parsed.get('summary') or '').strip()
+        except Exception:
+            m = re.search(r'\{.*\}', raw, re.S)
+            if m:
+                try:
+                    import json
+                    parsed = json.loads(m.group())
+                    new_text = str(parsed.get('rewritten') or '').strip()
+                    summary = str(parsed.get('summary') or '').strip()
+                except Exception:
+                    pass
+
+    if (not new_text or new_text == old.strip()) and want_short:
+        new_text = _shorten_title_locally(old)
+        summary = summary or '제목 축약'
+    if not new_text or new_text == old.strip():
+        return {
+            'type': 'edit',
+            'intent': 'rewrite',
+            'message': '수정 텍스트를 만들지 못했습니다. 지시를 더 구체적으로 적어 주세요.',
+            'changes': 0,
+        }
+
+    def _edit(path: str) -> tuple[bool, str]:
+        return hwpilot_edit_paragraph(path, int(idx), new_text, old_text=old)
+
+    new_bytes, msg = apply_hwpilot_to_bytes(file_bytes, source_filename, _edit)
+    if not new_bytes:
+        return {
+            'type': 'edit',
+            'intent': 'rewrite',
+            'message': f'문단 수정 실패: {msg}',
+            'changes': 0,
+        }
+    show = new_text if len(new_text) <= 60 else new_text[:57] + '…'
+    return {
+        'type': 'edit',
+        'intent': 'rewrite',
+        'message': (
+            f'문단 {idx + 1} 수정 — 「{show}」'
+            + (f' ({summary})' if summary else '')
+            + ' — HWP에 반영되었습니다. 다운로드로 저장하세요.'
+        ),
+        'changes': 1,
+        'elapsed': 0.0,
+        'applied_direct': True,
+        'new_file_bytes': new_bytes,
+    }
+
+
 def classify_intent(text: str) -> str:
     t = text.strip()
     spec = extract_replace_spec(t)
@@ -146,8 +336,8 @@ def classify_intent(text: str) -> str:
         REPLACE_VERBS.search(t) or re.search(r'(?:으로|로)\s*[\d,]', t)
     ):
         return 'replace'
-    # 참고자료「요약 삽입」보다 문서 채우기(자연어)를 우선. 「요약」이 있으면 append.
-    if EDIT_FILL.search(t) and not re.search(r'요약', t):
+    # 보완·채우기·두 문서 반영 → Q&A(분석가) 말고 편집 파이프
+    if EDIT_FILL.search(t) and not re.search(r'요약\s*만', t):
         return 'fill'
     if APPEND_REF.search(t):
         return 'append_ref'
@@ -540,8 +730,12 @@ def execute_edit_command(
 
     if intent == 'rewrite':
         if editor is None:
-            hwp = _try_hwp_bytes_insert(
-                command, source_filename, file_bytes, chat_history, 'rewrite')
+            hwp = _try_hwp_rewrite(
+                command, source_filename, file_bytes,
+                model, ollama_url,
+                selection_text=selection_text,
+                para_index=para_index,
+            )
             return hwp or _hwp_editor_required_message('rewrite')
         if para_index is not None:
             change, msg, elapsed = rewrite_paragraph(
@@ -553,22 +747,50 @@ def execute_edit_command(
                     'changes': 1, 'elapsed': elapsed,
                 }
             return {'type': 'edit', 'intent': 'rewrite', 'message': msg, 'changes': 0}
-        target = selection_text.strip()
+        target = _extract_rewrite_target(command, selection_text)
         if not target:
-            paras = editor.get_paragraphs()
-            if paras:
-                target = paras[0]['text']
-        if target:
-            change, msg, elapsed = rewrite_selection(
-                editor, target, command, reference_context, model, ollama_url,
-                paragraph_index=para_index)
+            return {
+                'type': 'edit', 'intent': 'rewrite',
+                'message': (
+                    '어떤 문장을 고칠지 모르겠습니다. '
+                    '미리보기에서 문단을 선택하거나, 제목을 첫 줄에 넣어 주세요.'
+                ),
+                'changes': 0,
+            }
+        # 문서에서 제목 문단 인덱스 확보 후 해당 문단만 리라이트
+        paras = editor.get_paragraphs()
+        found_idx = _find_hwp_paragraph_index(
+            [p.get('text') or '' for p in paras], target, None,
+        )
+        if found_idx is not None:
+            change, msg, elapsed = rewrite_paragraph(
+                editor, found_idx, command, reference_context, model, ollama_url)
             if change:
                 return {
                     'type': 'edit', 'intent': 'rewrite',
                     'message': f'{msg} ({elapsed}s)',
                     'changes': 1, 'elapsed': elapsed,
                 }
+            # LLM 실패 시 짧게 의도면 로컬 축약 제안
+            if re.search(r'짧게|줄여|간결', command, re.I):
+                short = _shorten_title_locally(paras[found_idx].get('text') or target)
+                ch = editor.propose_paragraph_change(found_idx, short)
+                return {
+                    'type': 'edit', 'intent': 'rewrite',
+                    'message': f'제목 축약 제안: 「{short}」 — 왼쪽에서 「모두 적용」',
+                    'changes': 1, 'elapsed': 0.0,
+                }
             return {'type': 'edit', 'intent': 'rewrite', 'message': msg, 'changes': 0}
+        change, msg, elapsed = rewrite_selection(
+            editor, target, command, reference_context, model, ollama_url,
+            paragraph_index=para_index)
+        if change:
+            return {
+                'type': 'edit', 'intent': 'rewrite',
+                'message': f'{msg} ({elapsed}s)',
+                'changes': 1, 'elapsed': elapsed,
+            }
+        return {'type': 'edit', 'intent': 'rewrite', 'message': msg, 'changes': 0}
 
     if editor is None:
         if intent in ('replace', 'delete'):

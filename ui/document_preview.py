@@ -203,12 +203,12 @@ def _build_preview_maps(editor: HWPXEditor):
 
 
 def _render_applied_cell(live_text: str, highlight: AppliedHighlight) -> str:
-    """적용된 셀 — 현재 값을 빨간색으로 (한글 파일과 동일)."""
+    """적용된 셀 — 실제 XML live_text만 표시 (없으면 빈 칸). preview로 저장 성공을 속이지 않음."""
     parts = []
     if highlight.old_text and highlight.old_text.strip() and highlight.old_text != live_text:
         parts.append(f'<span class="mod-applied-del">{_esc(highlight.old_text)}</span>')
-    display = live_text if live_text.strip() else highlight.new_text
-    if not display.strip():
+    display = live_text
+    if not (display or "").strip():
         return '<span class="cell-empty">(비어 있음)</span>'
     parts.append(f'<span class="mod-applied">{_esc(display)}</span>')
     return ''.join(parts)
@@ -290,8 +290,9 @@ def _render_table_block(
     pending_cells: dict,
     applied_cells: dict,
     max_rows: int = 50,
+    *,
+    canvas_mode: bool = False,
 ) -> str:
-    # TODO(canvas): 표 셀 클릭 선택·편집은 후속 단계에서 지원
     parts = [f'<div class="tbl-wrap" id="table-{t_idx}">']
     parts.append(f'<div class="tbl-caption">표 {t_idx + 1}</div>')
     parts.append('<table class="hwpx-tbl"><tbody>')
@@ -313,19 +314,37 @@ def _render_table_block(
             key = _cell_key(t_idx, r_idx, c_idx)
             pch = pending_cells.get(key)
             ach = applied_cells.get(key)
+            live = str(cell) if cell is not None else ''
             if pch:
                 cls, content = 'ch-pending', _render_pending_cell(pch)
                 id_attr = f' id="pending-{pch.id}"'
             elif ach:
-                cls, content = 'ch-applied', _render_applied_cell(str(cell), ach)
+                cls, content = 'ch-applied', _render_applied_cell(live, ach)
                 id_attr = ''
-            elif not cell or not str(cell).strip():
-                cls, content = 'cell-empty', '<span class="cell-empty">(비어 있음)</span>'
+            elif not live.strip():
+                cls, content = 'cell-empty', (
+                    '<span class="cell-editable cell-empty">(비어 있음)</span>'
+                    if canvas_mode else '<span class="cell-empty">(비어 있음)</span>'
+                )
                 id_attr = ''
             else:
-                cls, content = '', _esc(cell)
+                cls, content = '', (
+                    f'<span class="cell-editable">{_esc(live)}</span>'
+                    if canvas_mode else _esc(live)
+                )
                 id_attr = ''
-            parts.append(f'<{tag} class="{cls}"{span_attr}{id_attr}>{content}</{tag}>')
+
+            if canvas_mode and not pch:
+                cls = (cls + ' cell-clickable').strip()
+                data_attr = (
+                    f' data-t="{t_idx}" data-r="{r_idx}" data-c="{c_idx}"'
+                    f' data-cell-orig="{_esc(live[:300])}"'
+                )
+            else:
+                data_attr = ''
+            parts.append(
+                f'<{tag} class="{cls}"{span_attr}{id_attr}{data_attr}>{content}</{tag}>'
+            )
         parts.append('</tr>')
 
     if len(parsed.rows) > max_rows:
@@ -418,6 +437,7 @@ def build_preview_html(
                 t_idx, block['parsed'],
                 pending_cells, applied_cells,
                 max_rows=max_rows_per_table,
+                canvas_mode=canvas_mode,
             ))
             table_shown += 1
 

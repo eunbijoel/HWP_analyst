@@ -1,0 +1,907 @@
+"""
+HWP_v2 — Inline AI–style editor shell (local Ollama).
+
+Run:
+  python3 HWP_v2/server.py
+  → http://127.0.0.1:8765
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import os
+import re
+import sys
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+from flask import Flask, Response, jsonify, render_template, request, send_file
+
+_V2 = Path(__file__).resolve().parent
+_ROOT = _V2.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+if str(_V2) not in sys.path:
+    sys.path.insert(0, str(_V2))
+
+from hwp_core.hwpx_editor import HWPXEditor  # noqa: E402
+from hwp_core.hwp_parser import parse_document  # noqa: E402
+from hwp_core.llm_client import check_ollama_status, generate  # noqa: E402
+from hwp_core.qa_engine import QAEngine  # noqa: E402
+from hwp_core.doc_agent.pipeline import DocFillPipeline  # noqa: E402
+from ui.document_preview import build_preview_from_text, build_preview_html  # noqa: E402
+from ui.command_router import classify_intent  # noqa: E402
+from convert_hwp import hwpx_to_hwp_bytes  # noqa: E402
+from cell_ai import (  # noqa: E402
+    build_cell_prompt,
+    build_para_prompt,
+    detect_cell_intent,
+    shorten_locally,
+)
+from workspace_docs import DocSlot, load_doc_slot, slot_list_payload  # noqa: E402
+
+app = Flask(
+    __name__,
+    template_folder=str(_V2 / "templates"),
+    static_folder=str(_V2 / "static"),
+)
+
+DEFAULT_OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4")
+
+
+@dataclass
+class Session:
+    id: str
+    docs: dict[str, DocSlot] = field(default_factory=dict)
+    active_id: str = ""
+    filename: str = ""
+    editor: Optional[HWPXEditor] = None
+    chat: list[dict] = field(default_factory=list)
+    selected_para: Optional[int] = None
+    selected_cell: Optional[tuple[int, int, int]] = None  # t, r, c
+    source_was_hwp: bool = False
+    original_hwp_name: str = ""
+    original_hwp_bytes: Optional[bytes] = None
+    convert_note: str = ""
+    read_only: bool = False
+    readonly_html: str = ""
+    readonly_paras: list[str] = field(default_factory=list)
+    ollama_url: str = DEFAULT_OLLAMA
+    model: str = DEFAULT_MODEL
+    fill_pipeline: Optional[DocFillPipeline] = None
+
+
+SESSIONS: dict[str, Session] = {}
+
+
+def _session(sid: str) -> Session:
+    s = SESSIONS.get(sid)
+    if not s:
+        raise KeyError("session")
+    return s
+
+
+def _active(sess: Session) -> Optional[DocSlot]:
+    if sess.active_id and sess.active_id in sess.docs:
+        return sess.docs[sess.active_id]
+    if sess.docs:
+        return next(iter(sess.docs.values()))
+    return None
+
+
+def _sync_active(sess: Session) -> None:
+    """활성 슬롯 → 레거시 Session 필드 (편집/다운로드 경로 재사용)."""
+    slot = _active(sess)
+    if not slot:
+        sess.filename = ""
+        sess.editor = None
+        sess.read_only = True
+        sess.readonly_html = ""
+        sess.readonly_paras = []
+        return
+    sess.active_id = slot.id
+    sess.filename = slot.filename
+    sess.editor = slot.editor
+    sess.read_only = slot.read_only or slot.editor is None
+    sess.source_was_hwp = slot.source_was_hwp
+    sess.original_hwp_name = slot.original_hwp_name
+    sess.original_hwp_bytes = slot.original_hwp_bytes
+    sess.convert_note = slot.convert_note
+    sess.readonly_html = slot.preview_html
+    sess.readonly_paras = list(slot.paragraphs or [])
+    # 활성 슬롯 미리보기 갱신
+    if slot.editor is not None:
+        from workspace_docs import _preview_from_editor
+        slot.preview_html = _preview_from_editor(slot.editor, slot.filename)
+
+
+def _add_slot(sess: Session, slot: DocSlot, *, make_active: bool = False) -> None:
+    sess.docs[slot.id] = slot
+    if make_active or not sess.active_id:
+        # 편집 가능한 HWP(X)를 우선 활성으로
+        if make_active or slot.is_editable or not sess.active_id:
+            sess.active_id = slot.id
+    # 아직 편집 문서가 없고 방금 추가한 게 편집 가능하면 활성
+    cur = _active(sess)
+    if cur and not cur.is_editable and slot.is_editable:
+        sess.active_id = slot.id
+    _sync_active(sess)
+
+
+def _qa_documents(sess: Session) -> list[dict]:
+    return [s.qa_payload() for s in sess.docs.values() if s.paragraphs or s.qa_tables]
+
+
+def _doc_html(sess: Session) -> str:
+    slot = _active(sess)
+    if not slot:
+        return ""
+    if slot.editor is not None and not slot.read_only:
+        from workspace_docs import _preview_from_editor
+        return _preview_from_editor(slot.editor, slot.filename)
+    return slot.preview_html or sess.readonly_html
+
+
+def _pending_summary(editor: Optional[HWPXEditor]) -> list[dict]:
+    if editor is None:
+        return []
+    rows = []
+    for ch in editor.get_pending_changes():
+        rows.append({
+            "id": ch.id,
+            "type": ch.change_type,
+            "location": ch.location,
+            "old": (ch.old_text or "")[:120],
+            "new": (ch.new_text or "")[:120],
+        })
+    return rows
+
+
+def _state(sess: Session) -> dict:
+    _sync_active(sess)
+    cell = None
+    if sess.selected_cell is not None:
+        t, r, c = sess.selected_cell
+        cell = {"t": t, "r": r, "c": c}
+    pending_n = len(sess.editor.get_pending_changes()) if sess.editor else 0
+    slots = list(sess.docs.values())
+    return {
+        "session_id": sess.id,
+        "filename": sess.filename,
+        "active_id": sess.active_id,
+        "docs": slot_list_payload(slots, sess.active_id),
+        "doc_count": len(slots),
+        "pending_count": pending_n,
+        "pending": _pending_summary(sess.editor),
+        "selected_para": sess.selected_para,
+        "selected_cell": cell,
+        "source_was_hwp": sess.source_was_hwp,
+        "original_hwp_name": sess.original_hwp_name,
+        "convert_note": sess.convert_note,
+        "read_only": sess.read_only,
+        "can_try_hwp_download": bool(sess.original_hwp_bytes) or (
+            not sess.read_only and sess.editor is not None
+        ),
+        "chat": sess.chat[-40:],
+        "html": _doc_html(sess),
+        "ollama_url": sess.ollama_url,
+        "model": sess.model,
+    }
+
+
+def _parse_json_rewrite(raw: str) -> tuple[str, str]:
+    rewritten, summary = "", "제안 준비"
+    try:
+        parsed = json.loads(raw)
+        rewritten = (parsed.get("rewritten") or "").strip()
+        summary = (parsed.get("summary") or summary).strip()
+        return rewritten, summary
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r'\{.*\}', raw, re.S)
+    if m:
+        try:
+            parsed = json.loads(m.group())
+            rewritten = (parsed.get("rewritten") or "").strip()
+            summary = (parsed.get("summary") or summary).strip()
+            return rewritten, summary
+        except json.JSONDecodeError:
+            pass
+    return raw.strip(), summary
+
+
+@app.get("/")
+def index():
+    return render_template("index.html")
+
+
+@app.get("/api/health")
+def health():
+    return jsonify({"ok": True, "product": "HWP_v2"})
+
+
+@app.get("/api/ollama")
+def ollama_status():
+    url = request.args.get("url") or DEFAULT_OLLAMA
+    return jsonify(check_ollama_status(url))
+
+
+ALLOWED_EXT = (".hwp", ".hwpx", ".xlsx", ".xls")
+
+
+def _collect_upload_files() -> list[tuple[str, bytes]]:
+    """FormData: file / files 다중 지원."""
+    out: list[tuple[str, bytes]] = []
+    if request.files.getlist("files"):
+        for f in request.files.getlist("files"):
+            if f and f.filename:
+                out.append((f.filename, f.read()))
+    elif request.files.get("file"):
+        f = request.files["file"]
+        if f and f.filename:
+            out.append((f.filename, f.read()))
+    return out
+
+
+@app.post("/api/upload")
+def upload():
+    """단일/다중 업로드. session_id가 있으면 워크스페이스에 추가."""
+    items = _collect_upload_files()
+    if not items:
+        return jsonify({"error": "파일이 없습니다"}), 400
+
+    for name, _ in items:
+        if not name.lower().endswith(ALLOWED_EXT):
+            return jsonify({
+                "error": f"지원 형식: HWP / HWPX / Excel (.xlsx) — {name}",
+            }), 400
+
+    sid = (request.form.get("session_id") or "").strip()
+    ollama_url = request.form.get("ollama_url") or DEFAULT_OLLAMA
+    model = request.form.get("model") or DEFAULT_MODEL
+
+    if sid and sid in SESSIONS:
+        sess = SESSIONS[sid]
+    else:
+        sid = uuid.uuid4().hex[:12]
+        sess = Session(id=sid, ollama_url=ollama_url, model=model)
+        SESSIONS[sid] = sess
+
+    sess.ollama_url = ollama_url
+    sess.model = model
+
+    added: list[str] = []
+    notes: list[str] = []
+    for name, data in items:
+        slot = load_doc_slot(data, name)
+        # 파일명 중복이면 덮지 않고 새 슬롯
+        _add_slot(sess, slot, make_active=slot.is_editable)
+        added.append(slot.filename)
+        if slot.errors:
+            notes.append(f"{slot.filename}: {slot.errors[0]}")
+        elif slot.source_was_hwp and slot.convert_note:
+            notes.append(f"{slot.filename}: HWP→HWPX ({slot.convert_note})")
+
+    names = ", ".join(added)
+    n = len(sess.docs)
+    tip = (
+        f"워크스페이스 {n}개 · 방금 연 파일: {names}\n"
+        "• 왼쪽 목록에서 활성 문서 전환\n"
+        "• 엑셀/다른 문서는 참고 · 「두 문서 보고 보완해줘」「사업비는?」\n"
+        "• 문단·셀 선택 후 짧은 수정 지시"
+    )
+    if notes:
+        tip += "\n" + "\n".join(notes[:5])
+    sess.chat.append({"role": "assistant", "content": tip})
+    sess.selected_para = None
+    sess.selected_cell = None
+    return jsonify(_state(sess))
+
+
+@app.post("/api/set_active")
+def set_active():
+    body = request.get_json(force=True) or {}
+    try:
+        sess = _session(body["session_id"])
+    except KeyError:
+        return jsonify({"error": "세션 없음"}), 404
+    doc_id = body.get("doc_id") or ""
+    if doc_id not in sess.docs:
+        return jsonify({"error": "문서를 찾을 수 없습니다"}), 404
+    sess.active_id = doc_id
+    sess.selected_para = None
+    sess.selected_cell = None
+    _sync_active(sess)
+    return jsonify(_state(sess))
+
+
+def _run_workspace_fill(sess: Session, command: str) -> str:
+    """활성 HWP(X) = target, 나머지 = 참고 (엑셀 포함)."""
+    slots = list(sess.docs.values())
+    targets = [s for s in slots if s.kind in ("hwp", "hwpx") and s.bytes_data]
+    if not targets:
+        return "채울 HWP/HWPX가 없습니다. 문서를 하나 더 열어 주세요."
+    active = _active(sess)
+    target = active if active and active.kind in ("hwp", "hwpx") else targets[0]
+    refs = [s for s in slots if s.id != target.id]
+    if not refs:
+        return (
+            "참고할 자료(엑셀·다른 문서)를 하나 더 열어 주세요. "
+            "그다음 「내용 보완해줘」라고 해 주세요."
+        )
+
+    pipe = DocFillPipeline()
+    sess.fill_pipeline = pipe
+    r = pipe.register_target(target.filename, target.bytes_data)
+    err = r.get("error") or ""
+    if err and ("HWPX" in err or "변환" in err or "불가" in err):
+        return err
+    for ref in refs:
+        pipe.register_reference(ref.filename, ref.bytes_data)
+
+    insp = pipe.run_inspect()
+    if not insp.get("ok"):
+        data = insp.get("data") or {}
+        return insp.get("error") or data.get("error") or "문서를 읽지 못했습니다."
+
+    out = pipe.run_propose(
+        command, use_llm=True, model=sess.model, ollama_url=sess.ollama_url,
+    )
+    if not out.get("ok"):
+        return out.get("error") or "초안을 만들지 못했습니다."
+
+    proposals = (out.get("data") or {}).get("proposals") or []
+    if not proposals:
+        return (
+            f"「{target.filename}」과 참고({', '.join(r.filename for r in refs)})를 봤지만 "
+            "반영할 빈칸·초안을 찾지 못했습니다."
+        )
+
+    # 즉시 적용 시도
+    approved = [p["proposal_id"] for p in proposals]
+    applied = pipe.run_apply(approved)
+    if applied.get("ok"):
+        data = applied.get("data") or {}
+        edited = data.get("edited_bytes") or getattr(pipe.tools, "last_edited_bytes", None)
+        if edited and target.id in sess.docs:
+            # 결과로 슬롯 갱신
+            new_slot = load_doc_slot(edited, target.filename)
+            new_slot.id = target.id
+            if target.source_was_hwp:
+                new_slot.source_was_hwp = True
+                new_slot.original_hwp_name = target.original_hwp_name
+                new_slot.original_hwp_bytes = target.original_hwp_bytes
+            sess.docs[target.id] = new_slot
+            sess.active_id = target.id
+            _sync_active(sess)
+            return (
+                f"✅ 보완 {len(proposals)}건을 「{target.filename}」에 반영했습니다. "
+                f"참고: {', '.join(r.filename for r in refs)}\n"
+                "왼쪽 미리보기·저장으로 확인하세요."
+            )
+    # 적용 실패해도 제안 목록은 안내
+    lines = [f"초안 {len(proposals)}건 (자동 적용 일부 실패 — 요지만 표시):"]
+    for p in proposals[:8]:
+        loc = p.get("location") or p.get("field_id") or ""
+        after = (p.get("after") or "")[:80]
+        lines.append(f"• {loc}: {after}")
+    return "\n".join(lines)
+
+
+def _run_workspace_qa(sess: Session, question: str) -> str:
+    docs = _qa_documents(sess)
+    if not docs:
+        return "분석할 문서 내용이 없습니다. HWP/HWPX/Excel을 열어 주세요."
+    if len(docs) == 1:
+        d0 = docs[0]
+        qa = QAEngine(
+            paragraphs=d0.get("paragraphs", []),
+            table_summaries=d0.get("tables", []),
+            text_numbers=d0.get("text_numbers", []),
+            table_numbers=d0.get("table_numbers", []),
+        )
+    else:
+        qa = QAEngine(documents=docs)
+    ans = qa.answer(
+        question=question,
+        use_llm=True,
+        model=sess.model,
+        ollama_url=sess.ollama_url,
+        stream=False,
+    )
+    return (ans.get("answer") or "").strip() or "(빈 응답)"
+
+
+@app.get("/api/session/<sid>")
+def get_session(sid: str):
+    try:
+        return jsonify(_state(_session(sid)))
+    except KeyError:
+        return jsonify({"error": "세션 없음 — 다시 업로드"}), 404
+
+
+@app.post("/api/select")
+def select_target():
+    body = request.get_json(force=True) or {}
+    try:
+        sess = _session(body["session_id"])
+    except KeyError:
+        return jsonify({"error": "세션 없음"}), 404
+
+    kind = body.get("kind") or "paragraph"
+    if kind == "cell":
+        sess.selected_para = None
+        sess.selected_cell = (
+            int(body["t"]), int(body["r"]), int(body["c"]),
+        )
+    else:
+        sess.selected_cell = None
+        idx = body.get("paragraph_index")
+        sess.selected_para = int(idx) if idx is not None else None
+    return jsonify({
+        "selected_para": sess.selected_para,
+        "selected_cell": (
+            {"t": sess.selected_cell[0], "r": sess.selected_cell[1], "c": sess.selected_cell[2]}
+            if sess.selected_cell else None
+        ),
+    })
+
+
+@app.post("/api/edit_paragraph")
+def edit_paragraph():
+    """v1 canvas와 동일: propose/accept 없이 XML에 즉시 반영 (track_changes=False)."""
+    body = request.get_json(force=True) or {}
+    try:
+        sess = _session(body["session_id"])
+    except KeyError:
+        return jsonify({"error": "세션 없음"}), 404
+    if not sess.editor:
+        return jsonify({"error": "읽기 전용 — 인라인 편집 불가"}), 400
+    idx = int(body["paragraph_index"])
+    text = (body.get("text") or "").strip()
+    paras = sess.editor.get_paragraphs()
+    if idx < 0 or idx >= len(paras):
+        return jsonify({"error": f"문단 인덱스 범위 오류: {idx}"}), 400
+    old = paras[idx].get("text") or ""
+    if text == old:
+        return jsonify({"ok": True, **_state(sess)})
+
+    # 같은 문단의 pending AI 제안은 거절
+    for ch in sess.editor.pending_changes:
+        if ch.status == "pending" and ch.paragraph_index == idx:
+            ch.status = "rejected"
+
+    ok = sess.editor._set_paragraph_text(idx, text, track_changes=False)
+    if not ok:
+        return jsonify({"error": "문단 XML 반영 실패"}), 400
+    sess.editor._bump_preview()
+    sess.editor._invalidate_structure_cache()
+
+    # HWP로 연 경우 — v1처럼 working HWP에도 즉시 미러
+    _mirror_hwp_paragraph(sess, idx, text, old)
+
+    # export가 실제로 반영됐는지 검증
+    err = _verify_para_in_export(sess.editor, idx, text)
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, **_state(sess)})
+
+
+@app.post("/api/edit_cell")
+def edit_cell():
+    """v1 canvas와 동일: 셀 XML 즉시 반영."""
+    body = request.get_json(force=True) or {}
+    try:
+        sess = _session(body["session_id"])
+    except KeyError:
+        return jsonify({"error": "세션 없음"}), 404
+    if not sess.editor:
+        return jsonify({"error": "읽기 전용 — 인라인 편집 불가"}), 400
+    t, r, c = int(body["t"]), int(body["r"]), int(body["c"])
+    text = body.get("text")
+    if text is None:
+        return jsonify({"error": "text 필요"}), 400
+    text = str(text)
+    if text.strip() in ("(비어 있음)",):
+        text = ""
+
+    rows = sess.editor.get_table_as_rows(t)
+    old = ""
+    if r < len(rows) and c < len(rows[r]):
+        old = rows[r][c] or ""
+    if text == old:
+        return jsonify({"ok": True, **_state(sess)})
+
+    for ch in sess.editor.pending_changes:
+        if (
+            ch.status == "pending"
+            and ch.change_type == "cell"
+            and ch.table_index == t
+            and ch.row == r
+            and ch.col == c
+        ):
+            ch.status = "rejected"
+
+    ok = sess.editor.edit_table_cell(t, r, c, text)
+    if not ok:
+        return jsonify({"error": "셀 XML 반영 실패 — 위치/병합셀 확인"}), 400
+    sess.editor._bump_preview()
+    sess.editor._invalidate_structure_cache()
+
+    _mirror_hwp_cell(sess, t, r, c, text)
+
+    err = _verify_cell_in_export(sess.editor, t, r, c, text)
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, **_state(sess)})
+
+
+def _mirror_hwp_paragraph(sess: Session, idx: int, text: str, old: str) -> None:
+    if not sess.original_hwp_bytes:
+        return
+    from hwp_core.hwp_backends import apply_hwpilot_to_bytes, hwpilot_edit_paragraph
+
+    name = sess.original_hwp_name or "doc.hwp"
+
+    def _edit(path: str) -> tuple[bool, str]:
+        return hwpilot_edit_paragraph(path, int(idx), text, old_text=old)
+
+    new_b, _ = apply_hwpilot_to_bytes(sess.original_hwp_bytes, name, _edit)
+    if new_b:
+        sess.original_hwp_bytes = new_b
+        slot = _active(sess)
+        if slot:
+            slot.original_hwp_bytes = new_b
+
+
+def _mirror_hwp_cell(sess: Session, t: int, r: int, c: int, text: str) -> None:
+    if not sess.original_hwp_bytes:
+        return
+    from hwp_core.hwp_backends import apply_hwpilot_to_bytes, hwpilot_edit_table_cell
+
+    name = sess.original_hwp_name or "doc.hwp"
+    ref = f"s0.t{t}.r{r}.c{c}"
+
+    def _edit(path: str) -> tuple[bool, str]:
+        return hwpilot_edit_table_cell(path, ref, text)
+
+    new_b, _ = apply_hwpilot_to_bytes(sess.original_hwp_bytes, name, _edit)
+    if new_b:
+        sess.original_hwp_bytes = new_b
+        slot = _active(sess)
+        if slot:
+            slot.original_hwp_bytes = new_b
+
+
+def _verify_para_in_export(editor: HWPXEditor, idx: int, text: str) -> str:
+    data = editor.get_export_bytes()
+    ok, err = HWPXEditor.validate_hwpx_bytes(data)
+    if not ok:
+        return f"저장 검증 실패: {err}"
+    check = HWPXEditor(data)
+    paras = check.get_paragraphs()
+    if idx >= len(paras):
+        return "저장 검증 실패: 문단 인덱스 없음"
+    got = (paras[idx].get("text") or "").strip()
+    want = (text or "").strip()
+    if got != want and want not in got:
+        return f"저장 검증 실패: 문단에 「{want[:40]}」 미반영 (현재: 「{got[:40]}」)"
+    return ""
+
+
+def _verify_cell_in_export(editor: HWPXEditor, t: int, r: int, c: int, text: str) -> str:
+    data = editor.get_export_bytes()
+    ok, err = HWPXEditor.validate_hwpx_bytes(data)
+    if not ok:
+        return f"저장 검증 실패: {err}"
+    check = HWPXEditor(data)
+    rows = check.get_table_as_rows(t)
+    got = ""
+    if r < len(rows) and c < len(rows[r]):
+        got = rows[r][c] or ""
+    want = text or ""
+    if got != want and want.strip() not in (got or ""):
+        return f"저장 검증 실패: 셀에 「{want[:40]}」 미반영 (현재: 「{(got or '')[:40]}」)"
+    return ""
+
+
+def _row_hint(editor: HWPXEditor, t: int, r: int) -> str:
+    try:
+        rows = editor.get_table_as_rows(t)
+        if not rows:
+            return ""
+        header = " | ".join((x or "")[:24] for x in rows[0][:12])
+        cur = " | ".join((x or "")[:24] for x in rows[r][:12]) if r < len(rows) else ""
+        return f"헤더: {header} / 현재행: {cur}"
+    except Exception:
+        return ""
+
+
+def _propose_reply(loc: str, value: str, summary: str) -> str:
+    show = value if len(value) <= 80 else value[:77] + "…"
+    return (
+        f"{summary}\n→ 「{show}」\n\n"
+        f"{loc}에 제안을 올렸습니다. 「전체 수락」또는「전체 거절」을 누르세요."
+    )
+
+
+@app.post("/api/chat")
+def chat():
+    body = request.get_json(force=True) or {}
+    try:
+        sess = _session(body["session_id"])
+    except KeyError:
+        return jsonify({"error": "세션 없음"}), 404
+
+    user_msg = (body.get("message") or "").strip()
+    if not user_msg:
+        return jsonify({"error": "메시지를 입력하세요"}), 400
+
+    if body.get("ollama_url"):
+        sess.ollama_url = body["ollama_url"]
+    if body.get("model"):
+        sess.model = body["model"]
+
+    sess.chat.append({"role": "user", "content": user_msg})
+    intent = detect_cell_intent(user_msg)
+    route = classify_intent(user_msg)
+    _sync_active(sess)
+
+    sel = sess.selected_para
+    cell = sess.selected_cell
+    has_selection = cell is not None or sel is not None
+
+    # 선택 없음 → 멀티문서 보완(fill) / Q&A
+    if not has_selection:
+        if route == "fill" and len(sess.docs) >= 1:
+            reply = _run_workspace_fill(sess, user_msg)
+            sess.chat.append({"role": "assistant", "content": reply})
+            return jsonify(_state(sess))
+        if len(sess.docs) >= 1:
+            reply = _run_workspace_qa(sess, user_msg)
+            sess.chat.append({"role": "assistant", "content": reply})
+            return jsonify(_state(sess))
+        reply = "문서를 열어 주세요. HWP / HWPX / Excel을 여러 개 올릴 수 있습니다."
+        sess.chat.append({"role": "assistant", "content": reply})
+        return jsonify(_state(sess))
+
+    if not sess.editor:
+        reply = (
+            "활성 문서는 읽기 전용(또는 엑셀)입니다. "
+            "문단·셀 편집은 HWPX 문서를 활성으로 선택하세요. "
+            "질문·보완은 선택 없이 채팅만 하세요."
+        )
+        sess.chat.append({"role": "assistant", "content": reply})
+        return jsonify(_state(sess))
+
+    paras = sess.editor.get_paragraphs()
+
+    if cell is not None:
+        t, r, c = cell
+        rows = sess.editor.get_table_as_rows(t)
+        old = ""
+        if r < len(rows) and c < len(rows[r]):
+            old = rows[r][c] or ""
+
+        prompt = build_cell_prompt(
+            filename=sess.filename, t=t, r=r, c=c, old=old,
+            user_msg=user_msg, intent=intent, row_hint=_row_hint(sess.editor, t, r),
+        )
+        result = generate(
+            prompt, sess.model, sess.ollama_url,
+            temperature=0.25, num_predict=900, format="json", timeout=180,
+        )
+        if result.get("error"):
+            if intent == "shorten" and old.strip():
+                det_short = shorten_locally(old, aggressive="더" in user_msg)
+                sess.editor.propose_cell_change(t, r, c, det_short, context="축약")
+                reply = _propose_reply(f"표{t+1} ({r+1}행,{c+1}열)", det_short, "축약")
+                sess.chat.append({"role": "assistant", "content": reply})
+                return jsonify(_state(sess))
+            reply = f"Ollama 오류: {result['error']}"
+            sess.chat.append({"role": "assistant", "content": reply})
+            return jsonify({"error": reply, **_state(sess)}), 502
+
+        rewritten, summary = _parse_json_rewrite(result.get("text") or "")
+        if not (rewritten or "").strip():
+            if intent == "shorten" and old.strip():
+                rewritten = shorten_locally(old, aggressive="더" in user_msg)
+                summary = "축약"
+            else:
+                reply = "수정문을 만들지 못했습니다. 지시를 더 구체적으로 해 주세요."
+                sess.chat.append({"role": "assistant", "content": reply})
+                return jsonify(_state(sess))
+
+        sess.editor.propose_cell_change(t, r, c, rewritten, context=summary)
+        reply = _propose_reply(f"표{t+1} ({r+1}행,{c+1}열)", rewritten, summary or "수정")
+
+    elif sel is not None and 0 <= sel < len(paras):
+        selected_text = paras[sel]["text"]
+        prompt = build_para_prompt(old=selected_text, user_msg=user_msg, intent=intent)
+        result = generate(
+            prompt, sess.model, sess.ollama_url,
+            temperature=0.3, num_predict=1500, format="json", timeout=180,
+        )
+        if result.get("error"):
+            if intent == "shorten" and selected_text.strip():
+                det_short = shorten_locally(selected_text, aggressive="더" in user_msg)
+                sess.editor.propose_paragraph_change(sel, det_short)
+                reply = _propose_reply(f"문단 {sel + 1}", det_short, "축약")
+                sess.chat.append({"role": "assistant", "content": reply})
+                return jsonify(_state(sess))
+            reply = f"Ollama 오류: {result['error']}"
+            sess.chat.append({"role": "assistant", "content": reply})
+            return jsonify({"error": reply, **_state(sess)}), 502
+        rewritten, summary = _parse_json_rewrite(result.get("text") or "")
+        if not (rewritten or "").strip():
+            if intent == "shorten" and selected_text.strip():
+                rewritten = shorten_locally(selected_text, aggressive="더" in user_msg)
+                summary = "축약"
+            else:
+                reply = "수정문을 만들지 못했습니다. 지시를 더 구체적으로 해 주세요."
+                sess.chat.append({"role": "assistant", "content": reply})
+                return jsonify(_state(sess))
+        sess.editor.propose_paragraph_change(sel, rewritten)
+        reply = _propose_reply(f"문단 {sel + 1}", rewritten, summary or "수정")
+    else:
+        reply = _run_workspace_qa(sess, user_msg)
+
+    sess.chat.append({"role": "assistant", "content": reply})
+    return jsonify(_state(sess))
+
+
+@app.post("/api/accept_all")
+def accept_all():
+    body = request.get_json(force=True) or {}
+    try:
+        sess = _session(body["session_id"])
+    except KeyError:
+        return jsonify({"error": "세션 없음"}), 404
+    if not sess.editor:
+        return jsonify({"error": "읽기 전용"}), 400
+    # 수락도 직접 수정과 같이 깨끗한 텍스트 치환 (strike/green 대신)
+    pending = list(sess.editor.get_pending_changes())
+    n = sess.editor.accept_all_pending(track_changes=False)
+    for ch in pending:
+        if ch.status != "accepted":
+            continue
+        if ch.change_type == "cell" and ch.table_index is not None:
+            _mirror_hwp_cell(sess, ch.table_index, ch.row, ch.col, ch.new_text or "")
+        elif ch.change_type == "paragraph" and ch.paragraph_index is not None:
+            _mirror_hwp_paragraph(
+                sess, ch.paragraph_index, ch.new_text or "", ch.old_text or "",
+            )
+    sess.chat.append({
+        "role": "assistant",
+        "content": f"✅ AI 제안 {n}건을 문서에 반영했습니다.",
+    })
+    return jsonify({"accepted": n, **_state(sess)})
+
+
+@app.post("/api/reject_all")
+def reject_all():
+    body = request.get_json(force=True) or {}
+    try:
+        sess = _session(body["session_id"])
+    except KeyError:
+        return jsonify({"error": "세션 없음"}), 404
+    if not sess.editor:
+        return jsonify({"error": "읽기 전용"}), 400
+    n = sess.editor.reject_all_pending()
+    sess.editor.pending_changes = [
+        c for c in sess.editor.pending_changes if c.status == "pending"
+    ]
+    sess.editor._bump_preview()
+    sess.chat.append({
+        "role": "assistant",
+        "content": f"❌ AI 제안 {n}건을 거절했습니다.",
+    })
+    return jsonify({"rejected": n, **_state(sess)})
+
+
+def _export_hwp_via_hwpilot(sess: Session) -> tuple[Optional[bytes], str]:
+    """v1과 동일: 편집 중 미러링된 working HWP bytes를 그대로 반환.
+
+    (이전: HWPX highlight를 원본에 재적용 → 인덱스 불일치로 원본/실패)
+    """
+    if not sess.original_hwp_bytes:
+        return None, "원본 HWP가 없습니다 (HWPX만 연 경우)"
+    return bytes(sess.original_hwp_bytes), "working HWP"
+
+
+def _ascii_filename(name: str, ext: str) -> str:
+    """다운로드용 ASCII 파일명 (한글만 있으면 document)."""
+    stem = Path(name).stem
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "document"
+    return f"{safe}_edited.{ext.lstrip('.')}"
+
+
+def _build_export(sess: Session, fmt: str) -> tuple[Optional[bytes], str, str]:
+    """Returns (bytes|None, filename, error)."""
+    stem_src = sess.original_hwp_name or sess.filename
+    if fmt == "hwp":
+        hwp_data, note = _export_hwp_via_hwpilot(sess)
+        if not hwp_data and sess.editor:
+            hwp_data, note2 = hwpx_to_hwp_bytes(
+                sess.editor.get_export_bytes(), sess.filename,
+            )
+            note = f"{note}; {note2}"
+        if not hwp_data:
+            return None, "", (
+                f"HWP 저장 실패 ({note}). "
+                "대신 「저장 · HWPX」로 받은 뒤 한글에서 HWP로 저장하세요."
+            )
+        return hwp_data, _ascii_filename(stem_src, "hwp"), ""
+
+    if sess.read_only or sess.editor is None:
+        return None, "", "읽기 전용 — HWPX 편집본 없음. HWP 버튼으로 원본을 받으세요."
+
+    data = sess.editor.get_export_bytes()
+    ok, err = HWPXEditor.validate_hwpx_bytes(data)
+    if not ok:
+        return None, "", f"HWPX 손상: {err}"
+    return data, _ascii_filename(stem_src, "hwpx"), ""
+
+
+@app.get("/api/download/<sid>")
+def download(sid: str):
+    """바이너리 첨부 (octet-stream). 브라우저 미리보기 금지."""
+    try:
+        sess = _session(sid)
+    except KeyError:
+        return jsonify({"error": "세션 없음"}), 404
+    fmt = (request.args.get("fmt") or "hwpx").lower()
+    data, filename, err = _build_export(sess, fmt)
+    if err or not data:
+        return jsonify({"error": err or "다운로드 실패"}), 400
+
+    # Flask send_file 대신 헤더를 직접 고정 — Cursor/일부 프록시가 ZIP을 탭에 열던 문제 차단
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Length": str(len(data)),
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-store",
+    }
+    return Response(data, status=200, headers=headers, direct_passthrough=True)
+
+
+@app.get("/api/export/<sid>")
+def export_b64(sid: str):
+    """다운로드용 JSON+base64 (브라우저에서 파일로 저장)."""
+    try:
+        sess = _session(sid)
+    except KeyError:
+        return jsonify({"error": "세션 없음"}), 404
+    fmt = (request.args.get("fmt") or "hwpx").lower()
+    data, filename, err = _build_export(sess, fmt)
+    if err or not data:
+        return jsonify({"error": err or "내보내기 실패"}), 400
+    return jsonify({
+        "filename": filename,
+        "fmt": fmt,
+        "size": len(data),
+        "b64": base64.b64encode(data).decode("ascii"),
+        "magic": "PK" if data[:2] == b"PK" else data[:4].hex(),
+    })
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("HWP_V2_PORT", "8765"))
+    try:
+        from hwp_core.hwp_backends import get_backend_status
+        st = get_backend_status()
+        print(f"backends: {st.summary()}")
+        for n in st.notes:
+            print(f"  ! {n}")
+        if not st.hwpilot:
+            print("  → HWP 열기: cd hwpilot && npm install")
+    except Exception as e:
+        print("backend check failed:", e)
+    print(f"HWP_v2 → http://127.0.0.1:{port}")
+    app.run(host="0.0.0.0", port=port, debug=True)

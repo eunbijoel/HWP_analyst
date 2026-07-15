@@ -17,6 +17,11 @@ prompts:
     version: "1.1"
     description: 문서 근거형 최종 답변 (memory·issue 슬롯 포함)
 
+  stage2.enrich:
+    path: stage2/enrich.v1.md
+    version: "1.0"
+    description: 다중 문서 보완·채우기 초안 (편집 도우미 톤)
+
   stage2.pandas_code:
     path: stage2/pandas_code.v1.md
     version: "1.0"

@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HWP Analyser</title>
+  <link rel="stylesheet" href="/static/css/app.css?v=10" />
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">HWP</span>
+        <div>
+          <strong>HWP Analyser</strong>
+          <small>멀티문서 · Excel · 직접 수정 · AI</small>
+        </div>
+      </div>
+      <div class="top-actions">
+        <label class="file-btn">
+          파일 추가
+          <input type="file" id="fileInput" accept=".hwpx,.hwp,.xlsx,.xls" multiple hidden />
+        </label>
+        <button type="button" id="btnDownload" class="ghost" disabled title="편집본 HWPX 저장">저장 · HWPX</button>
+        <button type="button" id="btnDownloadHwp" class="ghost" disabled title="편집본 HWP 저장">저장 · HWP</button>
+        <details class="settings-pop">
+          <summary class="ghost">설정</summary>
+          <div class="settings-panel">
+            <label>Ollama URL
+              <input type="text" id="ollamaUrl" value="http://localhost:11434" />
+            </label>
+            <label>모델
+              <select id="modelSelect"></select>
+            </label>
+            <div class="ai-settings-row">
+              <button type="button" id="btnOllama" class="ghost small">연결 확인</button>
+              <span id="ollamaStatus" class="status">—</span>
+            </div>
+          </div>
+        </details>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="docs-pane" id="docsPane">
+        <div class="docs-head">워크스페이스</div>
+        <div id="docList" class="doc-list">
+          <div class="doc-list-empty">HWP · HWPX · Excel을<br>여러 개 올려 보세요</div>
+        </div>
+      </aside>
+
+      <section class="editor-pane">
+        <div class="editor-toolbar">
+          <span id="docName" class="doc-name">문서를 열어 주세요</span>
+          <span id="pendingBadge" class="badge hidden">제안 0</span>
+          <span id="hwpNote" class="note hidden"></span>
+          <span class="edit-tip">클릭=선택 · 더블클릭=편집 · Ctrl+S=저장</span>
+        </div>
+        <div class="paper-scroll" id="paperScroll">
+          <div class="empty-state" id="emptyState">
+            <h1>HWP Analyser</h1>
+            <p>HWP / HWPX / <b>Excel</b>을 함께 여세요.<br>
+              예: <em>두 문서 보고 내용 보완해줘</em> · <em>총 사업비는?</em><br>
+              문단·셀을 고른 뒤엔 짧은 수정 지시도 됩니다.</p>
+          </div>
+          <div id="docRoot" class="doc-root" hidden></div>
+        </div>
+      </section>
+
+      <aside class="ai-pane">
+        <div class="ai-top">
+          <div class="ai-header">
+            <h2>AI</h2>
+            <p>멀티문서 Q&amp;A · 보완 · 선택 수정</p>
+          </div>
+          <div class="selection-box">
+            <div class="sel-label">선택</div>
+            <div id="selInfo" class="sel-info">없으면 전체 문서·엑셀로 질문/보완</div>
+          </div>
+        </div>
+
+        <div class="chat" id="chatLog"></div>
+
+        <div class="ai-bottom">
+          <div class="accept-row">
+            <button type="button" id="btnAccept" class="primary" disabled>전체 수락</button>
+            <button type="button" id="btnReject" class="danger" disabled>전체 거절</button>
+          </div>
+          <form class="composer" id="chatForm">
+            <textarea id="chatInput" rows="2" placeholder="예: 두 문서 보고 보완해줘 / 사업비는?"></textarea>
+            <button type="submit" id="btnSend" disabled>보내기</button>
+          </form>
+        </div>
+      </aside>
+    </main>
+  </div>
+  <script src="/static/js/app.js?v=10"></script>
+</body>
+</html>

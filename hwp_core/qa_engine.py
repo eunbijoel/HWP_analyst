@@ -25,6 +25,12 @@ OVERVIEW_QUESTION = re.compile(
     r'알려|소개|요약|개요|무슨|어떤\s*내용|설명해|정리해|이\s*자료|이\s*문서|전체|개략|뭐에\s*관',
     re.I,
 )
+ENRICH_QUESTION = re.compile(
+    r'보완|보충|보강|반영|채워|채우|기입|'
+    r'(?:두|2)\s*(?:개\s*)?(?:문서|자료|파일)|'
+    r'(?:문서|자료).{0,12}(?:보|참고).{0,16}(?:보완|반영|채|넣|작)',
+    re.I,
+)
 COREF_QUESTION = re.compile(
     r'거기|그것|그거|이것|저것|해당|위에서|앞에서|방금|이번|앞의|위의|말한|그\s*기관|그\s*회사',
     re.I,
@@ -1401,9 +1407,10 @@ class QAEngine:
             history_text = self._format_history(history)
             history_section = f"\n## 이전 대화 (맥락 참고용):\n{history_text}\n"
 
+        prompt_id = "stage2.enrich" if ENRICH_QUESTION.search(question) else "stage2.answer"
         prompt = render_prompt(
-            "stage2.answer",
-            system_prompt=render_prompt("system.hwp_analyst"),
+            prompt_id,
+            system_prompt=render_prompt("system.hwp_analyst") if prompt_id == "stage2.answer" else "",
             context=context,
             pre_section=pre_section,
             rule_section=rule_section,
@@ -1470,9 +1477,10 @@ class QAEngine:
             history_text = self._format_history(history)
             history_section = f"\n## 이전 대화 (맥락 참고용):\n{history_text}\n"
 
+        prompt_id = "stage2.enrich" if ENRICH_QUESTION.search(question) else "stage2.answer"
         prompt = render_prompt(
-            "stage2.answer",
-            system_prompt=render_prompt("system.hwp_analyst"),
+            prompt_id,
+            system_prompt=render_prompt("system.hwp_analyst") if prompt_id == "stage2.answer" else "",
             context=context,
             pre_section=pre_section,
             rule_section=rule_section,
@@ -1524,6 +1532,10 @@ class QAEngine:
         if not self.paragraphs and not self.tables:
             return "(문서에서 추출된 문단·표가 없습니다. 파싱 결과를 확인하세요.)"
 
+        # 다중 문서 + 보완/비교 요청 → 전 파일 개요 (표 1만 보고 거절하는 현상 방지)
+        if self.multi_doc and ENRICH_QUESTION.search(question):
+            return self._build_multi_doc_overview(max_context)
+
         if OVERVIEW_QUESTION.search(question):
             return self._build_overview_context(max_context)
 
@@ -1564,6 +1576,39 @@ class QAEngine:
         if not context.strip() or len(context.strip()) < 80:
             return self._build_overview_context(max_context)
         return context
+
+    def _build_multi_doc_overview(self, max_context: int = 8000) -> str:
+        """업로드된 모든 문서를 LLM에 넘김 (다중 파일 보완·비교)."""
+        if not self.multi_doc or not self.documents:
+            return self._build_overview_context(max_context)
+
+        parts = [f"### 업로드된 문서 {len(self.documents)}개"]
+        total = len(parts[0])
+        per_doc = max(2000, max_context // max(len(self.documents), 1))
+
+        for doc in self.documents:
+            did = doc.get('id', '문서')
+            paras = doc.get('paragraphs') or []
+            tables = doc.get('tables') or []
+            block = [f"\n#### [{did}] — 문단 {len(paras)}개, 표 {len(tables)}개"]
+            for p in paras[:18]:
+                chunk = (p or '')[:500]
+                if chunk:
+                    block.append(f"- {chunk}")
+            for ts in tables[:4]:
+                formatted = self._format_table_for_llm(ts)
+                if len(formatted) > per_doc // 2:
+                    formatted = formatted[: per_doc // 2] + '\n... (이하 생략)'
+                block.append(formatted)
+            text = '\n'.join(block)
+            if len(text) > per_doc:
+                text = text[:per_doc] + '\n... (이하 생략)'
+            if total + len(text) > max_context:
+                break
+            parts.append(text)
+            total += len(text)
+
+        return '\n'.join(parts) if len(parts) > 1 else self._build_overview_context(max_context)
 
     def _build_overview_context(self, max_context: int = 8000) -> str:
         """개요/소개 질문 또는 키워드 미매칭 시 문서 앞부분·표 요약 제공."""

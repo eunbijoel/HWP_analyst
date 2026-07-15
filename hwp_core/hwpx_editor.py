@@ -497,8 +497,12 @@ class HWPXEditor:
         return updated
 
     def save(self) -> bytes:
-        """변경된 섹션/헤더만 재직렬화. ZIP 압축 방식·순서는 원본 유지."""
+        """섹션/헤더 재직렬화. dirty면 해당 트리 전체 반영 (누락 방지)."""
         order = self._zip_order or list(self.zip_contents.keys())
+        # native 수정이 있으면 _dirty_sections 누락 대비해 로드된 섹션 전부 직렬화
+        dirty = set(self._dirty_sections)
+        if self._native_modified:
+            dirty |= set(self.section_trees.keys())
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w') as zf:
             for name in order:
@@ -507,7 +511,7 @@ class HWPXEditor:
                 if name == self._header_file and self._header_tree is not None and self._header_modified:
                     data = ET.tostring(
                         self._header_tree, encoding='utf-8', xml_declaration=True)
-                elif name in self._dirty_sections and name in self.section_trees:
+                elif name in dirty and name in self.section_trees:
                     root = self.section_trees[name]
                     data = ET.tostring(root, encoding='utf-8', xml_declaration=True)
                 else:
@@ -575,12 +579,15 @@ class HWPXEditor:
         self._bump_preview()
 
     def get_export_bytes(self) -> bytes:
-        """한글에서 열 HWPX bytes — hwpilot 편집본은 재저장 없이 그대로 반환."""
-        if self._hwpilot_touched:
-            return bytes(self.original_bytes)
-        if not self._native_modified and not self._header_modified:
-            return bytes(self.original_bytes)
-        return bytes(self.save())
+        """한글에서 열 HWPX bytes.
+
+        hwpilot으로 만든 본문이라도, 이후 XML(셀/문단) 편집이 있으면
+        반드시 save()해서 dirty section을 ZIP에 반영한다.
+        (이전: _hwpilot_touched면 original_bytes만 반환 → 화면엔 보이지만 저장 안 됨)
+        """
+        if self._native_modified or self._header_modified:
+            return bytes(self.save())
+        return bytes(self.original_bytes)
 
     @staticmethod
     def validate_hwpx_bytes(data: bytes) -> tuple[bool, str]:
@@ -1380,14 +1387,20 @@ class HWPXEditor:
                 path, paragraph_index, new_text, old_text=old_text)
 
         new_bytes, msg = apply_hwpilot_to_bytes(
-            self.original_bytes, self._source_filename, _edit)
+            self.get_working_bytes(), getattr(self, "_source_filename", None) or "doc.hwpx", _edit)
         if new_bytes is None:
             return False
         self.reload_from_bytes(new_bytes, from_hwpilot=True)
         return True
 
     def _apply_change(self, change: PendingChange, track_changes: bool = True) -> bool:
-        if change.change_type == 'paragraph' and self._hwpilot_touched:
+        # 직접 편집/XML dirty가 있으면 hwpilot 우회로 XML에 남아 있는 수정을 덮어쓰지 않음
+        if (
+            change.change_type == 'paragraph'
+            and self._hwpilot_touched
+            and not self._native_modified
+            and not self._header_modified
+        ):
             if change.paragraph_index is None:
                 return False
             return self._apply_paragraph_via_hwpilot(
