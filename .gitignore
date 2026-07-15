@@ -1,9 +1,0 @@
-data/
-__pycache__/
-*.pyc
-.pytest_cache/
-hwpilot/node_modules/
-*.egg-info/
-.venv/
-venv/
-.env
