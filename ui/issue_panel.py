@@ -62,7 +62,7 @@ def build_explain_question(filename: str, issue: Any) -> str:
   rule = getattr(issue, "issue_type", "") or ""
   return (
     f"다음 검토 이슈를 설명해 주세요. "
-    f"숫자는 고치지 말고, 왜 발생했는지와 표에서 확인할 칸·수정 시 체크리스트만 알려 주세요.\n\n"
+    f"숫자는 고치지 말고, 왜 발생했는지와 문서에서 확인할 위치·수정 시 체크리스트만 알려 주세요.\n\n"
     f"파일: {filename}\n"
     f"규칙: {rule}\n"
     f"이슈: {issue.message}\n"

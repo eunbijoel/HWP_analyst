@@ -235,7 +235,7 @@ def ollama_status():
     return jsonify(check_ollama_status(url))
 
 
-ALLOWED_EXT = (".hwp", ".hwpx", ".xlsx", ".xls")
+ALLOWED_EXT = (".hwp", ".hwpx")
 
 
 def _collect_upload_files() -> list[tuple[str, bytes]]:
@@ -262,7 +262,7 @@ def upload():
     for name, _ in items:
         if not name.lower().endswith(ALLOWED_EXT):
             return jsonify({
-                "error": f"지원 형식: HWP / HWPX / Excel (.xlsx) — {name}",
+                "error": f"지원 형식: HWP / HWPX — {name}",
             }), 400
 
     sid = (request.form.get("session_id") or "").strip()
@@ -296,8 +296,8 @@ def upload():
     tip = (
         f"워크스페이스 {n}개 · 방금 연 파일: {names}\n"
         "• 왼쪽 목록에서 활성 문서 전환\n"
-        "• 엑셀/다른 문서는 참고 · 「두 문서 보고 보완해줘」「사업비는?」\n"
-        "• 문단·셀 선택 후 짧은 수정 지시"
+        "• 다른 문서는 참고 · 「두 문서 보고 보완해줘」「사업비는?」\n"
+        "• 문단 선택 후 짧은 수정 지시"
     )
     if notes:
         tip += "\n" + "\n".join(notes[:5])
@@ -324,6 +324,45 @@ def set_active():
     return jsonify(_state(sess))
 
 
+@app.post("/api/remove_doc")
+def remove_doc():
+    """워크스페이스에서 문서 슬롯 제거."""
+    body = request.get_json(force=True) or {}
+    try:
+        sess = _session(body["session_id"])
+    except KeyError:
+        return jsonify({"error": "세션 없음"}), 404
+    doc_id = body.get("doc_id") or ""
+    if doc_id not in sess.docs:
+        return jsonify({"error": "문서를 찾을 수 없습니다"}), 404
+
+    was_active = sess.active_id == doc_id
+    del sess.docs[doc_id]
+    sess.selected_para = None
+    sess.selected_cell = None
+    if was_active:
+        sess.active_id = ""
+        editable = next(
+            (s for s in sess.docs.values() if getattr(s, "is_editable", False)),
+            None,
+        )
+        if editable:
+            sess.active_id = editable.id
+        elif sess.docs:
+            sess.active_id = next(iter(sess.docs))
+    elif sess.active_id not in sess.docs:
+        sess.active_id = ""
+    if not sess.docs:
+        sess.active_id = ""
+        sess.fill_pipeline = None
+        sess.chat.append({
+            "role": "assistant",
+            "content": "열린 문서가 없습니다. 파일을 다시 추가해 주세요.",
+        })
+    _sync_active(sess)
+    return jsonify(_state(sess))
+
+
 def _run_workspace_fill(sess: Session, command: str) -> str:
     """활성 HWP(X) = target, 나머지 = 참고 (엑셀 포함)."""
     slots = list(sess.docs.values())
@@ -335,7 +374,7 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
     refs = [s for s in slots if s.id != target.id]
     if not refs:
         return (
-            "참고할 자료(엑셀·다른 문서)를 하나 더 열어 주세요. "
+            "참고할 다른 문서를 하나 더 열어 주세요. "
             "그다음 「내용 보완해줘」라고 해 주세요."
         )
 
@@ -405,7 +444,7 @@ def _explain_pending(sess: Session) -> str:
     if not pending:
         return (
             "대기 중인 변경 제안이 없습니다. "
-            "문단/셀을 선택한 뒤 수정 지시를 하거나, "
+            "문단을 선택한 뒤 수정 지시를 하거나, "
             "문서 분석·검토 Q&A는 Product A (Document Intelligence)를 이용하세요."
         )
     lines = [f"대기 변경 {len(pending)}건:"]
@@ -428,7 +467,7 @@ def _analysis_redirect(question: str) -> str:
         "전체 문서 Q&A·검토·검증은 **HWP Document Intelligence** (Product A)에서 지원합니다.\n"
         "`streamlit run apps/intelligence/app.py` 또는 `streamlit run app.py`\n\n"
         "이 편집기(Product B)에서는:\n"
-        "· 문단/셀 선택 후 리라이트\n"
+        "· 문단 선택 후 리라이트\n"
         "· 빈칸·참고 자료 채우기 (DocFill)\n"
         "· 제안 설명 (`변경 설명해줘`)\n"
         "만 지원합니다.\n\n"
@@ -677,7 +716,7 @@ def _answer_selection_question(sess: Session, user_msg: str) -> str:
             loc = f"문단 {sel + 1}"
 
     if not context.strip():
-        return "선택된 내용이 비어 있습니다. 다른 문단/셀을 선택하거나 Product A에서 질문하세요."
+        return "선택된 내용이 비어 있습니다. 다른 문단을 선택하거나 Product A에서 질문하세요."
 
     prompt = (
         "사용자는 문서 일부를 선택한 채 설명·정의·개념을 묻고 있습니다.\n"
@@ -760,7 +799,7 @@ def _apply_selection_rewrite(sess: Session, user_msg: str) -> str:
         sess.editor.propose_paragraph_change(sel, rewritten)
         return _propose_reply(f"문단 {sel + 1}", rewritten, summary or "수정")
 
-    return "선택된 문단/셀이 없습니다. 대상을 선택한 뒤 다시 지시해 주세요."
+    return "선택된 문단이 없습니다. 대상을 선택한 뒤 다시 지시해 주세요."
 
 
 def _apply_propose_target(sess: Session, route) -> str:
@@ -786,7 +825,7 @@ def _apply_propose_target(sess: Session, route) -> str:
         sess.editor.propose_paragraph_change(tg.para_index, rewritten)
         return _propose_reply(tg.label, rewritten, "치환 제안")
 
-    return "대상 위치에 제안을 올리지 못했습니다. 문단/셀을 직접 선택해 주세요."
+    return "대상 위치에 제안을 올리지 못했습니다. 문단을 직접 선택해 주세요."
 
 
 def _apply_compute_edit(sess: Session, route) -> str:
@@ -871,8 +910,8 @@ def chat():
     elif decision.action == "rewrite_selection":
         if not sess.editor:
             reply = (
-                "활성 문서는 읽기 전용(또는 엑셀)입니다. "
-                "문단·셀 편집은 HWPX 문서를 활성으로 선택하세요."
+                "활성 문서는 읽기 전용입니다. "
+                "편집은 HWPX 문서를 활성으로 선택하세요."
             )
         else:
             reply = _apply_selection_rewrite(sess, user_msg)
@@ -889,7 +928,7 @@ def chat():
     elif decision.action == "redirect_a":
         reply = decision.message
     else:
-        reply = decision.message or "문단이나 표 셀을 선택한 뒤 다시 지시해 주세요."
+        reply = decision.message or "문단을 선택한 뒤 다시 지시해 주세요."
 
     sess.chat.append({"role": "assistant", "content": reply})
     if reply.startswith("Ollama 오류:"):

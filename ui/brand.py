@@ -1,4 +1,4 @@
-"""상용 AI 제품 톤의 Streamlit 테마 · 셸 헬퍼."""
+"""Product A theme — B visual tokens only (no workflow redesign)."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from pathlib import Path
 
 import streamlit as st
 
-PRODUCT_NAME = "HWP Analyst"
-PRODUCT_TAGLINE = ""
+PRODUCT_NAME = "HWP Document Intelligence (A)"
+PRODUCT_TAGLINE = "문서 이해 · 검토 · 질문"
 LOGO_PATH = Path(__file__).resolve().parent / "logo.png"
 
 _logo_data_uri_cache: str | None = None
@@ -25,204 +25,176 @@ def _logo_data_uri() -> str:
   return _logo_data_uri_cache
 
 
+# Visual tokens aligned with HWP_v2/static/css/app.css — layout/UX stays Streamlit A.
 APP_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,0,0&display=swap');
 
 :root {
-  --bg: #f6f5f2;
-  --surface: #ffffff;
+  --bg: #e8eaef;
+  --paper: #ffffff;
   --ink: #1a1a1a;
-  --muted: #6b6b6b;
-  --line: #e8e6e1;
+  --muted: #6a6f7a;
+  --line: #d5d8e0;
   --accent: #1f4b99;
-  --accent-soft: #e8eef8;
+  --accent-soft: #eef3fb;
   --ok: #1b7a4e;
   --ok-soft: #e7f5ee;
   --warn: #9a6700;
   --warn-soft: #fff6e0;
   --danger: #b42318;
-  --radius: 16px;
-  --shadow: 0 1px 2px rgba(26,26,26,.04), 0 8px 24px rgba(26,26,26,.06);
+  --radius: 10px;
+  --shadow: 0 1px 2px rgba(0,0,0,.05), 0 12px 32px rgba(20,30,50,.08);
 }
 
-html, body, [class*="css"] {
-  font-family: "IBM Plex Sans KR", "IBM Plex Sans", system-ui, sans-serif !important;
+html, body, .stApp {
+  font-family: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif;
   color: var(--ink);
+  background: var(--bg) !important;
+}
+.stMarkdown, .stMarkdown p, .stCaption, label,
+[data-testid="stWidgetLabel"],
+[data-testid="stChatMessageContent"],
+.stButton > button {
+  font-family: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif !important;
 }
 
-.stApp {
-  background:
-    radial-gradient(1200px 500px at 10% -10%, #e8eef8 0%, transparent 55%),
-    radial-gradient(900px 400px at 100% 0%, #f0ebe3 0%, transparent 50%),
-    var(--bg) !important;
+span[data-testid="stIconMaterial"],
+.material-symbols-rounded {
+  font-family: "Material Symbols Rounded" !important;
+  font-weight: 400 !important;
+  font-style: normal !important;
+  font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24 !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+  display: inline-block !important;
+  line-height: 1 !important;
 }
 
-/* Hide Streamlit chrome noise — 사이드바 토글(stToolbar)은 유지 */
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header[data-testid="stHeader"] {background: transparent;}
+#MainMenu, footer { visibility: hidden; }
+.stAppDeployButton, [data-testid="stToolbar"],
+div[data-testid="stStatusWidget"] { display: none !important; }
+header[data-testid="stHeader"] { background: transparent !important; }
 
-/* 메인 콘텐츠만 wide — 사이드바 폭은 Streamlit 기본 유지 */
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+section.main,
+[data-testid="stMainBlockContainer"] {
+  background: var(--bg) !important;
+}
+
 section.main .block-container,
 [data-testid="stMainBlockContainer"] {
-  padding-top: 1.4rem !important;
-  padding-bottom: 4rem !important;
+  padding-top: 0.75rem !important;
+  padding-bottom: 2rem !important;
   max-width: 100% !important;
-  padding-left: clamp(1rem, 2vw, 2.5rem) !important;
-  padding-right: clamp(1rem, 2vw, 2.5rem) !important;
 }
 
-[data-testid="stAppViewContainer"] > section.main > div {
-  max-width: 100%;
-}
-
-[data-testid="stSidebar"] {
-  background: #faf9f7 !important;
-  border-right: 1px solid var(--line);
-  min-width: 16rem;
-}
-[data-testid="stSidebar"] .block-container {
-  padding-top: 1.5rem !important;
-  max-width: 21rem !important;
-}
-
-.hx-hero {
-  padding: 2.2rem 2rem 1.6rem;
-  border-radius: 24px;
-  background: linear-gradient(145deg, #ffffff 0%, #f3f6fb 100%);
-  border: 1px solid var(--line);
-  box-shadow: var(--shadow);
-  margin-bottom: 1.25rem;
-}
-.hx-hero h1 {
-  font-size: 2rem;
-  font-weight: 700;
-  letter-spacing: -0.03em;
-  margin: 0 0 .35rem 0;
-  color: var(--ink);
-}
-.hx-hero-row {
+/* Top brand bar (B look, no mode switch) */
+.hx-topbar {
   display: flex;
   align-items: center;
-  gap: 1.35rem;
-}
-.hx-hero-logo {
-  height: 9rem;
-  width: auto;
-  flex-shrink: 0;
-  display: block;
-}
-.hx-hero p {
-  margin: 0;
-  color: var(--muted);
-  font-size: 1.05rem;
-  line-height: 1.55;
-  max-width: 40rem;
-}
-
-.hx-card {
-  background: var(--surface);
+  justify-content: space-between;
+  padding: .55rem 1rem;
+  background: #f7f8fa;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 1.25rem 1.35rem;
-  box-shadow: var(--shadow);
-  margin-bottom: 1rem;
+  margin: 0 0 .85rem 0;
 }
-.hx-card h3 {
-  margin: 0 0 .35rem 0;
-  font-size: 1.05rem;
-  font-weight: 600;
+.hx-brand { display: flex; gap: .7rem; align-items: center; }
+.hx-brand-mark {
+  width: 2rem; height: 2rem; border-radius: 8px;
+  background: var(--accent); color: #fff;
+  display: grid; place-items: center; font-weight: 800; font-size: .72rem;
 }
-.hx-muted { color: var(--muted); font-size: .92rem; line-height: 1.5; }
+.hx-brand strong { display: block; font-size: .92rem; line-height: 1.2; }
+.hx-brand small { color: var(--muted); font-size: .75rem; }
 
-.hx-kpi-row {
-  display: flex; gap: .75rem; flex-wrap: wrap; margin: 1rem 0 1.25rem;
+/* Sidebar — B docs-pane colors; keep Streamlit widgets */
+[data-testid="stSidebar"] {
+  background: #f3f4f7 !important;
+  border-right: 1px solid var(--line);
 }
-.hx-kpi {
-  flex: 1; min-width: 140px;
-  background: var(--surface);
+[data-testid="stSidebar"] > div:first-child { background: #f3f4f7 !important; }
+[data-testid="stSidebar"] .block-container {
+  padding-top: .75rem !important;
+}
+[data-testid="stSidebar"] .stCheckbox {
+  background: #fff;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: .35rem .5rem;
+  margin-bottom: .3rem;
+}
+[data-testid="stSidebar"] .stCheckbox:hover { border-color: #c5cddc; }
+[data-testid="stSidebar"] .stExpander {
   border: 1px solid var(--line);
-  border-radius: 14px;
-  padding: 1rem 1.1rem;
-  box-shadow: var(--shadow);
+  border-radius: 10px;
+  background: #fff;
 }
-.hx-kpi .n {
-  font-size: 1.75rem; font-weight: 700; letter-spacing: -0.03em; line-height: 1.1;
+[data-testid="stExpander"] summary [data-testid="stIconMaterial"] {
+  /* keep expand icon working */
+  font-family: "Material Symbols Rounded" !important;
 }
-.hx-kpi .l { color: var(--muted); font-size: .85rem; margin-top: .25rem; }
 
-.hx-step {
-  display: flex; align-items: center; gap: .65rem;
-  padding: .55rem 0; color: var(--muted); font-size: .95rem;
+div[data-testid="stFileUploaderDropzone"] {
+  border: 1px dashed var(--line) !important;
+  border-radius: 10px !important;
+  background: #fff !important;
 }
-.hx-step.on { color: var(--accent); font-weight: 600; }
-.hx-step.done { color: var(--ok); }
-.hx-dot {
-  width: 10px; height: 10px; border-radius: 50%;
-  background: #d0cec8; flex-shrink: 0;
-}
-.hx-step.on .hx-dot { background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
-.hx-step.done .hx-dot { background: var(--ok); }
-
-.hx-badge {
-  display: inline-block;
-  padding: .2rem .55rem;
-  border-radius: 999px;
-  font-size: .78rem;
-  font-weight: 600;
-  letter-spacing: .01em;
-}
-.hx-badge.ready { background: var(--ok-soft); color: var(--ok); }
-.hx-badge.review { background: var(--warn-soft); color: var(--warn); }
-.hx-badge.ref { background: var(--accent-soft); color: var(--accent); }
-.hx-badge.skip { background: #f0eeea; color: #666; }
-
-.hx-diff {
-  display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; margin-top: .75rem;
-}
-.hx-diff .box {
-  border-radius: 12px; padding: .85rem 1rem; min-height: 4.5rem;
-  font-size: .92rem; line-height: 1.55; white-space: pre-wrap;
-}
-.hx-diff .before { background: #f7f6f3; border: 1px solid var(--line); color: #444; }
-.hx-diff .after { background: var(--ok-soft); border: 1px solid #c8e6d4; color: #143528; }
-
-div[data-testid="stFileUploader"] section {
-  border: 1.5px dashed #c9c5bc !important;
-  border-radius: 16px !important;
-  background: #fffcf8 !important;
-  padding: 1rem !important;
+div[data-testid="stFileUploaderDropzone"] [data-testid="stIconMaterial"] {
+  font-family: "Material Symbols Rounded" !important;
 }
 
 .stButton > button {
-  border-radius: 12px !important;
+  border-radius: 10px !important;
   font-weight: 600 !important;
-  padding: .55rem 1rem !important;
   border: 1px solid var(--line) !important;
 }
 .stButton > button[kind="primary"],
 .stButton > button[data-testid="baseButton-primary"] {
   background: var(--accent) !important;
-  color: white !important;
+  color: #fff !important;
   border-color: var(--accent) !important;
 }
 
-[data-testid="stExpander"] {
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: var(--surface);
+.hx-kpi-row {
+  display: flex; gap: .45rem; flex-wrap: wrap; margin: .5rem 0 .75rem;
 }
+.hx-kpi {
+  flex: 1; min-width: 100px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: .65rem .75rem;
+}
+.hx-kpi .n { font-size: 1.35rem; font-weight: 700; line-height: 1.1; }
+.hx-kpi .l { color: var(--muted); font-size: .75rem; margin-top: .2rem; }
+
+.hx-badge {
+  display: inline-block;
+  padding: .12rem .5rem;
+  border-radius: 999px;
+  font-size: .72rem;
+  font-weight: 700;
+}
+.hx-badge.ready { background: var(--ok-soft); color: var(--ok); }
+.hx-badge.review { background: var(--warn-soft); color: var(--warn); }
+.hx-badge.ref { background: var(--accent-soft); color: var(--accent); }
+.hx-badge.skip { background: #f0f2f6; color: #666; }
 
 .hx-next {
-  margin-top: 1rem;
-  padding: .9rem 1.1rem;
-  border-radius: 14px;
+  margin-top: .65rem;
+  padding: .65rem .85rem;
+  border-radius: 10px;
   background: var(--accent-soft);
   border: 1px solid #c9d7ef;
   color: #1a3470;
   font-weight: 500;
+  font-size: .88rem;
 }
+
+.hx-hero { display: none !important; }
 </style>
 """
 
@@ -232,30 +204,37 @@ def inject_theme() -> None:
 
 
 def hero(title: str, subtitle: str = "") -> None:
-  uri = _logo_data_uri()
-  logo = f'<img class="hx-hero-logo" src="{uri}" alt="" />' if uri else ""
-  sub = f"<p>{subtitle}</p>" if (subtitle or "").strip() else ""
+  """B-like top brand bar (no Understand/Modify)."""
+  sub = subtitle or PRODUCT_TAGLINE
   st.markdown(
-    f'<div class="hx-hero"><div class="hx-hero-row">{logo}<div><h1>{title}</h1>{sub}</div></div></div>',
+    f"""
+<div class="hx-topbar">
+  <div class="hx-brand">
+    <span class="hx-brand-mark">HWP</span>
+    <div>
+      <strong>{title or PRODUCT_NAME}</strong>
+      <small>{sub}</small>
+    </div>
+  </div>
+</div>
+""",
     unsafe_allow_html=True,
   )
 
 
 def sidebar_brand(*, caption: str = "로컬 처리 · 원본 보존") -> None:
-  if LOGO_PATH.is_file():
-    logo_col, title_col = st.columns([1, 4], gap="small", vertical_alignment="center")
-    with logo_col:
-      st.image(str(LOGO_PATH), width=34)
-    with title_col:
-      st.markdown(f"**{PRODUCT_NAME}**")
-  else:
-    st.markdown(f"### {PRODUCT_NAME}")
+  uri = _logo_data_uri()
+  if uri:
+    st.markdown(
+      f'<img src="{uri}" alt="" style="height:28px;margin-bottom:.35rem;" />',
+      unsafe_allow_html=True,
+    )
+  st.markdown(f"**{PRODUCT_NAME}**")
   if caption:
     st.caption(caption)
 
 
 def kpi_row(items: list[tuple[str, str]]) -> None:
-  """items: [(number, label), ...]"""
   cells = "".join(
     f'<div class="hx-kpi"><div class="n">{n}</div><div class="l">{lab}</div></div>'
     for n, lab in items
@@ -264,23 +243,7 @@ def kpi_row(items: list[tuple[str, str]]) -> None:
 
 
 def progress_steps(active: str) -> None:
-  """active: idle|analyzing|ready|done"""
-  steps = [
-    ("analyzing", "문서를 읽는 중"),
-    ("ready", "제안 준비 완료"),
-    ("done", "반영 · 내보내기"),
-  ]
-  order = {"idle": -1, "analyzing": 0, "ready": 1, "done": 2}
-  idx = order.get(active, -1)
-  html = []
-  for i, (key, label) in enumerate(steps):
-    cls = "hx-step"
-    if i < idx:
-      cls += " done"
-    elif i == idx:
-      cls += " on"
-    html.append(f'<div class="{cls}"><span class="hx-dot"></span>{label}</div>')
-  st.markdown("".join(html), unsafe_allow_html=True)
+  return None
 
 
 def badge(text: str, kind: str = "ref") -> str:

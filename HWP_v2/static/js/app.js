@@ -153,7 +153,7 @@
         clearSelectionUI();
         td.classList.add("selected-v2");
         const orig = td.getAttribute("data-cell-orig") || "";
-        els.selInfo.textContent = `표 ${t + 1} · ${r + 1}행 ${c + 1}열\n${orig.slice(0, 280) || "(비어 있음)"}`;
+        els.selInfo.textContent = `${r + 1}행 ${c + 1}열\n${orig.slice(0, 280) || "(비어 있음)"}`;
         try {
           await api("/api/select", {
             method: "POST",
@@ -217,18 +217,21 @@
     if (!els.docList) return;
     if (!docs || !docs.length) {
       els.docList.innerHTML =
-        '<div class="doc-list-empty">HWP · HWPX · Excel을<br>여러 개 올려 보세요</div>';
+        '<div class="doc-list-empty">HWP · HWPX를<br>여러 개 올려 보세요</div>';
       return;
     }
     els.docList.innerHTML = "";
     docs.forEach((d) => {
+      const row = document.createElement("div");
+      row.className = "doc-row";
+
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "doc-item" + (d.active ? " active" : "");
       const kind = (d.kind || "").toLowerCase();
-      const label = kind === "xlsx" ? "XLSX" : kind.toUpperCase() || "DOC";
+      const label = kind === "xlsx" ? "DOC" : kind.toUpperCase() || "DOC";
       const meta = d.excel
-        ? "참고 · 엑셀"
+        ? "참고"
         : d.editable
           ? "편집 가능"
           : "읽기 전용";
@@ -248,7 +251,33 @@
           alert(err.message);
         }
       });
-      els.docList.appendChild(btn);
+
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "doc-del";
+      del.title = "목록에서 삭제";
+      del.setAttribute("aria-label", `${d.filename || "문서"} 삭제`);
+      del.textContent = "×";
+      del.addEventListener("click", async (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (!sessionId) return;
+        const name = d.filename || "이 문서";
+        if (!confirm(`「${name}」을(를) 워크스페이스에서 제거할까요?`)) return;
+        try {
+          applyState(await api("/api/remove_doc", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: sessionId, doc_id: d.id }),
+          }));
+        } catch (err) {
+          alert(err.message);
+        }
+      });
+
+      row.appendChild(btn);
+      row.appendChild(del);
+      els.docList.appendChild(row);
     });
   }
 
@@ -274,9 +303,7 @@
       els.hwpNote.textContent = `HWP→HWPX (${state.convert_note || "변환됨"})`;
     } else if (state.read_only && state.filename) {
       els.hwpNote.classList.remove("hidden");
-      els.hwpNote.textContent = state.filename.toLowerCase().endsWith("x")
-        ? "엑셀 미리보기"
-        : "읽기 전용";
+      els.hwpNote.textContent = "읽기 전용";
     } else {
       els.hwpNote.classList.add("hidden");
     }
@@ -308,7 +335,7 @@
     wireDocument();
 
     if (!selectedCell && selectedPara == null) {
-      els.selInfo.textContent = "없으면 전체 문서·엑셀로 질문/보완";
+      els.selInfo.textContent = "없으면 전체 문서로 질문/보완";
     }
 
     if (selectedCell) {
@@ -319,7 +346,7 @@
         el.classList.add("selected-v2");
         const orig = el.getAttribute("data-cell-orig") || "";
         els.selInfo.textContent =
-          `표 ${selectedCell.t + 1} · ${selectedCell.r + 1}행 ${selectedCell.c + 1}열\n${orig.slice(0, 280) || "(비어 있음)"}`;
+          `${selectedCell.r + 1}행 ${selectedCell.c + 1}열\n${orig.slice(0, 280) || "(비어 있음)"}`;
       }
     } else if (selectedPara != null) {
       const el = els.docRoot.querySelector(`.para[data-para-idx="${selectedPara}"]`);

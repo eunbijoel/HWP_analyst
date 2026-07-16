@@ -11,7 +11,6 @@ import hashlib
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Optional
 
 import streamlit as st
@@ -21,7 +20,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from additional.reference_parser import build_reference_context, parse_reference
+from additional.reference_parser import build_reference_context
 from hwp_core.analysis.intent_route import (
     analysis_chat_reply_for_edit_intent,
     route_analysis_intent,
@@ -92,23 +91,8 @@ def _should_use_general_llm(question: str, documents: list) -> bool:
 def process_document(file_bytes: bytes, filename: str):
     ext = os.path.splitext(filename)[1].lower()
     if ext in (".xlsx", ".xls"):
-        ref = parse_reference(file_bytes, filename)
-        sheet_count = len(ref.tables)
-        summary_para = (
-            f"엑셀 문서 {filename} · 시트/표 {sheet_count}개"
-            if sheet_count > 0
-            else f"엑셀 문서 {filename}"
-        )
-        doc = SimpleNamespace(
-            filename=filename,
-            file_type=ref.file_type,
-            full_text=ref.full_text,
-            paragraphs=[summary_para],
-            tables_raw=[{"rows": rows, "caption": "", "unit": ""} for rows in ref.tables],
-            errors=ref.errors,
-        )
-    else:
-        doc = parse_document(file_bytes=file_bytes, filename=filename)
+        raise ValueError("지금은 HWP / HWPX만 지원합니다.")
+    doc = parse_document(file_bytes=file_bytes, filename=filename)
     tables = extract_tables(doc, document_id=filename)
     tnums = detect_numbers_in_text(doc.full_text, document_id=filename)
     tblnums = detect_numbers_in_tables(tables, document_id=filename)
@@ -177,12 +161,12 @@ def render_analysis_preview(entry: dict):
     jump_r = jump.get("row_index") if jump else None
     st.caption(
         f"파서: {getattr(doc, 'file_type', None) or 'unknown'} · "
-        f"문단 {len(paragraphs)} / 표 {len(dp.get('tables', []))}"
+        f"문단 {len(paragraphs)}"
     )
     st.markdown(f"### 📄 {fname}")
     if jump:
         st.info(
-            f"검토 이슈 위치 · {jump.get('source') or '표/행'}"
+            f"검토 이슈 위치 · {jump.get('source') or '문서'}"
             + (f" — {jump.get('message')}" if jump.get("message") else "")
         )
     html = build_preview_from_text(
@@ -193,10 +177,7 @@ def render_analysis_preview(entry: dict):
         highlight_row=jump_r,
     )
     render_scrollable_doc_preview(html)
-    st.caption(
-        "문서 수정은 HWP Editing Assistant (`python3 HWP_v2/server.py` 또는 "
-        "`python3 apps/editor/server.py`)에서 하세요."
-    )
+    st.caption("문서 수정은 HWP Editing Assistant (B) · http://127.0.0.1:8765 에서 하세요.")
 
 
 def render_analysis_chat(
@@ -354,7 +335,7 @@ def render_workspace_qa_chat(
 # --- Sidebar ---
 with st.sidebar:
     sidebar_brand()
-    st.caption("Product A · Document Intelligence")
+    st.caption("분석 · 검토 · Q&A (편집 없음)")
     st.markdown("---")
     with st.expander("연결 · 모델", expanded=False):
         ollama_url = st.text_input(
@@ -394,11 +375,11 @@ with st.sidebar:
     st.caption(f"백엔드: {get_backend_status().summary()}")
 
 hero(PRODUCT_NAME)
-st.caption("Document Intelligence — 분석·검토·Q&A (편집 없음)")
+st.caption("분석 · 검토 · Q&A — 문서를 추가해 시작하세요")
 
 uploaded_files = st.file_uploader(
     "문서 추가",
-    type=["hwp", "hwpx", "xlsx", "xls"],
+    type=["hwp", "hwpx"],
     accept_multiple_files=True,
     label_visibility="collapsed",
 )

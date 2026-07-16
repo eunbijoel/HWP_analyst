@@ -277,7 +277,7 @@ def decide_chat_route(
     if not has_docs:
         return ChatRoute(
             action="ask_select",
-            message="문서를 열어 주세요. HWP / HWPX / Excel을 여러 개 올릴 수 있습니다.",
+            message="문서를 열어 주세요. HWP / HWPX를 여러 개 올릴 수 있습니다.",
         )
 
     if classify_intent(t) == "fill" or (
@@ -307,8 +307,8 @@ def decide_chat_route(
             return ChatRoute(
                 action="ask_select",
                 message=(
-                    "활성 문서는 읽기 전용(또는 엑셀)입니다. "
-                    "문단·셀 편집은 HWPX 문서를 활성으로 선택하세요."
+                    "활성 문서는 읽기 전용입니다. "
+                    "편집은 HWPX 문서를 활성으로 선택하세요."
                 ),
             )
         spec = parse_edit_spec(t)
@@ -330,7 +330,7 @@ def resolve_search_edit(editor: Any, message: str, spec: Optional[EditSpec] = No
         return ChatRoute(action="propose_replace", spec=spec, targets=targets)
     if len(targets) > 1:
         lines = [
-            "여러 위치가 맞습니다. 문단/셀을 직접 선택하거나 더 구체적으로 적어 주세요:",
+            "여러 위치가 맞습니다. 문단을 직접 선택하거나 더 구체적으로 적어 주세요:",
             "",
         ]
         for i, tg in enumerate(targets[:12], 1):
@@ -348,7 +348,7 @@ def resolve_search_edit(editor: Any, message: str, spec: Optional[EditSpec] = No
         action="ask_select",
         message=(
             f"「{(spec.old or spec.label or '대상')[:40]}」위치를 찾지 못했습니다. "
-            "문단이나 표 셀을 선택한 뒤 다시 지시해 주세요."
+            "문단을 선택한 뒤 다시 지시해 주세요."
         ),
         spec=spec,
     )
