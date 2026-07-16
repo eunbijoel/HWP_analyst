@@ -1,24 +1,19 @@
-# HWP v2 (Experimental)
+# HWP Editing Assistant (B)
 
-**Status: Experimental prototype — not production ready**
+Flask 워크스페이스 UI — **Product B (Modify)**.  
+문서를 보며 선택 · 직접 수정 · Ollama 지시 · 저장합니다.
 
-## Purpose
 
-- Workspace UI (document pane + AI pane)
-- Multi-document editing workflow (HWP / HWPX / Excel)
-- Inline editing experiment (select · rewrite · accept/reject)
-- Local Ollama (not Claude)
+|     | Product A                                      | Product B (이 폴더)                               |
+| --- | ---------------------------------------------- | ---------------------------------------------- |
+| 이름  | HWP Document Intelligence (A)                  | HWP Editing Assistant (B)                      |
+| 역할  | 분석 · 검토 · Q&A (읽기 전용)                          | 선택 · 수정 · 보완 · 저장                              |
+| 실행  | `streamlit run apps/intelligence/app.py`       | `python3 HWP_v2/server.py`                     |
+| 주소  | [http://127.0.0.1:8501](http://127.0.0.1:8501) | [http://127.0.0.1:8765](http://127.0.0.1:8765) |
+| UI  | Streamlit (`apps/intelligence` + `ui/`)        | `templates/` · `static/`                       |
 
-## Not intended to replace the current Streamlit application
 
-| Production (stable) | This branch (experiment) |
-|---------------------|---------------------------|
-| `app.py` (Streamlit) | `HWP_v2/` (Flask) |
-| Review rules · fill · Q&A | Inline UI · multi-doc workspace |
-
-Current production version: **`app.py`** on `main`.
-
-Do **not** merge this branch into `main` until a product decision is made (v1 stays vs v2 replaces / merges).
+엔진은 `hwp_core`를 공유합니다. 동일 엔트리: `python3 apps/editor/server.py`.
 
 ---
 
@@ -27,27 +22,82 @@ Do **not** merge this branch into `main` until a product decision is made (v1 st
 ```bash
 cd "/home/eunbi/HWP analysis"
 python3 HWP_v2/server.py
+# 또는: python3 apps/editor/server.py
 ```
 
-→ http://127.0.0.1:8765
+→ [http://127.0.0.1:8765](http://127.0.0.1:8765)
 
-## What works (as of 2026-07-15)
+---
 
-- HWPX open · direct edit · export (save must match on-screen text)
-- HWP open via convert; working HWP mirror on edit when possible
-- Excel as reference · multi-doc Q&A / “보완해줘” fill path
-- Paragraph/cell select · Ollama rewrite · accept/reject
-- Settings (Ollama URL / model list) collapsed in header
+## Layout
 
-## What does **not** (or poorly)
+```
+[ 워크스페이스 ] [ 문서 미리보기/편집 ] [ AI ]
+```
 
-- Native Hangul.exe rendering (Linux → HTML preview only)
-- Fake placeholder names/titles (removed on purpose)
-- Polished UX comparable to commercial Inline AI
-- Clear long-term product direction vs v1
+
+| 영역  | 역할                                |
+| --- | --------------------------------- |
+| 왼쪽  | 연 파일 목록 · 클릭=활성 · **× = 목록에서 삭제** |
+| 가운데 | HTML 미리보기 · 클릭=선택 · 더블클릭=직접 편집    |
+| 오른쪽 | AI 채팅 · 제안 수락/거절                  |
+| 상단  | 파일 추가 · 저장(HWPX/HWP) · 설정(Ollama) |
+
+
+미리보기는 한글.exe가 아닙니다. Linux에서는 HWPX XML → HTML로 재구성합니다.
+
+**지원 파일: HWP / HWPX만** (Excel 업로드·분석은 UI에서 제외).
+
+---
+
+## Folder structure
+
+```
+HWP_v2/
+  server.py           # Flask API · 세션 · 채팅 · export
+  chat_route.py       # 채팅 의도 분기
+  workspace_docs.py   # DocSlot (HWP/HWPX 로드)
+  cell_ai.py          # 선택 문단/영역 프롬프트 · 로컬 축약
+  convert_hwp.py      # HWP ↔ HWPX
+  templates/index.html
+  static/js/app.js
+  static/css/app.css
+  README.md
+```
+
+**Reused**
+
+
+| Module                                 | Role                 |
+| -------------------------------------- | -------------------- |
+| `hwp_core.hwpx_editor.HWPXEditor`      | HWPX XML 편집 · export |
+| `hwp_core.qa_engine.QAEngine`          | 멀티문서 Q&A             |
+| `hwp_core.doc_agent.DocFillPipeline`   | 보완/채우기               |
+| `hwp_core.editing` / `hwp_core.shared` | 편집·공유 레이어            |
+
+
+---
+
+## Features
+
+### Documents
+
+- **파일 추가**: `.hwp` / `.hwpx` 다중 업로드 (세션에 계속 추가)
+- **삭제**: 워크스페이스 카드 옆 **×** → 확인 후 제거 (`POST /api/remove_doc`)
+- **HWPX**: 편집 가능
+- **HWP**: 변환 후 편집 · 가능하면 HWP 저장에 미러
+- **저장 · HWPX / HWP** · Ctrl+S ≈ HWPX
+
+### Editing
+
+- 클릭 = 선택, 더블클릭 = 직접 수정 → 서버에 즉시 commit
+- AI 제안은 propose → **전체 수락 / 전체 거절**
+
+---
 
 ## Notes
 
-- Engine reuses `hwp_core`, `DocFillPipeline`, `QAEngine`
-- HWPX is a ZIP (`PK…`) — save as file and open in Hangul
-- See `EXPERIMENT.md` for the day log
+- HWPX는 ZIP(`PK…`). 파일로 저장해 한글에서 열기.
+- 채우기 값은 참고 문서에서만 — 임의 생성하지 않음.
+- Product A/B 안내는 저장소의 `PRODUCT_B_UX_VALIDATION.md` 참고.
+
