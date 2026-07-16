@@ -385,7 +385,12 @@ def remove_doc():
 
 
 def _run_workspace_fill(sess: Session, command: str) -> str:
-    """활성 HWP(X) = target, 나머지 = 참고 (엑셀 포함)."""
+    """활성 HWP(X) = target, 나머지 = 참고.
+
+    Evidence Fill → Context Fill. 제안만 pending에 올리고 자동 적용하지 않음.
+    """
+    from hwp_core.doc_agent.edit_proposal_service import AI_DRAFT_MARKER, FILL_CONTEXT, FILL_EVIDENCE
+
     slots = list(sess.docs.values())
     targets = [s for s in slots if s.kind in ("hwp", "hwpx") and s.bytes_data]
     if not targets:
@@ -393,10 +398,18 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
     active = _active(sess)
     target = active if active and active.kind in ("hwp", "hwpx") else targets[0]
     refs = [s for s in slots if s.id != target.id]
-    if not refs:
+
+    if target.editor is None and not target.read_only:
+        # ensure editable slot has editor
+        try:
+            from hwp_core.hwpx_editor import HWPXEditor
+            target.editor = HWPXEditor(target.bytes_data)
+        except Exception:
+            pass
+    if target.editor is None:
         return (
-            "참고할 다른 문서를 하나 더 열어 주세요. "
-            "그다음 「내용 보완해줘」라고 해 주세요."
+            "편집 가능한 HWPX가 필요합니다. "
+            "HWP만 있으면 변환된 HWPX를 활성으로 선택하세요."
         )
 
     pipe = DocFillPipeline()
@@ -421,40 +434,118 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
 
     proposals = (out.get("data") or {}).get("proposals") or []
     if not proposals:
+        ref_note = (
+            f"참고({', '.join(r.filename for r in refs)})와 "
+            if refs else ""
+        )
         return (
-            f"「{target.filename}」과 참고({', '.join(r.filename for r in refs)})를 봤지만 "
-            "반영할 빈칸·초안을 찾지 못했습니다."
+            f"「{target.filename}」에서 {ref_note}Evidence Fill과 Context Fill을 "
+            "모두 시도했지만 반영할 초안을 만들지 못했습니다. "
+            "빈칸·섹션 라벨을 확인하거나 참고 문서를 추가해 주세요."
         )
 
-    # 즉시 적용 시도
-    approved = [p["proposal_id"] for p in proposals]
-    applied = pipe.run_apply(approved)
-    if applied.get("ok"):
-        data = applied.get("data") or {}
-        edited = data.get("edited_bytes") or getattr(pipe.tools, "last_edited_bytes", None)
-        if edited and target.id in sess.docs:
-            # 결과로 슬롯 갱신
-            new_slot = load_doc_slot(edited, target.filename)
-            new_slot.id = target.id
-            if target.source_was_hwp:
-                new_slot.source_was_hwp = True
-                new_slot.original_hwp_name = target.original_hwp_name
-                new_slot.original_hwp_bytes = target.original_hwp_bytes
-            sess.docs[target.id] = new_slot
-            sess.active_id = target.id
-            _sync_active(sess)
-            return (
-                f"✅ 보완 {len(proposals)}건을 「{target.filename}」에 반영했습니다. "
-                f"참고: {', '.join(r.filename for r in refs)}\n"
-                "왼쪽 미리보기·저장으로 확인하세요."
-            )
-    # 적용 실패해도 제안 목록은 안내
-    lines = [f"초안 {len(proposals)}건 (자동 적용 일부 실패 — 요지만 표시):"]
-    for p in proposals[:8]:
-        loc = p.get("location") or p.get("field_id") or ""
-        after = (p.get("after") or "")[:80]
-        lines.append(f"• {loc}: {after}")
-    return "\n".join(lines)
+    # Sync active editor = target (propose/accept workflow)
+    sess.active_id = target.id
+    _sync_active(sess)
+    editor = sess.editor
+    if editor is None:
+        return "편집기를 준비하지 못했습니다."
+
+    n_ev = n_ctx = 0
+    pushed = 0
+    lines: list[str] = []
+
+    for p in proposals:
+        meta = p.get("meta") or {}
+        fill_mode = meta.get("fill_mode") or FILL_EVIDENCE
+        after = (p.get("after") or "").strip()
+        if not after:
+            continue
+        action = p.get("action") or ""
+        sources = p.get("sources") or []
+        src_bits = []
+        for s in sources[:3]:
+            doc = s.get("document") or ""
+            loc = s.get("location") or ""
+            if doc or loc:
+                src_bits.append(f"{doc} {loc}".strip())
+        src_txt = " · ".join(src_bits) if src_bits else ""
+        ch = None
+
+        try:
+            if action == "write_table_cell":
+                t = int(meta["table_id"])
+                r_i = int(meta["row"])
+                c_i = int(meta["column"])
+                ctx = p.get("label") or ""
+                ch = editor.propose_cell_change(t, r_i, c_i, after, context=ctx)
+                if fill_mode == FILL_CONTEXT and AI_DRAFT_MARKER not in (ch.location or ""):
+                    ch.location = f"{AI_DRAFT_MARKER} · {ch.location}"
+            elif action == "insert_after":
+                anchor = (meta.get("anchor_label") or "").strip()
+                if not anchor:
+                    # location may include AI Draft prefix — strip for locate
+                    raw_loc = (p.get("location") or "").replace(AI_DRAFT_MARKER, "").strip(" ·")
+                    anchor = raw_loc
+                if anchor:
+                    ch = editor.propose_insert_after_anchor(anchor, after)
+                else:
+                    pid = meta.get("paragraph_id")
+                    if pid is None:
+                        continue
+                    ch = editor.propose_paragraph_change(int(pid), after)
+                if ch and fill_mode == FILL_CONTEXT and AI_DRAFT_MARKER not in (ch.location or ""):
+                    ch.location = f"{AI_DRAFT_MARKER} · {ch.location}"
+            elif action == "insert_table":
+                # Pending insert as text after first paragraph (review before apply)
+                paras = editor.get_paragraphs()
+                anchor = paras[0]["text"] if paras else ""
+                body = f"[표 삽입 제안]\n{after}"
+                if anchor:
+                    ch = editor.propose_insert_after_anchor(anchor, body)
+                else:
+                    continue
+            else:
+                # replace_paragraph
+                pid = meta.get("paragraph_id")
+                if pid is None:
+                    continue
+                ch = editor.propose_paragraph_change(int(pid), after)
+                if fill_mode == FILL_CONTEXT and AI_DRAFT_MARKER not in (ch.location or ""):
+                    ch.location = f"{AI_DRAFT_MARKER} · {ch.location}"
+        except Exception as e:
+            lines.append(f"· 제안 실패 ({p.get('label') or action}): {e}")
+            continue
+
+        if not ch:
+            continue
+        pushed += 1
+        if fill_mode == FILL_CONTEXT:
+            n_ctx += 1
+            tag = AI_DRAFT_MARKER
+        else:
+            n_ev += 1
+            tag = f"Evidence · {src_txt}" if src_txt else "Evidence Fill"
+        show = after if len(after) <= 70 else after[:67] + "…"
+        lines.append(f"· [{tag}] {ch.location}: 「{show}」")
+
+    if not pushed:
+        return (
+            "초안은 만들었지만 문서 위치에 제안을 올리지 못했습니다. "
+            "문단/표 좌표를 확인해 주세요."
+        )
+
+    editor._bump_preview()
+    head = (
+        f"채우기 제안 {pushed}건을 올렸습니다 "
+        f"(Evidence {n_ev} · Context/AI Draft {n_ctx}).\n"
+        "자동 반영하지 않았습니다. 항목별 수락/거절 또는 「전체 수락」「전체 거절」을 사용하세요."
+    )
+    if refs:
+        head += f"\n참고 문서: {', '.join(r.filename for r in refs)}"
+    else:
+        head += "\n참고 문서 없음 → Context Fill만 사용했습니다."
+    return head + "\n\n" + "\n".join(lines[:12])
 
 
 def _explain_pending(sess: Session) -> str:

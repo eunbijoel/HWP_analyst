@@ -206,3 +206,47 @@ def test_forbidden_tool():
   pipe = DocFillPipeline()
   r = pipe.tools.call("drop_database")
   assert not r.ok
+
+
+def test_context_fill_without_reference_docs():
+  """참고 문서가 없어도 현재 문서 맥락으로 Context Fill 제안이 나와야 함."""
+  from hwp_core.doc_agent.edit_proposal_service import AI_DRAFT_MARKER, FILL_CONTEXT
+  from hwp_core.doc_agent.fixtures import make_minimal_hwpx
+
+  target = make_minimal_hwpx([
+    "연구개발계획서",
+    "추진 배경으로 공공 문서의 HWP 비중이 높은 점을 고려한다.",
+    "연구개발 목표는 내부 예산·계획 문서의 숫자 오류를 자동으로 탐지하는 시스템을 구축하는 것이다.",
+    "연구개발 목표",
+    "□",
+    "기대효과는 검토 시간을 단축하고 보고서 품질을 높이는 것이다.",
+    "기대효과",
+    "□",
+  ])
+  pipe = DocFillPipeline()
+  pipe.register_target("plan.hwpx", target)
+  assert pipe.run_inspect()["ok"]
+  out = pipe.run_propose("빈칸 채워줘", use_llm=False)
+  assert out["ok"]
+  proposals = (out["data"] or {}).get("proposals") or []
+  assert proposals, "Context Fill should not stop with no reference"
+  assert all((p.get("meta") or {}).get("fill_mode") == FILL_CONTEXT for p in proposals)
+  assert any(AI_DRAFT_MARKER in (p.get("location") or "") for p in proposals)
+  assert all(p.get("after") for p in proposals)
+
+
+def test_evidence_fill_preferred_when_refs_available():
+  from hwp_core.doc_agent.edit_proposal_service import FILL_EVIDENCE
+
+  pipe = DocFillPipeline()
+  pipe.register_target("plan.hwpx", make_rd_plan_hwpx())
+  pipe.register_reference("company.hwpx", make_company_ref_hwpx())
+  pipe.run_inspect()
+  out = pipe.run_propose("연구개발 목표와 기대효과를 작성해줘", use_llm=False)
+  proposals = (out["data"] or {}).get("proposals") or []
+  assert proposals
+  assert any((p.get("meta") or {}).get("fill_mode") == FILL_EVIDENCE for p in proposals)
+  assert any(
+    s.get("document") == "company.hwpx"
+    for p in proposals for s in (p.get("sources") or [])
+  )
