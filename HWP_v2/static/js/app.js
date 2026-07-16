@@ -2,8 +2,8 @@
   const $ = (id) => document.getElementById(id);
 
   let sessionId = null;
-  let selectedPara = null;
-  let selectedCell = null; // {t,r,c}
+  let selectedParas = []; // number[]
+  let selectedCells = []; // {t,r,c}[]
   let pendingSave = Promise.resolve();
 
   const els = {
@@ -22,12 +22,134 @@
     btnSend: $("btnSend"),
     btnAccept: $("btnAccept"),
     btnReject: $("btnReject"),
+    pendingList: $("pendingList"),
     selInfo: $("selInfo"),
     ollamaUrl: $("ollamaUrl"),
     modelSelect: $("modelSelect"),
     btnOllama: $("btnOllama"),
     ollamaStatus: $("ollamaStatus"),
   };
+
+  function cellKey(c) {
+    return `${c.t},${c.r},${c.c}`;
+  }
+
+  function syncSelectionFromState(state) {
+    selectedParas = Array.isArray(state.selected_paras)
+      ? state.selected_paras.map(Number)
+      : (state.selected_para != null ? [Number(state.selected_para)] : []);
+    selectedCells = Array.isArray(state.selected_cells)
+      ? state.selected_cells.map((x) => ({ t: x.t, r: x.r, c: x.c }))
+      : (state.selected_cell
+        ? [{ t: state.selected_cell.t, r: state.selected_cell.r, c: state.selected_cell.c }]
+        : []);
+  }
+
+  function updateSelInfo() {
+    if (!els.selInfo) return;
+    if (selectedCells.length) {
+      if (selectedCells.length === 1) {
+        const { t, r, c } = selectedCells[0];
+        const el = els.docRoot.querySelector(`[data-t="${t}"][data-r="${r}"][data-c="${c}"]`);
+        const orig = (el && el.getAttribute("data-cell-orig")) || "";
+        els.selInfo.textContent =
+          `${r + 1}행 ${c + 1}열\n${orig.slice(0, 280) || "(비어 있음)"}`;
+      } else {
+        const lines = selectedCells
+          .slice(0, 6)
+          .map(({ r, c }) => `${r + 1}행 ${c + 1}열`);
+        const more = selectedCells.length > 6 ? `\n…외 ${selectedCells.length - 6}곳` : "";
+        els.selInfo.textContent = `셀 ${selectedCells.length}곳 선택 (Ctrl+클릭)\n${lines.join(" · ")}${more}`;
+      }
+      return;
+    }
+    if (selectedParas.length) {
+      if (selectedParas.length === 1) {
+        const idx = selectedParas[0];
+        const el = els.docRoot.querySelector(`.para[data-para-idx="${idx}"]`);
+        const orig = (el && el.getAttribute("data-para-orig")) || "";
+        els.selInfo.textContent = `문단 ${idx + 1}\n${orig.slice(0, 280)}`;
+      } else {
+        const lines = selectedParas.slice(0, 8).map((i) => `문단 ${i + 1}`);
+        const more = selectedParas.length > 8 ? `\n…외 ${selectedParas.length - 8}` : "";
+        els.selInfo.textContent = `문단 ${selectedParas.length}곳 선택 (Ctrl+클릭)\n${lines.join(" · ")}${more}`;
+      }
+      return;
+    }
+    els.selInfo.textContent = "없으면 전체 문서로 질문/보완\nCtrl+클릭으로 여러 곳 선택";
+  }
+
+  function paintSelection() {
+    clearSelectionUI();
+    selectedParas.forEach((idx) => {
+      const el = els.docRoot.querySelector(`.para[data-para-idx="${idx}"]`);
+      if (el) el.classList.add("selected-v2");
+    });
+    selectedCells.forEach(({ t, r, c }) => {
+      const el = els.docRoot.querySelector(`[data-t="${t}"][data-r="${r}"][data-c="${c}"]`);
+      if (el) el.classList.add("selected-v2");
+    });
+    updateSelInfo();
+  }
+
+  function renderPending(pending) {
+    if (!els.pendingList) return;
+    els.pendingList.innerHTML = "";
+    const rows = pending || [];
+    if (!rows.length) {
+      els.pendingList.hidden = true;
+      return;
+    }
+    els.pendingList.hidden = false;
+    rows.forEach((p) => {
+      const card = document.createElement("div");
+      card.className = "pending-item";
+      const loc = document.createElement("div");
+      loc.className = "pending-loc";
+      loc.textContent = p.location || p.type || "제안";
+      const body = document.createElement("div");
+      body.className = "pending-body";
+      body.textContent = (p.new || "").slice(0, 160) || "(내용 없음)";
+      const actions = document.createElement("div");
+      actions.className = "pending-actions";
+      const ok = document.createElement("button");
+      ok.type = "button";
+      ok.className = "primary small";
+      ok.textContent = "수락";
+      ok.addEventListener("click", async () => {
+        try {
+          applyState(await api("/api/accept_one", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: sessionId, change_id: p.id }),
+          }));
+        } catch (err) {
+          alert(err.message);
+        }
+      });
+      const no = document.createElement("button");
+      no.type = "button";
+      no.className = "danger small";
+      no.textContent = "거절";
+      no.addEventListener("click", async () => {
+        try {
+          applyState(await api("/api/reject_one", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: sessionId, change_id: p.id }),
+          }));
+        } catch (err) {
+          alert(err.message);
+        }
+      });
+      actions.appendChild(ok);
+      actions.appendChild(no);
+      card.appendChild(loc);
+      card.appendChild(body);
+      card.appendChild(actions);
+      els.pendingList.appendChild(card);
+    });
+  }
 
   function currentModel() {
     return (els.modelSelect && els.modelSelect.value) || "gemma4";
@@ -80,6 +202,19 @@
     els.docRoot.querySelectorAll(".selected-v2").forEach((el) => el.classList.remove("selected-v2"));
   }
 
+  async function postSelect(payload) {
+    if (!sessionId) return;
+    try {
+      const data = await api("/api/select", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, ...payload }),
+      });
+      syncSelectionFromState(data);
+      paintSelection();
+    } catch (_) {}
+  }
+
   function wireDocument() {
     const root = els.docRoot;
 
@@ -89,23 +224,12 @@
         if (e.target.classList.contains("para-editable") && document.activeElement === e.target) return;
         const idx = p.getAttribute("data-para-idx");
         if (idx == null) return;
-        selectedPara = Number(idx);
-        selectedCell = null;
-        clearSelectionUI();
-        p.classList.add("selected-v2");
-        const orig = p.getAttribute("data-para-orig") || "";
-        els.selInfo.textContent = `문단 ${selectedPara + 1}\n${orig.slice(0, 280)}`;
-        try {
-          await api("/api/select", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              session_id: sessionId,
-              kind: "paragraph",
-              paragraph_index: selectedPara,
-            }),
-          });
-        } catch (_) {}
+        const multi = e.ctrlKey || e.metaKey;
+        await postSelect({
+          kind: "paragraph",
+          mode: multi ? "toggle" : "replace",
+          paragraph_index: Number(idx),
+        });
       });
       p.addEventListener("dblclick", (e) => {
         e.preventDefault();
@@ -148,23 +272,12 @@
         const t = Number(td.getAttribute("data-t"));
         const r = Number(td.getAttribute("data-r"));
         const c = Number(td.getAttribute("data-c"));
-        selectedCell = { t, r, c };
-        selectedPara = null;
-        clearSelectionUI();
-        td.classList.add("selected-v2");
-        const orig = td.getAttribute("data-cell-orig") || "";
-        els.selInfo.textContent = `${r + 1}행 ${c + 1}열\n${orig.slice(0, 280) || "(비어 있음)"}`;
-        try {
-          await api("/api/select", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              session_id: sessionId,
-              kind: "cell",
-              t, r, c,
-            }),
-          });
-        } catch (_) {}
+        const multi = e.ctrlKey || e.metaKey;
+        await postSelect({
+          kind: "cell",
+          mode: multi ? "toggle" : "replace",
+          t, r, c,
+        });
       });
       td.addEventListener("dblclick", (e) => {
         e.preventDefault();
@@ -284,8 +397,6 @@
   function applyState(state) {
     if (!state) return;
     sessionId = state.session_id;
-    selectedPara = state.selected_para;
-    selectedCell = state.selected_cell || null;
 
     const hasDocs = (state.doc_count || 0) > 0 || !!(state.html || state.filename);
     els.emptyState.hidden = hasDocs;
@@ -332,30 +443,10 @@
 
     renderDocList(state.docs || []);
     renderChat(state.chat);
+    renderPending(state.pending || []);
     wireDocument();
-
-    if (!selectedCell && selectedPara == null) {
-      els.selInfo.textContent = "없으면 전체 문서로 질문/보완";
-    }
-
-    if (selectedCell) {
-      const el = els.docRoot.querySelector(
-        `[data-t="${selectedCell.t}"][data-r="${selectedCell.r}"][data-c="${selectedCell.c}"]`
-      );
-      if (el) {
-        el.classList.add("selected-v2");
-        const orig = el.getAttribute("data-cell-orig") || "";
-        els.selInfo.textContent =
-          `${selectedCell.r + 1}행 ${selectedCell.c + 1}열\n${orig.slice(0, 280) || "(비어 있음)"}`;
-      }
-    } else if (selectedPara != null) {
-      const el = els.docRoot.querySelector(`.para[data-para-idx="${selectedPara}"]`);
-      if (el) {
-        el.classList.add("selected-v2");
-        const orig = el.getAttribute("data-para-orig") || "";
-        els.selInfo.textContent = `문단 ${selectedPara + 1}\n${orig.slice(0, 280)}`;
-      }
-    }
+    syncSelectionFromState(state);
+    paintSelection();
   }
 
   els.fileInput.addEventListener("change", async () => {

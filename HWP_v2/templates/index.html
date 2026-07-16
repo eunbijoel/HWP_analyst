@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>HWP Editing Assistant (B)</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=12" />
+  <link rel="stylesheet" href="/static/css/app.css?v=13" />
 </head>
 <body>
   <div class="shell">
@@ -54,7 +54,7 @@
           <span id="docName" class="doc-name">문서를 열어 주세요</span>
           <span id="pendingBadge" class="badge hidden">제안 0</span>
           <span id="hwpNote" class="note hidden"></span>
-          <span class="edit-tip">클릭=선택 · 더블클릭=편집 · Ctrl+S=저장</span>
+          <span class="edit-tip">클릭=선택 · Ctrl+클릭=다중 · 더블클릭=편집 · Ctrl+S=저장</span>
         </div>
         <div class="paper-scroll" id="paperScroll">
           <div class="empty-state" id="emptyState">
@@ -75,13 +75,15 @@
           </div>
           <div class="selection-box">
             <div class="sel-label">선택</div>
-            <div id="selInfo" class="sel-info">없으면 전체 문서로 질문/보완</div>
+            <div id="selInfo" class="sel-info">없으면 전체 문서로 질문/보완
+Ctrl+클릭으로 여러 곳 선택</div>
           </div>
         </div>
 
         <div class="chat" id="chatLog"></div>
 
         <div class="ai-bottom">
+          <div id="pendingList" class="pending-list" hidden></div>
           <div class="accept-row">
             <button type="button" id="btnAccept" class="primary" disabled>전체 수락</button>
             <button type="button" id="btnReject" class="danger" disabled>전체 거절</button>
@@ -94,6 +96,6 @@
       </aside>
     </main>
   </div>
-  <script src="/static/js/app.js?v=12"></script>
+  <script src="/static/js/app.js?v=13"></script>
 </body>
 </html>

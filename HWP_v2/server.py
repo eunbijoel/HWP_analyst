@@ -67,7 +67,9 @@ class Session:
     editor: Optional[HWPXEditor] = None
     chat: list[dict] = field(default_factory=list)
     selected_para: Optional[int] = None
-    selected_cell: Optional[tuple[int, int, int]] = None  # t, r, c
+    selected_cell: Optional[tuple[int, int, int]] = None  # t, r, c (마지막 클릭 · 호환)
+    selected_paras: list[int] = field(default_factory=list)
+    selected_cells: list[tuple[int, int, int]] = field(default_factory=list)
     source_was_hwp: bool = False
     original_hwp_name: str = ""
     original_hwp_bytes: Optional[bytes] = None
@@ -151,6 +153,33 @@ def _doc_html(sess: Session) -> str:
     return slot.preview_html or sess.readonly_html
 
 
+def _clear_selection(sess: Session) -> None:
+    sess.selected_para = None
+    sess.selected_cell = None
+    sess.selected_paras = []
+    sess.selected_cells = []
+
+
+def _selection_payload(sess: Session) -> dict:
+    return {
+        "selected_para": sess.selected_para,
+        "selected_cell": (
+            {"t": sess.selected_cell[0], "r": sess.selected_cell[1], "c": sess.selected_cell[2]}
+            if sess.selected_cell else None
+        ),
+        "selected_paras": list(sess.selected_paras),
+        "selected_cells": [
+            {"t": t, "r": r, "c": c} for t, r, c in sess.selected_cells
+        ],
+    }
+
+
+def _has_selection(sess: Session) -> bool:
+    return bool(sess.selected_paras or sess.selected_cells) or (
+        sess.selected_para is not None or sess.selected_cell is not None
+    )
+
+
 def _pending_summary(editor: Optional[HWPXEditor]) -> list[dict]:
     if editor is None:
         return []
@@ -168,10 +197,6 @@ def _pending_summary(editor: Optional[HWPXEditor]) -> list[dict]:
 
 def _state(sess: Session) -> dict:
     _sync_active(sess)
-    cell = None
-    if sess.selected_cell is not None:
-        t, r, c = sess.selected_cell
-        cell = {"t": t, "r": r, "c": c}
     pending_n = len(sess.editor.get_pending_changes()) if sess.editor else 0
     slots = list(sess.docs.values())
     return {
@@ -182,8 +207,7 @@ def _state(sess: Session) -> dict:
         "doc_count": len(slots),
         "pending_count": pending_n,
         "pending": _pending_summary(sess.editor),
-        "selected_para": sess.selected_para,
-        "selected_cell": cell,
+        **_selection_payload(sess),
         "source_was_hwp": sess.source_was_hwp,
         "original_hwp_name": sess.original_hwp_name,
         "convert_note": sess.convert_note,
@@ -302,8 +326,7 @@ def upload():
     if notes:
         tip += "\n" + "\n".join(notes[:5])
     sess.chat.append({"role": "assistant", "content": tip})
-    sess.selected_para = None
-    sess.selected_cell = None
+    _clear_selection(sess)
     return jsonify(_state(sess))
 
 
@@ -318,8 +341,7 @@ def set_active():
     if doc_id not in sess.docs:
         return jsonify({"error": "문서를 찾을 수 없습니다"}), 404
     sess.active_id = doc_id
-    sess.selected_para = None
-    sess.selected_cell = None
+    _clear_selection(sess)
     _sync_active(sess)
     return jsonify(_state(sess))
 
@@ -338,8 +360,7 @@ def remove_doc():
 
     was_active = sess.active_id == doc_id
     del sess.docs[doc_id]
-    sess.selected_para = None
-    sess.selected_cell = None
+    _clear_selection(sess)
     if was_active:
         sess.active_id = ""
         editable = next(
@@ -493,6 +514,10 @@ def get_session(sid: str):
 
 @app.post("/api/select")
 def select_target():
+    """문단/셀 선택. mode=replace(기본) | toggle(Ctrl+클릭 다중).
+
+    문단과 셀은 동시에 고르지 않음.
+    """
     body = request.get_json(force=True) or {}
     try:
         sess = _session(body["session_id"])
@@ -500,22 +525,43 @@ def select_target():
         return jsonify({"error": "세션 없음"}), 404
 
     kind = body.get("kind") or "paragraph"
+    mode = (body.get("mode") or "replace").lower()
+    if mode not in ("replace", "toggle"):
+        mode = "replace"
+
     if kind == "cell":
-        sess.selected_para = None
-        sess.selected_cell = (
-            int(body["t"]), int(body["r"]), int(body["c"]),
-        )
+        key = (int(body["t"]), int(body["r"]), int(body["c"]))
+        if mode == "toggle":
+            sess.selected_paras = []
+            sess.selected_para = None
+            if key in sess.selected_cells:
+                sess.selected_cells = [x for x in sess.selected_cells if x != key]
+            else:
+                sess.selected_cells = list(sess.selected_cells) + [key]
+        else:
+            sess.selected_paras = []
+            sess.selected_para = None
+            sess.selected_cells = [key]
+        sess.selected_cell = sess.selected_cells[-1] if sess.selected_cells else None
     else:
-        sess.selected_cell = None
         idx = body.get("paragraph_index")
-        sess.selected_para = int(idx) if idx is not None else None
-    return jsonify({
-        "selected_para": sess.selected_para,
-        "selected_cell": (
-            {"t": sess.selected_cell[0], "r": sess.selected_cell[1], "c": sess.selected_cell[2]}
-            if sess.selected_cell else None
-        ),
-    })
+        if idx is None:
+            return jsonify({"error": "paragraph_index 필요"}), 400
+        idx = int(idx)
+        if mode == "toggle":
+            sess.selected_cells = []
+            sess.selected_cell = None
+            if idx in sess.selected_paras:
+                sess.selected_paras = [x for x in sess.selected_paras if x != idx]
+            else:
+                sess.selected_paras = list(sess.selected_paras) + [idx]
+        else:
+            sess.selected_cells = []
+            sess.selected_cell = None
+            sess.selected_paras = [idx]
+        sess.selected_para = sess.selected_paras[-1] if sess.selected_paras else None
+
+    return jsonify(_selection_payload(sess))
 
 
 @app.post("/api/edit_paragraph")
@@ -688,33 +734,157 @@ def _row_hint(editor: HWPXEditor, t: int, r: int) -> str:
         return ""
 
 
-def _propose_reply(loc: str, value: str, summary: str) -> str:
+def _propose_reply(loc: str, value: str, summary: str, *, n: int = 1) -> str:
     show = value if len(value) <= 80 else value[:77] + "…"
+    if n > 1:
+        return (
+            f"{summary} · {n}곳 제안\n"
+            f"마지막: {loc} → 「{show}」\n\n"
+            "제안 목록에서 항목별 수락/거절하거나 「전체 수락」「전체 거절」을 쓰세요."
+        )
     return (
         f"{summary}\n→ 「{show}」\n\n"
-        f"{loc}에 제안을 올렸습니다. 「전체 수락」또는「전체 거절」을 누르세요."
+        f"{loc}에 제안을 올렸습니다. 항목별 수락/거절 또는 「전체 수락」「전체 거절」."
     )
 
 
-def _answer_selection_question(sess: Session, user_msg: str) -> str:
-    """Selected location + explanatory question → chat answer only."""
-    context = ""
-    loc = ""
-    if sess.selected_cell is not None and sess.editor:
-        t, r, c = sess.selected_cell
-        rows = sess.editor.get_table_as_rows(t) or []
-        old = ""
-        if r < len(rows) and c < len(rows[r]):
-            old = rows[r][c] or ""
-        loc = f"표{t + 1} ({r + 1}행,{c + 1}열)"
-        context = old
-    elif sess.selected_para is not None and sess.editor:
-        paras = sess.editor.get_paragraphs()
-        sel = sess.selected_para
-        if 0 <= sel < len(paras):
-            context = paras[sel]["text"]
-            loc = f"문단 {sel + 1}"
+def _rewrite_one_cell(sess: Session, user_msg: str, t: int, r: int, c: int) -> tuple[bool, str]:
+    intent = detect_cell_intent(user_msg)
+    rows = sess.editor.get_table_as_rows(t)
+    old = ""
+    if r < len(rows) and c < len(rows[r]):
+        old = rows[r][c] or ""
+    loc = f"{r + 1}행 {c + 1}열"
 
+    prompt = build_cell_prompt(
+        filename=sess.filename, t=t, r=r, c=c, old=old,
+        user_msg=user_msg, intent=intent, row_hint=_row_hint(sess.editor, t, r),
+    )
+    result = generate(
+        prompt, sess.model, sess.ollama_url,
+        temperature=0.25, num_predict=900, format="json", timeout=180,
+    )
+    if result.get("error"):
+        if intent == "shorten" and old.strip():
+            det_short = shorten_locally(old, aggressive="더" in user_msg)
+            sess.editor.propose_cell_change(t, r, c, det_short, context="축약")
+            return True, f"{loc} 축약"
+        return False, f"{loc}: Ollama 오류 ({result['error']})"
+
+    rewritten, summary = _parse_json_rewrite(result.get("text") or "")
+    if not (rewritten or "").strip():
+        if intent == "shorten" and old.strip():
+            rewritten = shorten_locally(old, aggressive="더" in user_msg)
+            summary = "축약"
+        else:
+            return False, f"{loc}: 수정문을 만들지 못함"
+    sess.editor.propose_cell_change(t, r, c, rewritten, context=summary)
+    return True, f"{loc} {summary or '수정'}"
+
+
+def _rewrite_one_para(sess: Session, user_msg: str, sel: int) -> tuple[bool, str]:
+    intent = detect_cell_intent(user_msg)
+    paras = sess.editor.get_paragraphs()
+    if not (0 <= sel < len(paras)):
+        return False, f"문단 {sel + 1}: 범위 오류"
+    selected_text = paras[sel]["text"]
+    loc = f"문단 {sel + 1}"
+    prompt = build_para_prompt(old=selected_text, user_msg=user_msg, intent=intent)
+    result = generate(
+        prompt, sess.model, sess.ollama_url,
+        temperature=0.3, num_predict=1500, format="json", timeout=180,
+    )
+    if result.get("error"):
+        if intent == "shorten" and selected_text.strip():
+            det_short = shorten_locally(selected_text, aggressive="더" in user_msg)
+            sess.editor.propose_paragraph_change(sel, det_short)
+            return True, f"{loc} 축약"
+        return False, f"{loc}: Ollama 오류 ({result['error']})"
+    rewritten, summary = _parse_json_rewrite(result.get("text") or "")
+    if not (rewritten or "").strip():
+        if intent == "shorten" and selected_text.strip():
+            rewritten = shorten_locally(selected_text, aggressive="더" in user_msg)
+            summary = "축약"
+        else:
+            return False, f"{loc}: 수정문을 만들지 못함"
+    sess.editor.propose_paragraph_change(sel, rewritten)
+    return True, f"{loc} {summary or '수정'}"
+
+
+def _apply_selection_rewrite(sess: Session, user_msg: str) -> str:
+    cells = list(sess.selected_cells)
+    paras = list(sess.selected_paras)
+    if not cells and sess.selected_cell is not None:
+        cells = [sess.selected_cell]
+    if not paras and sess.selected_para is not None:
+        paras = [sess.selected_para]
+
+    if cells and paras:
+        return "문단과 셀을 동시에 선택할 수 없습니다. 한쪽만 Ctrl+클릭으로 고르세요."
+    if not cells and not paras:
+        return "선택된 문단이 없습니다. 대상을 선택한 뒤 다시 지시해 주세요."
+
+    ok_msgs: list[str] = []
+    err_msgs: list[str] = []
+    last_value = ""
+    last_loc = ""
+
+    if cells:
+        for t, r, c in cells:
+            ok, msg = _rewrite_one_cell(sess, user_msg, t, r, c)
+            (ok_msgs if ok else err_msgs).append(msg)
+            if ok:
+                last_loc = f"{r + 1}행 {c + 1}열"
+                rows = sess.editor.get_table_as_rows(t) or []
+                # new text is in pending; keep short summary
+                last_value = msg
+        n = len(ok_msgs)
+        if n == 0:
+            return "제안을 만들지 못했습니다.\n" + "\n".join(err_msgs)
+        head = _propose_reply(last_loc or "선택", last_value or "제안", f"{n}곳 수정", n=n)
+        detail = "\n".join(f"· {m}" for m in ok_msgs)
+        extra = ("\n실패:\n" + "\n".join(f"· {m}" for m in err_msgs)) if err_msgs else ""
+        return f"{head}\n\n{detail}{extra}"
+
+    for sel in paras:
+        ok, msg = _rewrite_one_para(sess, user_msg, sel)
+        (ok_msgs if ok else err_msgs).append(msg)
+        if ok:
+            last_loc = f"문단 {sel + 1}"
+            last_value = msg
+    n = len(ok_msgs)
+    if n == 0:
+        return "제안을 만들지 못했습니다.\n" + "\n".join(err_msgs)
+    head = _propose_reply(last_loc or "선택", last_value or "제안", f"{n}곳 수정", n=n)
+    detail = "\n".join(f"· {m}" for m in ok_msgs)
+    extra = ("\n실패:\n" + "\n".join(f"· {m}" for m in err_msgs)) if err_msgs else ""
+    return f"{head}\n\n{detail}{extra}"
+
+
+def _answer_selection_question(sess: Session, user_msg: str) -> str:
+    """Selected location(s) + explanatory question → chat answer only."""
+    parts: list[str] = []
+    cells = list(sess.selected_cells) or (
+        [sess.selected_cell] if sess.selected_cell is not None else []
+    )
+    paras = list(sess.selected_paras) or (
+        [sess.selected_para] if sess.selected_para is not None else []
+    )
+    if sess.editor and cells:
+        for t, r, c in cells[:8]:
+            rows = sess.editor.get_table_as_rows(t) or []
+            old = ""
+            if r < len(rows) and c < len(rows[r]):
+                old = rows[r][c] or ""
+            parts.append(f"[{r + 1}행 {c + 1}열] {old[:400]}")
+    elif sess.editor and paras:
+        all_paras = sess.editor.get_paragraphs()
+        for sel in paras[:8]:
+            if 0 <= sel < len(all_paras):
+                parts.append(f"[문단 {sel + 1}] {all_paras[sel]['text'][:400]}")
+
+    context = "\n\n".join(parts)
+    loc = f"{len(parts)}곳" if len(parts) > 1 else (parts[0][:40] if parts else "")
     if not context.strip():
         return "선택된 내용이 비어 있습니다. 다른 문단을 선택하거나 Product A에서 질문하세요."
 
@@ -722,7 +892,7 @@ def _answer_selection_question(sess: Session, user_msg: str) -> str:
         "사용자는 문서 일부를 선택한 채 설명·정의·개념을 묻고 있습니다.\n"
         "문서를 수정하거나 rewritten을 만들지 마세요. 질문에 한국어로만 답하세요.\n"
         f"위치: {loc}\n"
-        f"선택 내용:\n\"\"\"{context[:1200]}\"\"\"\n"
+        f"선택 내용:\n\"\"\"{context[:2400]}\"\"\"\n"
         f"질문: {user_msg}\n"
     )
     result = generate(
@@ -735,71 +905,6 @@ def _answer_selection_question(sess: Session, user_msg: str) -> str:
             "전체 문서 Q&A는 Product A를 이용하세요."
         )
     return (result.get("text") or "").strip() or "답변을 만들지 못했습니다."
-
-
-def _apply_selection_rewrite(sess: Session, user_msg: str) -> str:
-    intent = detect_cell_intent(user_msg)
-    cell = sess.selected_cell
-    sel = sess.selected_para
-    paras = sess.editor.get_paragraphs() if sess.editor else []
-
-    if cell is not None:
-        t, r, c = cell
-        rows = sess.editor.get_table_as_rows(t)
-        old = ""
-        if r < len(rows) and c < len(rows[r]):
-            old = rows[r][c] or ""
-
-        prompt = build_cell_prompt(
-            filename=sess.filename, t=t, r=r, c=c, old=old,
-            user_msg=user_msg, intent=intent, row_hint=_row_hint(sess.editor, t, r),
-        )
-        result = generate(
-            prompt, sess.model, sess.ollama_url,
-            temperature=0.25, num_predict=900, format="json", timeout=180,
-        )
-        if result.get("error"):
-            if intent == "shorten" and old.strip():
-                det_short = shorten_locally(old, aggressive="더" in user_msg)
-                sess.editor.propose_cell_change(t, r, c, det_short, context="축약")
-                return _propose_reply(f"표{t+1} ({r+1}행,{c+1}열)", det_short, "축약")
-            return f"Ollama 오류: {result['error']}"
-
-        rewritten, summary = _parse_json_rewrite(result.get("text") or "")
-        if not (rewritten or "").strip():
-            if intent == "shorten" and old.strip():
-                rewritten = shorten_locally(old, aggressive="더" in user_msg)
-                summary = "축약"
-            else:
-                return "수정문을 만들지 못했습니다. 지시를 더 구체적으로 해 주세요."
-
-        sess.editor.propose_cell_change(t, r, c, rewritten, context=summary)
-        return _propose_reply(f"표{t+1} ({r+1}행,{c+1}열)", rewritten, summary or "수정")
-
-    if sel is not None and 0 <= sel < len(paras):
-        selected_text = paras[sel]["text"]
-        prompt = build_para_prompt(old=selected_text, user_msg=user_msg, intent=intent)
-        result = generate(
-            prompt, sess.model, sess.ollama_url,
-            temperature=0.3, num_predict=1500, format="json", timeout=180,
-        )
-        if result.get("error"):
-            if intent == "shorten" and selected_text.strip():
-                det_short = shorten_locally(selected_text, aggressive="더" in user_msg)
-                sess.editor.propose_paragraph_change(sel, det_short)
-                return _propose_reply(f"문단 {sel + 1}", det_short, "축약")
-            return f"Ollama 오류: {result['error']}"
-        rewritten, summary = _parse_json_rewrite(result.get("text") or "")
-        if not (rewritten or "").strip():
-            if intent == "shorten" and selected_text.strip():
-                rewritten = shorten_locally(selected_text, aggressive="더" in user_msg)
-                summary = "축약"
-            else:
-                return "수정문을 만들지 못했습니다. 지시를 더 구체적으로 해 주세요."
-        sess.editor.propose_paragraph_change(sel, rewritten)
-        return _propose_reply(f"문단 {sel + 1}", rewritten, summary or "수정")
-
-    return "선택된 문단이 없습니다. 대상을 선택한 뒤 다시 지시해 주세요."
 
 
 def _apply_propose_target(sess: Session, route) -> str:
@@ -891,7 +996,7 @@ def chat():
 
     sel = sess.selected_para
     cell = sess.selected_cell
-    has_selection = cell is not None or sel is not None
+    has_selection = _has_selection(sess)
 
     decision = decide_chat_route(
         message=user_msg,
@@ -964,6 +1069,38 @@ def accept_all():
     return jsonify({"accepted": n, **_state(sess)})
 
 
+@app.post("/api/accept_one")
+def accept_one():
+    body = request.get_json(force=True) or {}
+    try:
+        sess = _session(body["session_id"])
+    except KeyError:
+        return jsonify({"error": "세션 없음"}), 404
+    if not sess.editor:
+        return jsonify({"error": "읽기 전용"}), 400
+    change_id = (body.get("change_id") or "").strip()
+    if not change_id:
+        return jsonify({"error": "change_id 필요"}), 400
+    ch = next((c for c in sess.editor.pending_changes if c.id == change_id), None)
+    if ch is None or ch.status != "pending":
+        return jsonify({"error": "제안을 찾을 수 없습니다"}), 404
+    ok = sess.editor.accept_change(change_id, track_changes=False)
+    if not ok:
+        return jsonify({"error": "수락 반영 실패"}), 400
+    if ch.change_type == "cell" and ch.table_index is not None:
+        _mirror_hwp_cell(sess, ch.table_index, ch.row, ch.col, ch.new_text or "")
+    elif ch.change_type == "paragraph" and ch.paragraph_index is not None:
+        _mirror_hwp_paragraph(
+            sess, ch.paragraph_index, ch.new_text or "", ch.old_text or "",
+        )
+    show = (ch.new_text or "")[:60]
+    sess.chat.append({
+        "role": "assistant",
+        "content": f"✅ 수락 · {ch.location}: 「{show}」",
+    })
+    return jsonify({"accepted": 1, **_state(sess)})
+
+
 @app.post("/api/reject_all")
 def reject_all():
     body = request.get_json(force=True) or {}
@@ -983,6 +1120,33 @@ def reject_all():
         "content": f"❌ AI 제안 {n}건을 거절했습니다.",
     })
     return jsonify({"rejected": n, **_state(sess)})
+
+
+@app.post("/api/reject_one")
+def reject_one():
+    body = request.get_json(force=True) or {}
+    try:
+        sess = _session(body["session_id"])
+    except KeyError:
+        return jsonify({"error": "세션 없음"}), 404
+    if not sess.editor:
+        return jsonify({"error": "읽기 전용"}), 400
+    change_id = (body.get("change_id") or "").strip()
+    if not change_id:
+        return jsonify({"error": "change_id 필요"}), 400
+    ch = next((c for c in sess.editor.pending_changes if c.id == change_id), None)
+    if ch is None or ch.status != "pending":
+        return jsonify({"error": "제안을 찾을 수 없습니다"}), 404
+    ch.status = "rejected"
+    sess.editor.pending_changes = [
+        c for c in sess.editor.pending_changes if c.status == "pending"
+    ]
+    sess.editor._bump_preview()
+    sess.chat.append({
+        "role": "assistant",
+        "content": f"❌ 거절 · {ch.location}",
+    })
+    return jsonify({"rejected": 1, **_state(sess)})
 
 
 def _export_hwp_via_hwpilot(sess: Session) -> tuple[Optional[bytes], str]:

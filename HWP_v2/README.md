@@ -90,8 +90,12 @@ HWP_v2/
 
 ### Editing
 
-- 클릭 = 선택, 더블클릭 = 직접 수정 → 서버에 즉시 commit
-- AI 제안은 propose → **전체 수락 / 전체 거절**
+- 클릭 = 선택, **Ctrl+클릭 = 다중 선택** (문단끼리 또는 셀끼리; 혼합 불가)
+- 더블클릭 = 직접 수정 → 서버에 즉시 commit
+- 선택 후 채팅 한 번 → 선택한 곳마다 AI 제안
+- 제안: **항목별 수락/거절** + **전체 수락 / 전체 거절**
+  - `POST /api/select` — `mode: replace|toggle`
+  - `POST /api/accept_one` / `POST /api/reject_one` — `change_id`
 
 ---
 
