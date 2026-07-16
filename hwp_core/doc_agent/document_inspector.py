@@ -15,8 +15,18 @@ from ..hwpx_editor import HWPXEditor, PLACEHOLDER_RE, PLACEHOLDER_SUBSTR
 _FILL_ONTOLOGY = Path(__file__).resolve().parent.parent / "ontology" / "doc_fill_concepts.yaml"
 
 # 글 항목으로 취급할 concept
-TEXT_CONCEPTS = {"rd_necessity", "rd_objective", "expected_effect"}
+TEXT_CONCEPTS = {
+  "rd_necessity", "rd_objective", "expected_effect",
+  "rd_content", "rd_strategy", "utilization",
+}
+# 인건비형 표
 TABLE_CONCEPTS = {"person_name", "position", "participation_rate", "labor_cost_cash"}
+# 서식 사실 칸 (Evidence only)
+FACT_CONCEPTS = {
+  "org_name", "address", "representative", "pi_name",
+  "phone", "mobile", "email", "business_reg_no", "corp_reg_no",
+  "person_name", "position", "form_blank",
+} | TABLE_CONCEPTS
 
 
 @dataclass
@@ -75,14 +85,61 @@ def find_empty_fields(editor: HWPXEditor, document_id: str = "") -> list[Editabl
 
 
 FORM_LABEL_RE = re.compile(
-  r"(번호|성명|이름|직위|직급|주소|전화|메일|이메일|팩스|"
-  r"공고|과제|대표|등록|기관|부처|일자|기간|비율|금액)",
+  r"(성명|이름|직위|직급|주소|전화번호|전화|메일|이메일|전자우편|팩스|"
+  r"공고번호|과제번호|대표자명|대표자|대표전화|등록번호|기관명|"
+  r"주관기관|수행기관|부처|일자|기간|비율|금액|책임자|소재지|"
+  r"휴대전화|연구자번호|연월일|연락처|기관\s*유형|유형)",
+  re.I,
+)
+
+_ORG_OR_VALUE_LIKE_RE = re.compile(
+  r"(연구원|연구소|협회|학회|대학교|대학|센터|주식회사|㈜|[(（]주[)）]|"
+  r"유한회사|조합|본부|회의소|얼라이언스|테크|산업)$"
+)
+
+_INSTRUCTIONAL_VALUE_RE = re.compile(
+  r"(유형|연월일|기입|작성|예시|해당\s*없음|선택|해당란|"
+  r"대학\s*,|출연연|중소기업\s*등|\(비어|"
+  r"등\s*\)|등\))",
   re.I,
 )
 
 
+def _looks_like_org_or_filled_value(text: str) -> bool:
+  """왼쪽 칸이 라벨이 아니라 이미 채워진 값(기관명 등)인지."""
+  t = (text or "").strip()
+  if not t:
+    return False
+  if len(t) > 18:
+    return True
+  if _ORG_OR_VALUE_LIKE_RE.search(t):
+    return True
+  # 한글 고유명사처럼 보이는데 ontology 라벨이 아니면 값으로 본다
+  gr = _ground_label(t)
+  if gr[0] in FACT_CONCEPTS and gr[1] >= 0.95 and len(t) <= 12:
+    return False
+  if not FORM_LABEL_RE.search(t) and len(t) >= 4:
+    return True
+  return False
+
+
+def _is_usable_form_label(text: str) -> bool:
+  t = (text or "").strip()
+  if not t or len(t) > 40:
+    return False
+  if _looks_like_org_or_filled_value(t):
+    return False
+  cid, conf = _ground_label(t)
+  if cid in FACT_CONCEPTS and conf >= 0.85:
+    return True
+  # "기관 유형 (대학, …)" 안내 헤더도 열 라벨로 인정 (값은 별도 검증에서 차단)
+  if re.search(r"기관\s*유형|유형\s*\(", t) and len(t) <= 40:
+    return True
+  return bool(FORM_LABEL_RE.search(t)) and len(t) <= 24
+
+
 def find_form_label_blanks(editor: HWPXEditor, document_id: str = "") -> list[EditableField]:
-  """라벨 옆이 비어 있는 서식 칸 (공고번호·과제번호 등). 연속 빈 칸은 첫 칸만."""
+  """라벨 옆/열 헤더 아래가 비어 있는 서식 칸. ontology로 concept grounding."""
   fields: list[EditableField] = []
   seen: set[tuple[int, int, int]] = set()
 
@@ -96,16 +153,58 @@ def find_form_label_blanks(editor: HWPXEditor, document_id: str = "") -> list[Ed
         if not _is_blank(str(row[c_idx])):
           c_idx += 1
           continue
-        label = ""
+
+        # 1) 열 헤더(위쪽) 우선 — 기관명|책임자|직위 표
+        header_label = ""
+        for hr in range(0, min(r_idx, 3)):
+          if c_idx >= len(rows[hr]):
+            continue
+          cand = str(rows[hr][c_idx]).strip()
+          if cand and _is_usable_form_label(cand):
+            header_label = cand
+            break
+
+        # 2) 왼쪽 라벨 — 값이 아닌 짧은 라벨만
+        left_label = ""
         for j in range(c_idx - 1, -1, -1):
           cand = str(row[j]).strip()
-          if cand:
-            label = cand
+          if not cand:
+            continue
+          if _looks_like_org_or_filled_value(cand):
             break
-        if not label or len(label) > 24 or not FORM_LABEL_RE.search(label):
+          if _is_usable_form_label(cand):
+            left_label = cand
+          break
+
+        label = header_label or left_label
+        if not label:
           c_idx += 1
           continue
-        # 같은 라벨이 반복 병합된 칸은 스킵
+
+        row_ctx = " ".join(
+          str(row[j]).strip() for j in range(0, min(c_idx, len(row))) if str(row[j]).strip()
+        )
+        # 헤더 행 텍스트도 맥락에 포함
+        if r_idx > 0 and c_idx < len(rows[0]):
+          row_ctx = f"{rows[0][c_idx]} {row_ctx}".strip()
+
+        # 라벨 자체만 grounding (row_ctx에 연구책임자가 있으면 패턴이 라벨을 덮어씀)
+        cid, conf = _ground_label(label)
+        if (
+          (cid in ("person_name", None, "") or not cid)
+          and re.search(r"연구\s*책임|책임자", f"{row_ctx} {label}")
+          and not re.search(r"번호|등록", label)
+        ):
+          cid, conf = "pi_name", max(float(conf or 0), 0.9)
+        if cid in TEXT_CONCEPTS:
+          c_idx += 1
+          continue
+        if cid not in FACT_CONCEPTS:
+          if not FORM_LABEL_RE.search(label):
+            c_idx += 1
+            continue
+          cid, conf = "form_blank", 0.7
+
         if label == str(row[c_idx]).strip():
           c_idx += 1
           continue
@@ -115,8 +214,11 @@ def find_form_label_blanks(editor: HWPXEditor, document_id: str = "") -> list[Ed
           continue
         seen.add(key)
         end = c_idx + 1
-        while end < len(row) and _is_blank(str(row[end])):
-          end += 1
+        # 왼쪽 라벨 서식(라벨|값|값)만 연속 빈 칸 병합.
+        # 열 헤더 표(기관명|책임자|직위)는 칸마다 별도 필드로 둔다.
+        if not header_label:
+          while end < len(row) and _is_blank(str(row[end])):
+            end += 1
         fields.append(EditableField(
           field_id=f"form_{t_idx}_{r_idx}_{c_idx}_{uuid.uuid4().hex[:6]}",
           field_type="table_cell",
@@ -127,9 +229,9 @@ def find_form_label_blanks(editor: HWPXEditor, document_id: str = "") -> list[Ed
           row=r_idx,
           column=c_idx,
           current_value="",
-          concept_id="form_blank",
-          concept_confidence=0.7,
-          style={"span_cols": end - c_idx, "form": True},
+          concept_id=cid,
+          concept_confidence=conf if conf else 0.7,
+          style={"span_cols": end - c_idx, "form": True, "factual": True},
         ))
         c_idx = end
   return fields
@@ -185,6 +287,19 @@ def find_empty_table_cells(editor: HWPXEditor, document_id: str = "") -> list[Ed
   return fields
 
 
+def _looks_like_section_heading(text: str) -> bool:
+  """본문 문장이 아닌 짧은 섹션 제목인지."""
+  t = (text or "").strip()
+  if not t or len(t) > 28:
+    return False
+  # 서술형 문장 배제
+  if re.search(r"(다\.|요\.|음\.|이다\.|된다\.|한다\.)$", t):
+    return False
+  if re.search(r"(을|를)\s+\S+(다|요)", t):
+    return False
+  return True
+
+
 def find_text_section_fields(editor: HWPXEditor, document_id: str = "") -> list[EditableField]:
   """라벨 문단 바로 다음이 비어 있거나 짧으면 작성 후보."""
   paras = editor.get_paragraphs()
@@ -193,8 +308,7 @@ def find_text_section_fields(editor: HWPXEditor, document_id: str = "") -> list[
 
   for i, para in enumerate(paras):
     text = (para.get("text") or "").strip()
-    # 표에서 추출된 긴 요약 덩어리는 섹션 라벨이 아님
-    if not text or len(text) > 48:
+    if not _looks_like_section_heading(text):
       continue
     cid, conf = _ground_label(text)
     if not cid or cid not in TEXT_CONCEPTS or conf < 0.85:
@@ -204,8 +318,17 @@ def find_text_section_fields(editor: HWPXEditor, document_id: str = "") -> list[
         if not cdef:
           continue
         keys = [cdef.label_ko] + list(cdef.synonyms)
-        # 짧은 제목 문단에 동의어가 들어 있을 때만
-        if any(normalize_label(k) and normalize_label(k) in normalize_label(text) for k in keys):
+        # 제목 전체가 동의어와 가깝거나, 짧은 제목에 동의어가 포함
+        nt = normalize_label(text)
+        hit = False
+        for k in keys:
+          nk = normalize_label(k)
+          if not nk:
+            continue
+          if nt == nk or (len(nt) <= 20 and nk in nt):
+            hit = True
+            break
+        if hit:
           cid, conf = syn_cid, 0.9
           break
       else:
@@ -221,7 +344,10 @@ def find_text_section_fields(editor: HWPXEditor, document_id: str = "") -> list[
     if next_para:
       next_text = (next_para.get("text") or "").strip()
       next_cid, _ = _ground_label(next_text)
-      if next_cid in TEXT_CONCEPTS and len(next_text) <= 48:
+      if (
+        next_cid in TEXT_CONCEPTS
+        and _looks_like_section_heading(next_text)
+      ):
         # 바로 다음이 다른 섹션 → 이 라벨 아래 삽입
         fields.append(EditableField(
           field_id=f"ins_{i}_{uuid.uuid4().hex[:6]}",

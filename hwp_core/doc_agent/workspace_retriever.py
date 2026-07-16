@@ -329,64 +329,261 @@ def lookup_label_value_in_refs(
   refs: list[WorkspaceDocument],
   label: str,
 ) -> tuple[str, list[dict]]:
-  """라벨(공고번호·성명 등)에 대응되는 값을 참고자료에서 찾음. 없으면 ("", [])."""
-  lab = (label or "").strip()
-  if not lab:
-    return "", []
-  nlab = normalize_label(lab)
+  """하위 호환: 라벨 문자열만으로 검색."""
+  return lookup_fact_value(refs, label=label, concept_id="")
 
-  # 1) Excel: 헤더==라벨인 열의 첫 데이터, 또는 같은 행에서 라벨 옆 값
+
+def _concept_label_aliases(concept_id: str, label: str) -> list[str]:
+  """ontology 동의어 + 원 라벨."""
+  aliases: list[str] = []
+  seen: set[str] = set()
+
+  def _add(s: str) -> None:
+    t = (s or "").strip()
+    if not t:
+      return
+    n = normalize_label(t)
+    if not n or n in seen:
+      return
+    seen.add(n)
+    aliases.append(t)
+
+  _add(label)
+  if concept_id and concept_id in get_fill_resolver().concepts:
+    cdef = get_fill_resolver().concepts[concept_id]
+    _add(cdef.label_ko)
+    for s in cdef.synonyms:
+      _add(s)
+  # Also accept any ontology concept that grounds this label
+  if label:
+    gr = get_fill_resolver().ground(label)
+    if gr.grounded and gr.concept_id and gr.concept_id != concept_id:
+      cdef = get_fill_resolver().concepts.get(gr.concept_id)
+      if cdef:
+        _add(cdef.label_ko)
+        for s in cdef.synonyms:
+          _add(s)
+  # longer aliases first for matching
+  aliases.sort(key=lambda x: len(normalize_label(x)), reverse=True)
+  return aliases
+
+
+def _label_matches(cell: str, aliases: list[str]) -> bool:
+  ncell = normalize_label(cell)
+  if not ncell:
+    return False
+  for a in aliases:
+    na = normalize_label(a)
+    if not na:
+      continue
+    if ncell == na or na in ncell or (len(ncell) >= 2 and ncell in na):
+      return True
+  return False
+
+
+def _iter_ref_table_grids(ref: WorkspaceDocument) -> list[tuple[str, list[list[str]]]]:
+  """참고 문서의 모든 표 그리드 (Excel · HWPX · parsed)."""
+  grids: list[tuple[str, list[list[str]]]] = []
+  for sheet in ref.excel_sheets or []:
+    rows = sheet.get("rows") or []
+    if rows:
+      grids.append((str(sheet.get("name") or "Sheet"), rows))
+
+  # Prefer native HWPX grid (accurate label/value cells)
+  if ref.file_bytes:
+    ext = (ref.file_type or "").lower().lstrip(".")
+    name = (ref.filename or "").lower()
+    if ext in ("hwpx", "hwp") or name.endswith(".hwpx") or name.endswith(".hwp"):
+      try:
+        from ..hwpx_editor import HWPXEditor
+        ed = HWPXEditor(ref.file_bytes)
+        for ti in range(ed.get_table_count()):
+          rows = ed.get_table_as_rows(ti)
+          if rows:
+            grids.append((f"표{ti + 1}", rows))
+      except Exception:
+        pass
+
+  if ref.parsed is not None:
+    for si, rows in enumerate(getattr(ref.parsed, "tables", None) or []):
+      if rows and isinstance(rows, list):
+        grids.append((f"Sheet{si + 1}", rows))
+
+  # Avoid broken dataframe collapses when we already have HWPX grids
+  if not grids:
+    for i, t in enumerate(ref.tables or []):
+      df = getattr(t, "dataframe", None)
+      if df is None:
+        continue
+      try:
+        rows = [list(map(str, df.columns))] + [
+          [("" if str(c) == "nan" else str(c)) for c in row]
+          for row in df.values.tolist()
+        ]
+        if rows:
+          grids.append((f"table{i + 1}", rows))
+      except Exception:
+        pass
+  return grids
+
+
+def _looks_like_field_label(text: str) -> bool:
+  from .value_type_validation import _looks_like_field_label as _is_label
+  return _is_label(text)
+
+
+def value_rejection_reason(concept_id: str, label: str, value: str) -> str:
+  from .value_type_validation import value_rejection_reason as _reason
+  return _reason(concept_id, label, value)
+
+
+def _value_ok_for_concept(concept_id: str, label: str, value: str) -> bool:
+  return value_rejection_reason(concept_id, label, value) == ""
+
+
+def lookup_fact_candidates(
+  refs: list[WorkspaceDocument],
+  *,
+  label: str = "",
+  concept_id: str = "",
+) -> list[dict]:
+  """사실 칸 후보를 전부 나열 (검색 순서 = rank). 검증은 rank_validate_candidates에서."""
+  aliases = _concept_label_aliases(concept_id, label)
+  out: list[dict] = []
+  if not aliases and not concept_id:
+    return []
+
+  def _push(val: str, doc: str, loc: str, stype: str) -> None:
+    v = (val or "").strip()
+    if not v:
+      return
+    out.append({
+      "value": v,
+      "source_document": doc,
+      "source_location": loc,
+      "source_type": stype,
+    })
+
+  # 1) 표: 라벨 옆/아래
   for ref in refs:
-    sheets = list(ref.excel_sheets or [])
-    if not sheets and ref.parsed is not None:
-      for si, rows in enumerate(getattr(ref.parsed, "tables", None) or []):
-        sheets.append({"name": f"Sheet{si+1}", "rows": rows})
-    for sheet in sheets:
-      rows = sheet.get("rows") or []
+    for gname, rows in _iter_ref_table_grids(ref):
       if not rows:
         continue
-      header = [str(c).strip() for c in rows[0]]
-      for ci, h in enumerate(header):
-        if normalize_label(h) == nlab or (nlab and nlab in normalize_label(h)):
-          for ri in range(1, len(rows)):
-            if ci < len(rows[ri]):
-              val = str(rows[ri][ci]).strip()
-              if val:
-                return val, [{
-                  "document": ref.filename,
-                  "source_type": "excel_cell",
-                  "location": f"{sheet.get('name')}!{ri+1}열{ci+1}",
-                }]
-      # 행 안에서 라벨 셀 옆에 값
       for ri, row in enumerate(rows):
         for ci, cell in enumerate(row):
-          if normalize_label(str(cell)) != nlab and nlab not in normalize_label(str(cell)):
+          if not _label_matches(str(cell), aliases):
             continue
           for nj in (ci + 1, ci + 2):
             if nj < len(row):
-              val = str(row[nj]).strip()
-              if val and normalize_label(val) != nlab:
-                return val, [{
-                  "document": ref.filename,
-                  "source_type": "excel_cell",
-                  "location": f"{sheet.get('name')} 행{ri+1}",
-                }]
+              _push(str(row[nj]), ref.filename, f"{gname} 행{ri + 1}열{nj + 1}", "table_cell")
+          if ri + 1 < len(rows) and ci < len(rows[ri + 1]):
+            _push(
+              str(rows[ri + 1][ci]),
+              ref.filename,
+              f"{gname} 행{ri + 2}열{ci + 1}",
+              "table_cell",
+            )
 
-  # 2) 문단/표 텍스트: "공고번호: XXX" 패턴
-  pat = re.compile(
-    re.escape(lab) + r"\s*[:：]?\s*([^\s,;/|]{2,40})",
-  )
+  # 2) 헤더 열
+  for ref in refs:
+    for gname, rows in _iter_ref_table_grids(ref):
+      if len(rows) < 2:
+        continue
+      header = [str(c).strip() for c in rows[0]]
+      if len(header) <= 2 and _looks_like_field_label(header[0]):
+        continue
+      for ci, h in enumerate(header):
+        if not _label_matches(h, aliases):
+          continue
+        for ri in range(1, len(rows)):
+          if ci >= len(rows[ri]):
+            continue
+          _push(
+            str(rows[ri][ci]),
+            ref.filename,
+            f"{gname} 헤더'{h}' 행{ri + 1}",
+            "table_cell",
+          )
+
+  # 3) 문단
   for ref in refs:
     paras = list(getattr(ref.parsed, "paragraphs", None) or []) if ref.parsed else []
+    if not paras and ref.file_bytes:
+      try:
+        from ..hwpx_editor import HWPXEditor
+        paras = [p["text"] for p in HWPXEditor(ref.file_bytes).get_paragraphs()]
+      except Exception:
+        paras = []
     for i, p in enumerate(paras):
-      m = pat.search(p or "")
-      if m:
-        return m.group(1).strip(), [{
-          "document": ref.filename,
-          "source_type": "paragraph",
-          "location": f"문단 {i+1}",
-        }]
-  return "", []
+      text = (p or "").strip()
+      if not text:
+        continue
+      for alias in aliases:
+        pat = re.compile(re.escape(alias) + r"\s*[:：]\s*(.+)$", re.I)
+        m = pat.search(text)
+        if not m:
+          m = re.compile(r"^" + re.escape(alias) + r"\s+(.{2,200})$", re.I).search(text)
+        if not m:
+          continue
+        val = re.split(r"\s{2,}|\t", m.group(1).strip())[0].strip()
+        _push(val, ref.filename, f"문단 {i + 1}", "paragraph")
+
+  return out
+
+
+def lookup_fact_value(
+  refs: list[WorkspaceDocument],
+  *,
+  label: str = "",
+  concept_id: str = "",
+) -> tuple[str, list[dict]]:
+  """첫 수락 후보 선택. 거절 시 나머지 후보 계속 평가."""
+  from .value_type_validation import pick_accepted_candidate
+
+  raw = lookup_fact_candidates(refs, label=label, concept_id=concept_id)
+  val, srcs, _, _ = pick_accepted_candidate(raw, concept_id=concept_id, label=label)
+  return val, srcs
+
+
+def resolve_fact_field(
+  refs: list[WorkspaceDocument],
+  *,
+  label: str,
+  concept_id: str,
+) -> dict:
+  """Ranked candidates + accepted + proposal metadata for trace."""
+  from .value_type_validation import expected_value_type, pick_accepted_candidate
+
+  raw: list[dict] = []
+  if refs:
+    raw = lookup_fact_candidates(refs, label=label, concept_id=concept_id)
+    if concept_id == "person_name":
+      raw = raw + lookup_fact_candidates(refs, label=label, concept_id="pi_name")
+    elif concept_id == "pi_name":
+      raw = raw + lookup_fact_candidates(refs, label="연구책임자", concept_id="pi_name")
+      raw = raw + lookup_fact_candidates(refs, label=label, concept_id="person_name")
+
+  val, srcs, accepted, ranked = pick_accepted_candidate(
+    raw, concept_id=concept_id, label=label,
+  )
+  rejected = [c for c in ranked if not c.get("accepted")]
+  vtype = expected_value_type(concept_id, label)
+  proposal = None
+  if val:
+    proposal = {
+      "after": val,
+      "sources": srcs,
+      "fill_mode": "evidence",
+    }
+  return {
+    "expected_value_type": vtype,
+    "candidate_ranking": ranked,
+    "rejected_candidates": rejected,
+    "accepted_candidate": accepted or None,
+    "value": val,
+    "sources": srcs,
+    "final_proposal": proposal,
+  }
 
 
 def search_tables(

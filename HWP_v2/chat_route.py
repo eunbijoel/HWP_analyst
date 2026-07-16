@@ -17,6 +17,12 @@ from hwp_core.shared.intent_classify import (
 )
 from hwp_core.shared.replace_spec import extract_replace_spec
 
+try:
+    from hwp_core.workflows.registry import match_workflow as match_named_workflow
+except ImportError:  # pragma: no cover
+    def match_named_workflow(_message: str):
+        return None
+
 WRITE_VERB = re.compile(
     r"(?:수정|바꿔|변경|고쳐|다듬|리라이트|짧게|줄여|간결|"
     r"채우|채워|넣어|기입|삽입|추가|반영|삭제|지워|치환|작성)"
@@ -279,6 +285,10 @@ def decide_chat_route(
             action="ask_select",
             message="문서를 열어 주세요. HWP / HWPX를 여러 개 올릴 수 있습니다.",
         )
+
+    wf_id = match_named_workflow(t)
+    if wf_id:
+        return ChatRoute(action=f"workflow:{wf_id}")
 
     if classify_intent(t) == "fill" or (
         EDIT_FILL.search(t) and not re.search(r"요약\s*만", t)

@@ -7,11 +7,17 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
-from .document_inspector import TABLE_CONCEPTS, TEXT_CONCEPTS, get_fill_resolver
+from .document_inspector import FACT_CONCEPTS, TABLE_CONCEPTS, TEXT_CONCEPTS, get_fill_resolver
+from .fill_trace import (
+  STATUS_PROPOSED,
+  STATUS_SKIPPED_NO_EVIDENCE,
+  STATUS_SKIPPED_UNSAFE,
+  FieldFillTrace,
+)
 from .workspace_retriever import (
   excel_grids_for_insert,
   format_grid_preview,
-  lookup_label_value_in_refs,
+  resolve_fact_field,
   search_excel_rows,
   search_paragraphs,
   search_tables,
@@ -23,6 +29,123 @@ from ..llm_client import generate
 AI_DRAFT_MARKER = "AI Draft (Generated from current document context)"
 FILL_EVIDENCE = "evidence"
 FILL_CONTEXT = "context"
+
+_META_INSTRUCTION_RE = re.compile(
+  r"기입\s*(?:필요|하십시오|하세요)|작성\s*(?:필요|요망)|입력\s*(?:필요|요망)|"
+  r"정보\s*(?:없음|입력)|추후\s*기입|비어\s*있음|해당\s*없음|"
+  r"확인되지\s*않|자료에서\s*확인|담당자명\s*기입|회사명\]|"
+  r"법인등록번호\s*기입|또는\s*\(작성|또는\s*\(정보",
+  re.I,
+)
+_FACT_LABEL_RE = re.compile(
+  r"전화|휴대|메일|이메일|전자우편|주소|등록번호|사업자|법인|"
+  r"성명|이름|직위|직급|연락처|팩스|대표자|책임자|기관명|소재지",
+  re.I,
+)
+
+
+def _is_meta_instruction(text: str) -> bool:
+  t = (text or "").strip()
+  if not t:
+    return True
+  if _META_INSTRUCTION_RE.search(t):
+    return True
+  if t.startswith("[") and ("필요" in t or "기입" in t):
+    return True
+  if t.startswith("(") and any(k in t for k in ("필요", "기입", "요망", "없음", "비어")):
+    return True
+  return False
+
+
+def _is_fact_field(label: str, concept_id: str = "") -> bool:
+  """사실 칸 — Evidence only."""
+  if concept_id in TEXT_CONCEPTS:
+    return False
+  if concept_id in FACT_CONCEPTS or concept_id == "form_blank":
+    return True
+  if bool((label or "") and _FACT_LABEL_RE.search(label)):
+    return True
+  return False
+
+
+def _value_fits_fact_field(label: str, value: str, concept_id: str = "") -> bool:
+  """사실 칸 값이 concept expected type에 맞는지."""
+  from .value_type_validation import value_fits_type
+  return value_fits_type(concept_id, label, value)
+
+
+def _is_weak_draft(text: str, label: str = "") -> bool:
+  t = (text or "").strip()
+  lab = (label or "").strip()
+  if not t:
+    return True
+  if _is_meta_instruction(t):
+    return True
+  if t in ("□", "○", "-", "—"):
+    return True
+  if lab and (t == lab or (len(t) <= len(lab) + 2 and lab in t)):
+    return True
+  # narrative drafts need a bit of substance; short fact values handled separately
+  if len(t) < 8 and not _is_fact_field(lab):
+    return True
+  return False
+
+
+def _draft_from_sources(label: str, concept_id: str, hits: list[dict]) -> tuple[str, float]:
+  if not hits:
+    return "", 0.0
+  bodies = []
+  lab = ""
+  if concept_id and get_fill_resolver().concepts.get(concept_id):
+    lab = get_fill_resolver().concepts[concept_id].label_ko
+  lab = lab or label
+  for h in hits:
+    t = (h.get("text") or "").strip()
+    if not t or _is_weak_draft(t, lab):
+      continue
+    if lab and (t == lab or (len(t) < 30 and lab in t)):
+      continue
+    bodies.append(t)
+  if not bodies:
+    return "", 0.0
+  text = bodies[0]
+  parts = re.split(r"(?<=[.。!?？])\s+|\n+", text)
+  parts = [p.strip() for p in parts if p.strip() and not _is_weak_draft(p, lab)]
+  draft = " ".join(parts[:4]) if parts else text[:500]
+  if _is_weak_draft(draft, lab):
+    return "", 0.0
+  conf = min(0.95, 0.55 + 0.1 * len(hits) + float(hits[0].get("score") or 0) * 0.2)
+  return draft.strip(), conf
+
+
+def _llm_draft(
+  label: str,
+  concept_id: str,
+  hits: list[dict],
+  *,
+  model: str,
+  ollama_url: str,
+) -> tuple[str, float]:
+  evidence = "\n\n".join(
+    f"[{h.get('document')} {h.get('location')}]\n{h.get('text','')[:800]}"
+    for h in hits[:4]
+  )
+  if not evidence.strip():
+    return "", 0.0
+  prompt = (
+    f"항목 '{label}'({concept_id}) 초안을 한국어로 작성하세요.\n"
+    "반드시 아래 근거만 사용하고, 숫자·사실을 지어내지 마세요.\n"
+    "2~5문장. 근거에 없으면 아무 것도 출력하지 마세요 (빈 응답).\n"
+    "'기입 필요'·'작성 필요'·'정보 없음' 같은 안내문은 쓰지 마세요.\n\n"
+    f"근거:\n{evidence}\n\n초안:"
+  )
+  result = generate(prompt, model, ollama_url, temperature=0.2, num_predict=800, timeout=120)
+  if result.get("error"):
+    return _draft_from_sources(label, concept_id, hits)
+  text = (result.get("text") or "").strip()
+  if not text or _is_weak_draft(text, label):
+    return _draft_from_sources(label, concept_id, hits)
+  return text, 0.75
 
 
 @dataclass
@@ -81,74 +204,6 @@ def _proposal_from_excel_grid(
       "fill_mode": FILL_EVIDENCE,
     },
   )
-
-
-def _is_weak_draft(text: str, label: str = "") -> bool:
-  t = (text or "").strip()
-  lab = (label or "").strip()
-  if len(t) < 8:
-    return True
-  if t in ("□", "○", "-", "—", "해당 없음", "자료에서 확인되지 않음"):
-    return True
-  if lab and (t == lab or (len(t) <= len(lab) + 2 and lab in t)):
-    return True
-  return False
-
-
-def _draft_from_sources(label: str, concept_id: str, hits: list[dict]) -> tuple[str, float]:
-  if not hits:
-    return "", 0.0
-  bodies = []
-  lab = ""
-  if concept_id and get_fill_resolver().concepts.get(concept_id):
-    lab = get_fill_resolver().concepts[concept_id].label_ko
-  lab = lab or label
-  for h in hits:
-    t = (h.get("text") or "").strip()
-    if not t or _is_weak_draft(t, lab):
-      continue
-    if lab and (t == lab or (len(t) < 30 and lab in t)):
-      continue
-    bodies.append(t)
-  if not bodies:
-    return "", 0.0
-  text = bodies[0]
-  parts = re.split(r"(?<=[.。!?？])\s+|\n+", text)
-  parts = [p.strip() for p in parts if p.strip() and not _is_weak_draft(p, lab)]
-  draft = " ".join(parts[:4]) if parts else text[:500]
-  if _is_weak_draft(draft, lab):
-    return "", 0.0
-  conf = min(0.95, 0.55 + 0.1 * len(hits) + float(hits[0].get("score") or 0) * 0.2)
-  return draft.strip(), conf
-
-
-def _llm_draft(
-  label: str,
-  concept_id: str,
-  hits: list[dict],
-  *,
-  model: str,
-  ollama_url: str,
-) -> tuple[str, float]:
-  evidence = "\n\n".join(
-    f"[{h.get('document')} {h.get('location')}]\n{h.get('text','')[:800]}"
-    for h in hits[:4]
-  )
-  if not evidence.strip():
-    return "", 0.0
-  prompt = (
-    f"항목 '{label}'({concept_id}) 초안을 한국어로 작성하세요.\n"
-    "반드시 아래 근거만 사용하고, 숫자·사실을 지어내지 마세요.\n"
-    "2~5문장. 근거에 없으면 짧게 '자료에서 확인되지 않음'만 쓰세요.\n\n"
-    f"근거:\n{evidence}\n\n초안:"
-  )
-  result = generate(prompt, model, ollama_url, temperature=0.2, num_predict=800, timeout=120)
-  if result.get("error"):
-    return _draft_from_sources(label, concept_id, hits)
-  text = (result.get("text") or "").strip()
-  if not text:
-    return _draft_from_sources(label, concept_id, hits)
-  return text, 0.75
 
 
 def _target_paragraphs(target: Optional[WorkspaceDocument]) -> list[str]:
@@ -255,7 +310,8 @@ def _llm_context_draft(
   prompt = (
     f"현재 문서만 보고 빈 항목 '{label}'({concept_id or 'general'}) 초안을 한국어로 작성하세요.\n"
     f"{length}. 참고 파일이 없으므로 문서 맥락·라벨·주변 문단에서 추론하세요.\n"
-    "없는 숫자·고유명사는 지어내지 말고, 추론이면 일반적인 표현을 쓰세요.\n"
+    "없는 숫자·고유명사·연락처는 지어내지 마세요. 근거가 부족하면 빈 응답만 하세요.\n"
+    "'기입 필요'·'작성 필요'·'정보 없음'·안내문·홍보 문구는 금지입니다.\n"
     "초안 본문만 출력하세요 (표시 문구·따옴표 금지).\n\n"
     f"문서 맥락:\n{blob[:3500]}\n\n초안:"
   )
@@ -263,30 +319,74 @@ def _llm_context_draft(
   if result.get("error"):
     return "", 0.0
   text = (result.get("text") or "").strip()
-  if not text or "확인되지 않" in text:
+  if not text or _is_weak_draft(text, label) or _is_meta_instruction(text):
     return "", 0.0
   return text, 0.45
 
 
+_CONCEPT_KEYS = {
+  "rd_objective": ("목표", "목적"),
+  "expected_effect": ("효과", "성과", "파급"),
+  "rd_necessity": ("필요", "배경", "추진"),
+  "rd_content": ("연구내용", "개발내용", "내용"),
+  "rd_strategy": ("전략",),
+  "utilization": ("활용",),
+}
+
+
+def _text_matches_concept(text: str, concept_id: str) -> bool:
+  keys = _CONCEPT_KEYS.get(concept_id or "", ())
+  if not keys:
+    return True
+  return any(k in (text or "") for k in keys)
+
+
+def _text_matches_other_narrative(text: str, concept_id: str) -> bool:
+  """다른 글 섹션 키워드가 더 분명하면 True (교차 오염 방지)."""
+  t = text or ""
+  own = _CONCEPT_KEYS.get(concept_id or "", ())
+  for other, keys in _CONCEPT_KEYS.items():
+    if other == concept_id:
+      continue
+    if any(k in t for k in keys) and not any(k in t for k in own):
+      return True
+  return False
+
+
 def _context_draft_heuristic(label: str, concept_id: str, ctx: dict, hits: list[dict]) -> tuple[str, float]:
+  # 1) concept에 맞는 검색 hit 우선
   draft, conf = _draft_from_sources(label, concept_id, hits)
-  if draft and not _is_weak_draft(draft, label):
+  if draft and not _is_weak_draft(draft, label) and not _text_matches_other_narrative(draft, concept_id):
     return draft, min(conf, 0.5)
-  bits = []
+
+  bits: list[str] = []
+  for h in hits:
+    t = (h.get("text") or "").strip()
+    if not t or _is_weak_draft(t, label):
+      continue
+    if _text_matches_other_narrative(t, concept_id):
+      continue
+    if concept_id and not _text_matches_concept(t, concept_id):
+      continue
+    bits.append(t)
+
+  # 2) 주변 문단은 concept 키워드가 맞을 때만
   title = (ctx.get("title") or "").strip()
   section = (ctx.get("section_title") or label or "").strip()
   for line in ctx.get("surrounding") or []:
     body = re.sub(r"^\[문단 \d+\]\s*", "", line).strip()
-    if body and not _is_weak_draft(body, label) and body not in (title, section):
-      bits.append(body)
-  for h in hits:
-    t = (h.get("text") or "").strip()
-    if t and not _is_weak_draft(t, label):
-      bits.append(t)
+    if not body or body in (title, section) or _is_weak_draft(body, label):
+      continue
+    if _text_matches_other_narrative(body, concept_id):
+      continue
+    if concept_id and not _text_matches_concept(body, concept_id):
+      continue
+    bits.append(body)
+
   if not bits:
     return "", 0.0
   joined = " ".join(bits[0].split()[:60])
-  if _is_weak_draft(joined, label):
+  if _is_weak_draft(joined, label) or _text_matches_other_narrative(joined, concept_id):
     return "", 0.0
   return joined, 0.35
 
@@ -307,17 +407,17 @@ def _make_context_sources(ctx: dict, hits: list[dict]) -> list[dict]:
 
 
 def _prefer_concept_hits(hits: list[dict], concept_id: str) -> list[dict]:
-  keys = {
-    "rd_objective": ("목표", "목적"),
-    "expected_effect": ("효과", "성과", "파급"),
-    "rd_necessity": ("필요", "배경", "추진"),
-  }.get(concept_id or "", ())
-  if not keys:
+  if not concept_id:
     return hits
   preferred, rest = [], []
   for h in hits:
     t = h.get("text") or ""
-    (preferred if any(k in t for k in keys) else rest).append(h)
+    if _text_matches_other_narrative(t, concept_id):
+      continue
+    if _text_matches_concept(t, concept_id):
+      preferred.append(h)
+    else:
+      rest.append(h)
   return preferred + rest
 
 
@@ -332,21 +432,24 @@ def _context_fill_text(
 ) -> tuple[str, float, list[dict]]:
   cid = field.get("concept_id") or ""
   label = field.get("label") or field.get("context") or ""
+  # 사실 칸(전화·주소·성명 등)은 Context로 지어내지 않음
+  if _is_fact_field(label, cid) or short:
+    return "", 0.0, []
   ctx = gather_target_context(workspace, field)
   hits = _prefer_concept_hits(_context_hits_from_target(workspace, field, cid), cid)
   after, conf = "", 0.0
   if use_llm:
     after, conf = _llm_context_draft(
-      label, cid, ctx, hits, model=model, ollama_url=ollama_url, short=short,
+      label, cid, ctx, hits, model=model, ollama_url=ollama_url, short=False,
     )
+    if after and _text_matches_other_narrative(after, cid):
+      after, conf = "", 0.0
   if not after or _is_weak_draft(after, label):
     after, conf = _context_draft_heuristic(label, cid, ctx, hits)
   if not after or _is_weak_draft(after, label):
     return "", 0.0, []
-  if short:
-    after = after.split("\n")[0].strip()[:80]
-    if _is_weak_draft(after, label):
-      return "", 0.0, []
+  if _text_matches_other_narrative(after, cid):
+    return "", 0.0, []
   return after, conf, _make_context_sources(ctx, hits)
 
 
@@ -359,10 +462,14 @@ def build_proposals(
   model: str = "gemma4",
   ollama_url: str = "http://localhost:11434",
   command: str = "",
-) -> list[EditProposal]:
+) -> tuple[list[EditProposal], list[dict], list[FieldFillTrace]]:
   by_id = {f["field_id"]: f for f in fields}
   proposals: list[EditProposal] = []
+  skipped_facts: list[dict] = []
+  fill_traces: list[FieldFillTrace] = []
   refs = workspace.list_references()
+  target_doc = workspace.get_target()
+  target_name = target_doc.filename if target_doc else ""
   excel_table_added = False
   form_labels_tried: set[str] = set()
 
@@ -425,6 +532,8 @@ def build_proposals(
 
       if not after:
         continue
+      if _is_weak_draft(after, f.get("label") or ""):
+        continue
 
       loc = f.get("context") or f.get("label") or ""
       if fill_mode == FILL_CONTEXT:
@@ -450,81 +559,119 @@ def build_proposals(
       ))
 
     elif action == "fill_table":
-      # 서식 빈칸: Evidence (참고 라벨 매칭) → Context Fill
-      if cid == "form_blank" or (f.get("style") or {}).get("form"):
-        lab = (f.get("label") or "").strip()
-        if not lab or lab in form_labels_tried:
-          continue
-        form_labels_tried.add(lab)
-        val, srcs = lookup_label_value_in_refs(refs, lab) if refs else ("", [])
-        fill_mode = FILL_EVIDENCE
-        conf_use = 0.85
-        if not val:
-          target = workspace.get_target()
-          if target:
-            val, srcs = lookup_label_value_in_refs([target], lab)
-        if not val:
-          after, conf, srcs = _context_fill_text(
-            f, workspace, use_llm=use_llm, model=model, ollama_url=ollama_url, short=True,
-          )
-          if not after:
-            continue
-          val = after
-          fill_mode = FILL_CONTEXT
-          conf_use = conf
+      is_form = (
+        cid == "form_blank"
+        or bool((f.get("style") or {}).get("form"))
+        or bool((f.get("style") or {}).get("factual"))
+        or (cid in FACT_CONCEPTS - TABLE_CONCEPTS)
+      )
 
-        loc = f.get("context") or lab
-        if fill_mode == FILL_CONTEXT:
-          loc = f"{AI_DRAFT_MARKER} · {loc}"
+      # 서식 사실 칸: Evidence only (동의어·전 참고문서 검색)
+      if is_form:
+        lab = (f.get("label") or "").strip()
+        try_key = f"{cid}:{lab}"
+        if not lab or try_key in form_labels_tried:
+          continue
+        form_labels_tried.add(try_key)
+        gr = get_fill_resolver().ground(lab, f.get("context") or "")
+        loc = {
+          "field_type": f.get("field_type") or "table_cell",
+          "table_id": f.get("table_id"),
+          "row": f.get("row"),
+          "column": f.get("column"),
+          "paragraph_id": f.get("paragraph_id"),
+          "context": f.get("context") or "",
+        }
+        resolved = resolve_fact_field(refs, label=lab, concept_id=cid) if refs else {
+          "expected_value_type": "",
+          "candidate_ranking": [],
+          "rejected_candidates": [],
+          "accepted_candidate": None,
+          "value": "",
+          "sources": [],
+          "final_proposal": None,
+        }
+        val = resolved.get("value") or ""
+        srcs = resolved.get("sources") or []
+        ranked = resolved.get("candidate_ranking") or []
+        rejected = resolved.get("rejected_candidates") or []
+        accepted = resolved.get("accepted_candidate")
+        vtype = resolved.get("expected_value_type") or ""
+
+        if not val:
+          if ranked:
+            status = STATUS_SKIPPED_UNSAFE
+            reason = "모든 후보가 타입 검증에서 거절됨"
+          else:
+            status = STATUS_SKIPPED_NO_EVIDENCE
+            reason = "참고 자료에서 근거를 찾지 못해 비워 둠"
+        else:
+          status = STATUS_PROPOSED
+          reason = ""
+
+        fill_traces.append(FieldFillTrace(
+          target_document=target_name,
+          location=loc,
+          raw_label=lab,
+          concept_id=cid,
+          grounding_confidence=float(
+            f.get("concept_confidence")
+            or (gr.confidence if gr.grounded else 0.0)
+          ),
+          grounding_method=str(
+            f.get("grounding_method")
+            or (gr.method if gr.grounded else "none")
+          ),
+          expected_value_type=vtype,
+          candidate_ranking=ranked,
+          rejected_candidates=rejected,
+          accepted_candidate=accepted,
+          final_proposal=resolved.get("final_proposal"),
+          candidates=ranked,
+          selected_value=str(val).strip() if val else None,
+          final_status=status,
+          notes=[reason] if reason else [],
+        ))
+
+        if status != STATUS_PROPOSED:
+          skipped_facts.append({
+            "label": lab or cid,
+            "concept_id": cid,
+            "reason": reason,
+          })
+          continue
         proposals.append(EditProposal(
           proposal_id=f"p_{uuid.uuid4().hex[:8]}",
           field_id=fid,
           action="write_table_cell",
           before=f.get("current_value") or "",
-          after=str(val),
+          after=str(val).strip(),
           sources=srcs[:4],
-          confidence=conf_use,
-          location=loc,
+          confidence=0.9,
+          location=f.get("context") or lab,
           label=lab,
           concept_id=cid,
           meta={
             "table_id": f.get("table_id"),
             "row": f.get("row"),
             "column": f.get("column"),
-            "fill_mode": fill_mode,
+            "fill_mode": FILL_EVIDENCE,
+            "expected_value_type": vtype,
+            "accepted_rank": (accepted or {}).get("rank"),
           },
         ))
         continue
 
+      # 인건비형 표: 엑셀 행 매핑. 근거 없으면 비움.
       key = (int(f.get("table_id") or 0), int(f.get("row") or 0))
       pi = row_person.get(key, 0)
       if pi >= len(people):
-        # No staff evidence — try same-document label lookup for this concept
         lab = (f.get("label") or "").strip()
-        target = workspace.get_target()
-        val, srcs = ("", [])
-        if target and lab:
-          val, srcs = lookup_label_value_in_refs([target], lab)
-        if not val:
-          continue
-        proposals.append(EditProposal(
-          proposal_id=f"p_{uuid.uuid4().hex[:8]}",
-          field_id=fid,
-          action="write_table_cell",
-          before=f.get("current_value") or "",
-          after=str(val),
-          sources=srcs[:4] or _make_context_sources(gather_target_context(workspace, f), []),
-          confidence=0.4,
-          location=f"{AI_DRAFT_MARKER} · {f.get('context') or lab}",
-          label=lab,
-          concept_id=cid,
-          meta={
-            "table_id": f.get("table_id"),
-            "row": f.get("row"),
-            "column": f.get("column"),
-            "fill_mode": FILL_CONTEXT,
-          },
-        ))
+        skipped_facts.append({
+          "label": lab or cid,
+          "concept_id": cid,
+          "reason": "인력/엑셀 근거가 없어 비워 둠",
+        })
         continue
       person = people[pi]
       val = (person["values"] or {}).get(cid, "")
@@ -589,4 +736,4 @@ def build_proposals(
       )
     proposals.append(prop)
 
-  return proposals
+  return proposals, skipped_facts, fill_traces

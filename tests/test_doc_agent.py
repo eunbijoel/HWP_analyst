@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -250,3 +251,225 @@ def test_evidence_fill_preferred_when_refs_available():
     s.get("document") == "company.hwpx"
     for p in proposals for s in (p.get("sources") or [])
   )
+
+
+def test_form_blank_rejects_meta_and_does_not_invent():
+  """주소·전화 등 서식 칸은 근거 없이 '기입 필요' 초안을 만들지 않음."""
+  from hwp_core.doc_agent.document_inspector import get_fill_resolver
+  from hwp_core.doc_agent.edit_proposal_service import (
+    _is_meta_instruction,
+    _value_fits_fact_field,
+  )
+  from hwp_core.doc_agent.fixtures import make_minimal_hwpx
+
+  get_fill_resolver.cache_clear()
+  assert _is_meta_instruction("(필요한 주소 정보를 기입하십시오)")
+  assert _is_meta_instruction("[회사명] 대표이사 담당자명 기입 필요")
+  assert _is_meta_instruction("추후 기입 예정 (정보 없음)")
+  assert not _value_fits_fact_field(
+    "휴대전화",
+    "사용자 경험을 개선하고 혁신적인 기능을 제공합니다.",
+    "mobile",
+  )
+  assert not _value_fits_fact_field("성명", "개발 제품명 또는 기술명", "person_name")
+  assert _value_fits_fact_field("전자우편", "a@b.com", "email")
+  assert _value_fits_fact_field("직장전화", "02-1234-5678", "phone")
+
+  form = make_minimal_hwpx(
+    paragraphs=["신청서"],
+    tables=[[
+      ["기관명", "한국생산기술연구원", "주소", ""],
+      ["대표자명", "", "사업자등록번호", ""],
+      ["대표자 연락처", "", "대표자 전자우편", ""],
+    ]],
+  )
+  pipe = DocFillPipeline()
+  pipe.register_target("form.hwpx", form)
+  pipe.run_inspect()
+  out = pipe.run_propose("빈칸 채워줘", use_llm=False)
+  proposals = (out["data"] or {}).get("proposals") or []
+  form_props = [
+    p for p in proposals
+    if p.get("action") == "write_table_cell"
+  ]
+  # 근거 없는 빈 칸은 제안하지 않음 (기관명은 이미 채워져 있음)
+  assert not form_props, f"should not invent form values: {form_props}"
+  skipped = (out["data"] or {}).get("skipped_facts") or []
+  assert skipped, "should explain skipped factual blanks"
+
+
+def test_org_form_evidence_fill_from_reference():
+  """기관명·대표자·주소·전화·이메일을 참고에서 Evidence로 복사."""
+  from hwp_core.doc_agent.document_inspector import get_fill_resolver
+  from hwp_core.doc_agent.edit_proposal_service import FILL_EVIDENCE
+  from hwp_core.doc_agent.fixtures import make_org_form_target_hwpx, make_org_ref_hwpx
+
+  get_fill_resolver.cache_clear()
+  pipe = DocFillPipeline()
+  pipe.register_target("form.hwpx", make_org_form_target_hwpx())
+  pipe.register_reference("org.hwpx", make_org_ref_hwpx())
+  assert pipe.run_inspect()["ok"]
+  out = pipe.run_propose("빈칸을 참고 자료로 채워줘", use_llm=False)
+  assert out["ok"]
+  proposals = (out["data"] or {}).get("proposals") or []
+  by_label = {p.get("label"): p for p in proposals if p.get("action") == "write_table_cell"}
+  assert "기관명" in by_label
+  assert "한국생산기술연구원" in by_label["기관명"]["after"]
+  assert "대표자명" in by_label
+  assert "이상목" in by_label["대표자명"]["after"]
+  assert "주소" in by_label
+  assert "천안" in by_label["주소"]["after"]
+  assert "대표전화" in by_label or "전화번호" in str(by_label)
+  phone_p = by_label.get("대표전화") or next(
+    (p for p in proposals if "전화" in (p.get("label") or "")), None,
+  )
+  assert phone_p and re.search(r"\d{2,3}", phone_p["after"])
+  mail_p = by_label.get("전자우편") or next(
+    (p for p in proposals if "우편" in (p.get("label") or "") or "메일" in (p.get("label") or "")),
+    None,
+  )
+  assert mail_p and "@" in mail_p["after"]
+  assert all((p.get("meta") or {}).get("fill_mode") == FILL_EVIDENCE for p in by_label.values())
+  assert any(
+    s.get("document") == "org.hwpx"
+    for p in by_label.values() for s in (p.get("sources") or [])
+  )
+
+
+def test_org_form_no_evidence_leaves_empty():
+  from hwp_core.doc_agent.document_inspector import get_fill_resolver
+  from hwp_core.doc_agent.fixtures import make_org_form_target_hwpx
+
+  get_fill_resolver.cache_clear()
+  pipe = DocFillPipeline()
+  pipe.register_target("form.hwpx", make_org_form_target_hwpx())
+  pipe.run_inspect()
+  out = pipe.run_propose("빈칸 채워줘", use_llm=False)
+  proposals = (out["data"] or {}).get("proposals") or []
+  assert not any(p.get("action") == "write_table_cell" for p in proposals)
+  assert (out["data"] or {}).get("skipped_facts")
+
+
+def test_context_fill_keeps_section_alignment():
+  """목표/기대효과 Context Fill이 서로 뒤바뀌면 안 됨."""
+  from hwp_core.doc_agent.document_inspector import get_fill_resolver
+  from hwp_core.doc_agent.edit_proposal_service import FILL_CONTEXT
+  from hwp_core.doc_agent.fixtures import make_minimal_hwpx
+
+  get_fill_resolver.cache_clear()
+  target = make_minimal_hwpx([
+    "연구개발계획서",
+    "연구개발 목표는 문서 숫자 오류를 자동 탐지하는 시스템을 구축하는 것이다.",
+    "연구개발 목표",
+    "□",
+    "기대효과는 검토 시간을 단축한다.",
+    "기대효과",
+    "□",
+  ])
+  pipe = DocFillPipeline()
+  pipe.register_target("plan.hwpx", target)
+  pipe.run_inspect()
+  out = pipe.run_propose("빈칸 채워줘", use_llm=False)
+  props = (out["data"] or {}).get("proposals") or []
+  by_c = {p.get("concept_id"): p for p in props}
+  assert "rd_objective" in by_c
+  assert "expected_effect" in by_c
+  assert "목표" in by_c["rd_objective"]["after"] or "탐지" in by_c["rd_objective"]["after"]
+  assert "효과" in by_c["expected_effect"]["after"] or "단축" in by_c["expected_effect"]["after"]
+  assert "단축" not in by_c["rd_objective"]["after"]
+  assert "탐지" not in by_c["expected_effect"]["after"]
+  assert (by_c["rd_objective"].get("meta") or {}).get("fill_mode") == FILL_CONTEXT
+
+
+def test_synonym_grounding_for_form_labels():
+  from hwp_core.doc_agent.document_inspector import get_fill_resolver
+
+  get_fill_resolver.cache_clear()
+  r = get_fill_resolver()
+  assert r.ground("대표 성명").concept_id == "representative"
+  assert r.ground("E-mail").concept_id == "email"
+  assert r.ground("주관기관").concept_id == "org_name"
+  assert r.ground("TEL").concept_id == "phone"
+  assert r.ground("연구책임자").concept_id == "pi_name"
+
+
+def test_reject_field_labels_as_fact_values():
+  """다른 칸 라벨·안내문을 값으로 쓰지 않음."""
+  from hwp_core.doc_agent.workspace_retriever import _value_ok_for_concept
+
+  assert not _value_ok_for_concept("pi_name", "성명", "설립 연월일")
+  assert not _value_ok_for_concept("person_name", "성명", "설립 연월일")
+  assert not _value_ok_for_concept(
+    "pi_name", "책임자", "기관 유형 (대학, 정부 출연연, 중소기업 등)",
+  )
+  assert not _value_ok_for_concept(
+    "form_blank", "기관 유형", "기관 유형 (대학, 정부 출연연, 중소기업 등)",
+  )
+  assert _value_ok_for_concept("pi_name", "성명", "홍길동")
+  assert _value_ok_for_concept("org_name", "기관명", "한국생산기술연구원")
+
+
+def test_form_blanks_use_column_header_not_org_name():
+  """기관명|책임자 표에서 빈 책임자 칸 라벨은 '책임자'여야 함 (기관명 아님)."""
+  from hwp_core.doc_agent.document_inspector import find_form_label_blanks
+  from hwp_core.doc_agent.fixtures import make_minimal_hwpx
+  from hwp_core.hwpx_editor import HWPXEditor
+
+  doc = make_minimal_hwpx(
+    paragraphs=["참여연구개발기관"],
+    tables=[[
+      ["연구개발기관", "기관명", "책임자", "직위"],
+      ["주관연구개발기관", "한국생산기술연구원", "", ""],
+      ["공동연구개발기관", "한국전자기술연구원", "", ""],
+    ]],
+  )
+  fields = find_form_label_blanks(HWPXEditor(doc))
+  labels = {f.label for f in fields}
+  assert "책임자" in labels
+  assert "직위" in labels
+  assert "한국생산기술연구원" not in labels
+  assert "한국전자기술연구원" not in labels
+
+
+def test_template_ref_does_not_copy_neighbor_labels():
+  """참고가 빈 서식 템플릿일 때 옆 칸 라벨을 값으로 복사하지 않음."""
+  from hwp_core.doc_agent.document_inspector import get_fill_resolver
+  from hwp_core.doc_agent.fixtures import make_minimal_hwpx
+
+  get_fill_resolver.cache_clear()
+  target = make_minimal_hwpx(
+    paragraphs=["신청서"],
+    tables=[
+      [
+        ["연구책임자", "성명", "", "직위", ""],
+        ["", "직장전화", "", "휴대전화", ""],
+        ["", "전자우편", "", "국가연구자번호", ""],
+        ["설립 연월일", "", "기관 유형 (대학, 정부 출연연, 중소기업 등)", ""],
+      ],
+      [
+        ["연구개발기관", "기관명", "책임자", "직위"],
+        ["주관연구개발기관", "한국생산기술연구원", "", ""],
+        ["공동연구개발기관", "경기산업", "", ""],
+      ],
+    ],
+  )
+  # 같은 빈 템플릿을 참고로 넣어도 라벨이 값으로 들어가면 안 됨
+  ref = target
+  pipe = DocFillPipeline()
+  pipe.register_target("form.hwpx", target)
+  pipe.register_reference("template.hwpx", ref)
+  pipe.run_inspect()
+  out = pipe.run_propose("빈칸 채워줘", use_llm=False)
+  props = [
+    p for p in ((out["data"] or {}).get("proposals") or [])
+    if p.get("action") == "write_table_cell"
+  ]
+  bad = [
+    p for p in props
+    if any(
+      x in (p.get("after") or "")
+      for x in ("설립 연월일", "기관 유형", "성명", "직위", "책임자")
+    )
+  ]
+  assert not bad, f"labels used as values: {bad}"
+

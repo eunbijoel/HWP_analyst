@@ -47,6 +47,8 @@ class ToolRegistry:
   last_fields: list[dict] = field(default_factory=list)
   last_plan: dict = field(default_factory=dict)
   last_proposals: list[dict] = field(default_factory=list)
+  last_skipped_facts: list[dict] = field(default_factory=list)
+  last_fill_trace: list[dict] = field(default_factory=list)
   last_edited_bytes: bytes | None = None
   last_verify: list[dict] = field(default_factory=list)
   job_id: str = ""
@@ -146,7 +148,7 @@ class ToolRegistry:
     if not plan_res.get("ok"):
       return ToolResult(False, "generate_paragraph_draft", error=plan_res.get("error") or "plan fail")
     self.last_plan = plan_res["plan"]
-    proposals = prop_svc.build_proposals(
+    proposals, skipped_facts, fill_traces = prop_svc.build_proposals(
       self.last_plan,
       self.last_fields,
       self.workspace,
@@ -156,9 +158,13 @@ class ToolRegistry:
       command=command or "",
     )
     self.last_proposals = [p.to_dict() for p in proposals]
+    self.last_skipped_facts = skipped_facts
+    self.last_fill_trace = [t.to_dict() for t in fill_traces]
     return ToolResult(True, "generate_paragraph_draft", data={
       "plan": self.last_plan,
       "proposals": self.last_proposals,
+      "skipped_facts": skipped_facts,
+      "fill_trace": self.last_fill_trace,
       "plan_note": plan_res.get("error") or "",
     })
 

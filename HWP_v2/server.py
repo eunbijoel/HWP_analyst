@@ -253,6 +253,14 @@ def health():
     return jsonify({"ok": True, "product": "HWP_v2"})
 
 
+@app.get("/api/workflows")
+def list_document_workflows():
+    from hwp_core.workflows.registry import list_workflows
+
+    implemented_only = request.args.get("implemented", "").lower() in ("1", "true", "yes")
+    return jsonify({"workflows": list_workflows(implemented_only=implemented_only)})
+
+
 @app.get("/api/ollama")
 def ollama_status():
     url = request.args.get("url") or DEFAULT_OLLAMA
@@ -384,67 +392,18 @@ def remove_doc():
     return jsonify(_state(sess))
 
 
-def _run_workspace_fill(sess: Session, command: str) -> str:
-    """활성 HWP(X) = target, 나머지 = 참고.
-
-    Evidence Fill → Context Fill. 제안만 pending에 올리고 자동 적용하지 않음.
-    """
+def _push_fill_proposals(
+    sess: Session,
+    target: "DocSlot",
+    refs: list,
+    proposals: list[dict],
+    skipped_facts: list[dict],
+    *,
+    header: str,
+) -> str:
+    """Push DocFill proposals to editor pending; return user message."""
     from hwp_core.doc_agent.edit_proposal_service import AI_DRAFT_MARKER, FILL_CONTEXT, FILL_EVIDENCE
 
-    slots = list(sess.docs.values())
-    targets = [s for s in slots if s.kind in ("hwp", "hwpx") and s.bytes_data]
-    if not targets:
-        return "채울 HWP/HWPX가 없습니다. 문서를 하나 더 열어 주세요."
-    active = _active(sess)
-    target = active if active and active.kind in ("hwp", "hwpx") else targets[0]
-    refs = [s for s in slots if s.id != target.id]
-
-    if target.editor is None and not target.read_only:
-        # ensure editable slot has editor
-        try:
-            from hwp_core.hwpx_editor import HWPXEditor
-            target.editor = HWPXEditor(target.bytes_data)
-        except Exception:
-            pass
-    if target.editor is None:
-        return (
-            "편집 가능한 HWPX가 필요합니다. "
-            "HWP만 있으면 변환된 HWPX를 활성으로 선택하세요."
-        )
-
-    pipe = DocFillPipeline()
-    sess.fill_pipeline = pipe
-    r = pipe.register_target(target.filename, target.bytes_data)
-    err = r.get("error") or ""
-    if err and ("HWPX" in err or "변환" in err or "불가" in err):
-        return err
-    for ref in refs:
-        pipe.register_reference(ref.filename, ref.bytes_data)
-
-    insp = pipe.run_inspect()
-    if not insp.get("ok"):
-        data = insp.get("data") or {}
-        return insp.get("error") or data.get("error") or "문서를 읽지 못했습니다."
-
-    out = pipe.run_propose(
-        command, use_llm=True, model=sess.model, ollama_url=sess.ollama_url,
-    )
-    if not out.get("ok"):
-        return out.get("error") or "초안을 만들지 못했습니다."
-
-    proposals = (out.get("data") or {}).get("proposals") or []
-    if not proposals:
-        ref_note = (
-            f"참고({', '.join(r.filename for r in refs)})와 "
-            if refs else ""
-        )
-        return (
-            f"「{target.filename}」에서 {ref_note}Evidence Fill과 Context Fill을 "
-            "모두 시도했지만 반영할 초안을 만들지 못했습니다. "
-            "빈칸·섹션 라벨을 확인하거나 참고 문서를 추가해 주세요."
-        )
-
-    # Sync active editor = target (propose/accept workflow)
     sess.active_id = target.id
     _sync_active(sess)
     editor = sess.editor
@@ -484,7 +443,6 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
             elif action == "insert_after":
                 anchor = (meta.get("anchor_label") or "").strip()
                 if not anchor:
-                    # location may include AI Draft prefix — strip for locate
                     raw_loc = (p.get("location") or "").replace(AI_DRAFT_MARKER, "").strip(" ·")
                     anchor = raw_loc
                 if anchor:
@@ -497,7 +455,6 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
                 if ch and fill_mode == FILL_CONTEXT and AI_DRAFT_MARKER not in (ch.location or ""):
                     ch.location = f"{AI_DRAFT_MARKER} · {ch.location}"
             elif action == "insert_table":
-                # Pending insert as text after first paragraph (review before apply)
                 paras = editor.get_paragraphs()
                 anchor = paras[0]["text"] if paras else ""
                 body = f"[표 삽입 제안]\n{after}"
@@ -506,7 +463,6 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
                 else:
                     continue
             else:
-                # replace_paragraph
                 pid = meta.get("paragraph_id")
                 if pid is None:
                     continue
@@ -536,16 +492,160 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
         )
 
     editor._bump_preview()
-    head = (
+    head = header or (
         f"채우기 제안 {pushed}건을 올렸습니다 "
-        f"(Evidence {n_ev} · Context/AI Draft {n_ctx}).\n"
-        "자동 반영하지 않았습니다. 항목별 수락/거절 또는 「전체 수락」「전체 거절」을 사용하세요."
+        f"(Evidence {n_ev} · Context/AI Draft {n_ctx})."
+    )
+    head += (
+        "\n자동 반영하지 않았습니다. 항목별 수락/거절 또는 「전체 수락」「전체 거절」을 사용하세요."
     )
     if refs:
         head += f"\n참고 문서: {', '.join(r.filename for r in refs)}"
-    else:
-        head += "\n참고 문서 없음 → Context Fill만 사용했습니다."
-    return head + "\n\n" + "\n".join(lines[:12])
+    body = head + "\n\n" + "\n".join(lines[:12])
+    if skipped_facts:
+        body += "\n\n근거 없어 비운 사실 칸:"
+        for s in skipped_facts[:10]:
+            body += f"\n· {s.get('label') or s.get('concept_id')}: {s.get('reason')}"
+    return body
+
+
+def _setup_fill_pipeline(sess: Session):
+    """Return (target, refs, pipe) or raise via error string in tuple."""
+    slots = list(sess.docs.values())
+    targets = [s for s in slots if s.kind in ("hwp", "hwpx") and s.bytes_data]
+    if not targets:
+        return None, None, None, "채울 HWP/HWPX가 없습니다. 문서를 하나 더 열어 주세요."
+    active = _active(sess)
+    target = active if active and active.kind in ("hwp", "hwpx") else targets[0]
+    refs = [s for s in slots if s.id != target.id]
+
+    if target.editor is None and not target.read_only:
+        try:
+            from hwp_core.hwpx_editor import HWPXEditor
+            target.editor = HWPXEditor(target.bytes_data)
+        except Exception:
+            pass
+    if target.editor is None:
+        return None, None, None, (
+            "편집 가능한 HWPX가 필요합니다. "
+            "HWP만 있으면 변환된 HWPX를 활성으로 선택하세요."
+        )
+
+    pipe = DocFillPipeline()
+    sess.fill_pipeline = pipe
+    r = pipe.register_target(target.filename, target.bytes_data)
+    err = r.get("error") or ""
+    if err and ("HWPX" in err or "변환" in err or "불가" in err):
+        return None, None, None, err
+    for ref in refs:
+        pipe.register_reference(ref.filename, ref.bytes_data)
+    return target, refs, pipe, ""
+
+
+def _run_named_workflow(sess: Session, workflow_id: str, command: str) -> str:
+    from hwp_core.workflows.registry import run_workflow
+
+    target, refs, pipe, err = _setup_fill_pipeline(sess)
+    if err:
+        return err
+    assert target and pipe
+
+    result = run_workflow(
+        workflow_id,
+        pipe,
+        command=command,
+        use_llm=False,
+        model=sess.model,
+        ollama_url=sess.ollama_url,
+    )
+    if not result.ok and not result.proposals:
+        return result.message
+
+    proposals = result.proposals
+    skipped = result.skipped
+    if not proposals:
+        if skipped:
+            lines = [result.message, "", "비운 항목:"]
+            for s in skipped[:15]:
+                lines.append(f"· {s.get('label') or s.get('concept_id')}: {s.get('reason')}")
+            return "\n".join(lines)
+        return result.message
+
+    wf_name = (result.meta.get("spec") or {}).get("name_ko") or workflow_id
+    header = f"【{wf_name}】 {result.message}"
+    return _push_fill_proposals(sess, target, refs, proposals, skipped, header=header)
+
+
+def _run_workspace_fill(sess: Session, command: str) -> str:
+    """활성 HWP(X) = target, 나머지 = 참고.
+
+    Evidence Fill → Context Fill. 제안만 pending에 올리고 자동 적용하지 않음.
+    """
+    from hwp_core.doc_agent.edit_proposal_service import FILL_CONTEXT, FILL_EVIDENCE
+
+    target, refs, pipe, err = _setup_fill_pipeline(sess)
+    if err:
+        return err
+    assert target and pipe
+
+    insp = pipe.run_inspect()
+    if not insp.get("ok"):
+        data = insp.get("data") or {}
+        return insp.get("error") or data.get("error") or "문서를 읽지 못했습니다."
+
+    out = pipe.run_propose(
+        command, use_llm=True, model=sess.model, ollama_url=sess.ollama_url,
+    )
+    if not out.get("ok"):
+        return out.get("error") or "초안을 만들지 못했습니다."
+
+    proposals = (out.get("data") or {}).get("proposals") or []
+    skipped_facts = (out.get("data") or {}).get("skipped_facts") or []
+    fill_trace = (out.get("data") or {}).get("fill_trace") or []
+    if fill_trace and os.environ.get("DOCFILL_DEBUG"):
+        try:
+            from hwp_core.doc_agent.fill_trace import save_fill_trace
+            save_fill_trace(
+                fill_trace,
+                out_dir=_ROOT / "data" / "validation",
+                prefix="docfill_trace_session",
+                meta={
+                    "target": target.filename,
+                    "references": [r.filename for r in refs],
+                    "command": command,
+                },
+            )
+        except Exception:
+            pass
+    if not proposals:
+        if skipped_facts:
+            lines = [
+                "사실 칸(기관·주소·전화·이메일 등)은 참고 근거가 없어 비워 두었습니다. "
+                "추측으로 채우지 않습니다.",
+            ]
+            for s in skipped_facts[:15]:
+                lines.append(f"· {s.get('label') or s.get('concept_id')}: {s.get('reason')}")
+            if not refs:
+                lines.append("참고 문서를 추가한 뒤 다시 「채워줘」를 요청해 주세요.")
+            return "\n".join(lines)
+        ref_note = (
+            f"참고({', '.join(r.filename for r in refs)})와 "
+            if refs else ""
+        )
+        return (
+            f"「{target.filename}」에서 {ref_note}Evidence Fill과 Context Fill을 "
+            "모두 시도했지만 반영할 초안을 만들지 못했습니다. "
+            "빈칸·섹션 라벨을 확인하거나 참고 문서를 추가해 주세요."
+        )
+
+    return _push_fill_proposals(
+        sess,
+        target,
+        refs,
+        proposals,
+        skipped_facts,
+        header="",
+    )
 
 
 def _explain_pending(sess: Session) -> str:
@@ -1097,7 +1197,10 @@ def chat():
     )
 
     reply = ""
-    if decision.action == "fill":
+    if decision.action.startswith("workflow:"):
+        wf_id = decision.action.split(":", 1)[1]
+        reply = _run_named_workflow(sess, wf_id, user_msg)
+    elif decision.action == "fill":
         reply = _run_workspace_fill(sess, user_msg)
     elif decision.action == "explain_pending":
         reply = _explain_pending(sess)

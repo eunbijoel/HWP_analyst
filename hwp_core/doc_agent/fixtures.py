@@ -111,3 +111,34 @@ def make_staff_xlsx() -> bytes:
   buf = io.BytesIO()
   wb.save(buf)
   return buf.getvalue()
+
+
+def make_org_form_target_hwpx() -> bytes:
+  """빈 기관 서식 표."""
+  return make_minimal_hwpx(
+    paragraphs=["연구개발계획 신청서"],
+    tables=[[
+      ["기관명", "", "주소", ""],
+      ["대표자명", "", "사업자등록번호", ""],
+      ["대표전화", "", "전자우편", ""],
+    ]],
+  )
+
+
+def make_org_ref_hwpx() -> bytes:
+  """기관 정보가 있는 참고 HWPX (표 + 문단)."""
+  return make_minimal_hwpx(
+    paragraphs=[
+      "기관 소개",
+      "주관기관: 한국생산기술연구원",
+      "TEL: 041-589-8111",
+    ],
+    tables=[[
+      ["기관명", "한국생산기술연구원"],
+      ["주소", "충청남도 천안시 서북구 입장면 양대기로길 89"],
+      ["대표자명", "이상목"],
+      ["전화번호", "041-589-8000"],
+      ["E-mail", "contact@kitech.re.kr"],
+      ["사업자등록번호", "123-45-67890"],
+    ]],
+  )

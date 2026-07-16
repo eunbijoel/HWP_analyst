@@ -1,4 +1,4 @@
-# 문서 양식 채우기용 개념 (글 항목 · 인건비 표)
+# 문서 양식 채우기용 개념 (글 항목 · 서식 사실 · 인건비 표)
 version: 1
 domain: doc_fill
 
@@ -14,6 +14,37 @@ concepts:
     patterns:
       - "연구\\s*개발\\s*필요성"
       - "추진\\s*배경"
+
+  rd_content:
+    label_ko: 연구내용
+    value_type: text
+    synonyms:
+      - 연구내용
+      - 연구 내용
+      - 개발내용
+    patterns:
+      - "연구\\s*내용"
+      - "개발\\s*내용"
+
+  rd_strategy:
+    label_ko: 추진전략
+    value_type: text
+    synonyms:
+      - 추진전략
+      - 추진 전략
+      - 전략
+    patterns:
+      - "추진\\s*전략"
+
+  utilization:
+    label_ko: 활용방안
+    value_type: text
+    synonyms:
+      - 활용방안
+      - 활용 방안
+      - 성과활용
+    patterns:
+      - "활용\\s*방안"
 
   rd_objective:
     label_ko: 연구개발 목표
@@ -38,6 +69,140 @@ concepts:
     patterns:
       - "기대\\s*효과"
       - "파급\\s*효과"
+
+  org_name:
+    label_ko: 기관명
+    value_type: text
+    synonyms:
+      - 기관명
+      - 주관기관
+      - 주관 연구개발기관
+      - 수행기관
+      - 연구개발기관
+      - 업체명
+      - 회사명
+    patterns:
+      - "기관\\s*명"
+      - "주관\\s*(연구개발)?\\s*기관"
+      - "수행\\s*기관"
+
+  address:
+    label_ko: 주소
+    value_type: text
+    synonyms:
+      - 주소
+      - 소재지
+      - 사업장주소
+      - 기관주소
+      - 도로명주소
+    patterns:
+      - "주\\s*소"
+      - "소재\\s*지"
+
+  representative:
+    label_ko: 대표자명
+    value_type: text
+    synonyms:
+      - 대표자명
+      - 대표자
+      - 대표 성명
+      - 대표성명
+      - 기관장
+      - 대표이사
+    patterns:
+      - "대표\\s*자(\\s*명)?"
+      - "대표\\s*성\\s*명"
+      - "기관\\s*장"
+
+  pi_name:
+    label_ko: 연구책임자
+    value_type: text
+    synonyms:
+      - 연구책임자
+      - 책임자
+      - 연구책임자 성명
+      - 과제책임자
+    patterns:
+      - "연구\\s*책임\\s*자"
+      - "과제\\s*책임\\s*자"
+
+  phone:
+    label_ko: 전화번호
+    value_type: text
+    synonyms:
+      - 전화번호
+      - 전화
+      - 대표전화
+      - 대표자 연락처
+      - 대표자연락처
+      - 직장전화
+      - 연락처
+      - TEL
+      - Tel
+      - tel
+      - 팩스
+      - FAX
+    patterns:
+      - "전화\\s*(번호)?"
+      - "대표\\s*전화"
+      - "연락\\s*처"
+      - "직장\\s*전화"
+
+  mobile:
+    label_ko: 휴대전화
+    value_type: text
+    synonyms:
+      - 휴대전화
+      - 휴대폰
+      - 핸드폰
+      - 모바일
+      - H.P
+      - HP
+    patterns:
+      - "휴대\\s*전화"
+      - "휴대\\s*폰"
+      - "핸드\\s*폰"
+
+  email:
+    label_ko: 전자우편
+    value_type: text
+    synonyms:
+      - 전자우편
+      - 이메일
+      - 메일
+      - E-mail
+      - Email
+      - e-mail
+      - email
+      - 대표자 전자우편
+      - 전자메일
+    patterns:
+      - "전자\\s*우편"
+      - "이\\s*메일"
+      - "e\\-?mail"
+
+  business_reg_no:
+    label_ko: 사업자등록번호
+    value_type: text
+    synonyms:
+      - 사업자등록번호
+      - 사업자 번호
+      - 사업자번호
+      - 사업자등록
+    patterns:
+      - "사업자\\s*등록\\s*번호"
+      - "사업자\\s*번호"
+
+  corp_reg_no:
+    label_ko: 법인등록번호
+    value_type: text
+    synonyms:
+      - 법인등록번호
+      - 법인 번호
+      - 법인번호
+    patterns:
+      - "법인\\s*등록\\s*번호"
+      - "법인\\s*번호"
 
   person_name:
     label_ko: 성명
