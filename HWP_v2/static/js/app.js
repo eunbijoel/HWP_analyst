@@ -469,6 +469,13 @@
     els.fileInput.value = "";
   });
 
+  els.chatInput.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
+    e.preventDefault();
+    if (els.btnSend.disabled) return;
+    els.chatForm.requestSubmit();
+  });
+
   els.chatForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     if (!sessionId) return;

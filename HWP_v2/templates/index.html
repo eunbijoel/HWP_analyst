@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>HWP Editing Assistant (B)</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=13" />
+  <link rel="stylesheet" href="/static/css/app.css?v=14" />
 </head>
 <body>
   <div class="shell">
@@ -89,13 +89,17 @@ Ctrl+클릭으로 여러 곳 선택</div>
             <button type="button" id="btnReject" class="danger" disabled>전체 거절</button>
           </div>
           <form class="composer" id="chatForm">
-            <textarea id="chatInput" rows="2" placeholder="예: 두 문서 보고 보완해줘 / 사업비는?"></textarea>
-            <button type="submit" id="btnSend" disabled>보내기</button>
+            <textarea id="chatInput" rows="2" placeholder="예: 두 문서 보고 보완해줘 / 사업비는?" title="Enter로 전송 · Shift+Enter로 줄바꿈"></textarea>
+            <button type="submit" id="btnSend" class="btn-send" disabled aria-label="보내기" title="보내기">
+              <svg class="send-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">
+                <path fill="currentColor" d="M4 12h12.2l-4.6-4.6L13 6l7 7-7 7-1.4-1.4L16.2 13H4z"/>
+              </svg>
+            </button>
           </form>
         </div>
       </aside>
     </main>
   </div>
-  <script src="/static/js/app.js?v=13"></script>
+  <script src="/static/js/app.js?v=14"></script>
 </body>
 </html>
