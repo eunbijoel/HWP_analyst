@@ -10,9 +10,15 @@ from typing import Any, Optional
 from .document_inspector import FACT_CONCEPTS, TABLE_CONCEPTS, TEXT_CONCEPTS, get_fill_resolver
 from .fill_trace import (
   STATUS_PROPOSED,
+  STATUS_SKIPPED_NO_CALC,
   STATUS_SKIPPED_NO_EVIDENCE,
   STATUS_SKIPPED_UNSAFE,
   FieldFillTrace,
+)
+from .table_calc_fill import (
+  SKIP_REASON,
+  is_target_derived_cell,
+  try_table_cell_calculation,
 )
 from .workspace_retriever import (
   excel_grids_for_insert,
@@ -29,6 +35,7 @@ from ..llm_client import generate
 AI_DRAFT_MARKER = "AI Draft (Generated from current document context)"
 FILL_EVIDENCE = "evidence"
 FILL_CONTEXT = "context"
+FILL_CALCULATION = "calculation"
 
 _META_INSTRUCTION_RE = re.compile(
   r"기입\s*(?:필요|하십시오|하세요)|작성\s*(?:필요|요망)|입력\s*(?:필요|요망)|"
@@ -453,6 +460,107 @@ def _context_fill_text(
   return after, conf, _make_context_sources(ctx, hits)
 
 
+def _try_derived_table_calc(
+  f: dict,
+  fid: str,
+  *,
+  target_doc: WorkspaceDocument | None,
+  target_name: str,
+  proposals: list[EditProposal],
+  skipped_facts: list[dict],
+  fill_traces: list[FieldFillTrace],
+) -> bool:
+  """파생값 표 셀이면 계산 제안 또는 Skip. True면 이후 Evidence/엑셀 경로 생략."""
+  if not target_doc or not target_doc.file_bytes:
+    return False
+  t_idx = f.get("table_id")
+  r_idx = f.get("row")
+  c_idx = f.get("column")
+  if t_idx is None or r_idx is None or c_idx is None:
+    return False
+
+  from ..hwpx_editor import HWPXEditor
+
+  editor = HWPXEditor(target_doc.file_bytes)
+  table_index = int(t_idx)
+  row = int(r_idx)
+  col = int(c_idx)
+  if not is_target_derived_cell(editor, table_index, row, col):
+    return False
+
+  lab = (f.get("label") or "").strip()
+  cid = f.get("concept_id") or "form_blank"
+  loc = {
+    "field_type": f.get("field_type") or "table_cell",
+    "table_id": table_index,
+    "row": row,
+    "column": col,
+    "paragraph_id": f.get("paragraph_id"),
+    "context": f.get("context") or "",
+  }
+  calc = try_table_cell_calculation(editor, table_index, row, col)
+  if calc.ok:
+    srcs = [{
+      "document": target_name or "target",
+      "source_type": "table_cell",
+      "location": f"표{table_index + 1} ({op.row},{op.col})",
+      "value": op.display,
+    } for op in calc.operands]
+    proposals.append(EditProposal(
+      proposal_id=f"p_{uuid.uuid4().hex[:8]}",
+      field_id=fid,
+      action="write_table_cell",
+      before=f.get("current_value") or "",
+      after=calc.value,
+      sources=srcs[:8],
+      confidence=0.98,
+      location=f.get("context") or lab,
+      label=lab,
+      concept_id=cid,
+      meta={
+        "table_id": table_index,
+        "row": row,
+        "column": col,
+        "fill_mode": FILL_CALCULATION,
+        "formula": calc.formula,
+        "calc_direction": calc.direction,
+        "calc_operands": [op.to_dict() for op in calc.operands],
+      },
+    ))
+    fill_traces.append(FieldFillTrace(
+      target_document=target_name,
+      location=loc,
+      raw_label=lab,
+      concept_id=cid,
+      grounding_confidence=float(f.get("concept_confidence") or 0.0),
+      grounding_method="table_calc",
+      expected_value_type="number",
+      final_status=STATUS_PROPOSED,
+      selected_value=calc.value,
+      notes=[calc.formula],
+    ))
+    return True
+
+  reason = calc.reason or SKIP_REASON
+  fill_traces.append(FieldFillTrace(
+    target_document=target_name,
+    location=loc,
+    raw_label=lab,
+    concept_id=cid,
+    grounding_confidence=float(f.get("concept_confidence") or 0.0),
+    grounding_method="table_calc",
+    expected_value_type="number",
+    final_status=STATUS_SKIPPED_NO_CALC,
+    notes=[reason],
+  ))
+  skipped_facts.append({
+    "label": lab or cid,
+    "concept_id": cid,
+    "reason": reason,
+  })
+  return True
+
+
 def build_proposals(
   plan: dict,
   fields: list[dict],
@@ -559,6 +667,16 @@ def build_proposals(
       ))
 
     elif action == "fill_table":
+      if _try_derived_table_calc(
+        f, fid,
+        target_doc=target_doc,
+        target_name=target_name,
+        proposals=proposals,
+        skipped_facts=skipped_facts,
+        fill_traces=fill_traces,
+      ):
+        continue
+
       is_form = (
         cid == "form_blank"
         or bool((f.get("style") or {}).get("form"))

@@ -12,6 +12,7 @@ from typing import Any, Optional
 STATUS_PROPOSED = "proposed"
 STATUS_SKIPPED_NO_EVIDENCE = "skipped_no_evidence"
 STATUS_SKIPPED_UNSAFE = "skipped_unsafe"
+STATUS_SKIPPED_NO_CALC = "skipped_no_calc"
 STATUS_NEEDS_REVIEW = "needs_review"
 
 

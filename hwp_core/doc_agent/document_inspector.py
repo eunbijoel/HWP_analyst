@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 from ..concept_resolver import ConceptResolver, normalize_label
 from ..hwpx_editor import HWPXEditor, PLACEHOLDER_RE, PLACEHOLDER_SUBSTR
+from .table_calc_fill import is_derived_header_label
 
 _FILL_ONTOLOGY = Path(__file__).resolve().parent.parent / "ontology" / "doc_fill_concepts.yaml"
 
@@ -127,6 +128,8 @@ def _is_usable_form_label(text: str) -> bool:
   t = (text or "").strip()
   if not t or len(t) > 40:
     return False
+  if is_derived_header_label(t):
+    return True
   if _looks_like_org_or_filled_value(t):
     return False
   cid, conf = _ground_label(t)
@@ -181,6 +184,7 @@ def find_form_label_blanks(editor: HWPXEditor, document_id: str = "") -> list[Ed
           c_idx += 1
           continue
 
+        derived_total = is_derived_header_label(label)
         row_ctx = " ".join(
           str(row[j]).strip() for j in range(0, min(c_idx, len(row))) if str(row[j]).strip()
         )
@@ -190,7 +194,9 @@ def find_form_label_blanks(editor: HWPXEditor, document_id: str = "") -> list[Ed
 
         # 라벨 자체만 grounding (row_ctx에 연구책임자가 있으면 패턴이 라벨을 덮어씀)
         cid, conf = _ground_label(label)
-        if (
+        if derived_total:
+          cid, conf = "form_blank", 0.95
+        elif (
           (cid in ("person_name", None, "") or not cid)
           and re.search(r"연구\s*책임|책임자", f"{row_ctx} {label}")
           and not re.search(r"번호|등록", label)
@@ -231,7 +237,7 @@ def find_form_label_blanks(editor: HWPXEditor, document_id: str = "") -> list[Ed
           current_value="",
           concept_id=cid,
           concept_confidence=conf if conf else 0.7,
-          style={"span_cols": end - c_idx, "form": True, "factual": True},
+          style={"span_cols": end - c_idx, "form": True, "factual": not derived_total, "derived_total": derived_total},
         ))
         c_idx = end
   return fields
