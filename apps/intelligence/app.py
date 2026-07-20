@@ -28,7 +28,14 @@ from hwp_core.analysis.intent_route import (
 from hwp_core.hwp_backends import get_backend_status
 from hwp_core.hwp_parser import parse_document
 from hwp_core.intel_pipeline import build_intelligence, build_workspace_intelligence
-from hwp_core.llm_client import answer_general_question, check_ollama_status
+from hwp_core.llm_client import check_ollama_status
+from hwp_core.knowledge_mode import (
+    DEFAULT_KNOWLEDGE_MODE,
+    MODE_HELP_KO,
+    MODE_LABELS_KO,
+    KnowledgeMode,
+    normalize_knowledge_mode,
+)
 from hwp_core.qa_engine import QAEngine
 from hwp_core.shared.preview.plain import build_preview_from_text
 from hwp_core.table_extractor import (
@@ -58,11 +65,6 @@ DOC_PANE_HEIGHT = 720
 DOC_IFRAME_HEIGHT = 700
 CHAT_SCROLL_HEIGHT = 520
 
-GENERAL_KNOWLEDGE_RE = __import__("re").compile(
-    r"필요성|중요성|배경|기대효과|의미|정의|개념|bullet|불릿|장점|단점",
-    __import__("re").I,
-)
-
 
 def render_scrollable_doc_preview(html: str, *, iframe_height: int = DOC_IFRAME_HEIGHT):
     with st.container(height=DOC_PANE_HEIGHT, border=False):
@@ -78,14 +80,25 @@ def _has_document_content(documents: list) -> bool:
     return any(d.get("paragraphs") or d.get("tables") for d in (documents or []))
 
 
-def _should_use_general_llm(question: str, documents: list) -> bool:
-    if _has_document_content(documents):
-        return False
-    import re
-
-    if re.search(r"이\s*문서|이\s*자료|이\s*파일|문서\s*에서|올린|업로드", question, re.I):
-        return False
-    return bool(GENERAL_KNOWLEDGE_RE.search(question))
+def render_knowledge_mode_picker(*, key: str = "knowledge_mode") -> KnowledgeMode:
+    """Product A: document vs general knowledge — default document + general."""
+    options: list[KnowledgeMode] = [
+        "document_only",
+        "document_plus_general",
+        "general_only",
+    ]
+    if key not in st.session_state:
+        st.session_state[key] = DEFAULT_KNOWLEDGE_MODE
+    mode = st.radio(
+        "답변 근거",
+        options=options,
+        format_func=lambda m: MODE_LABELS_KO[m],
+        horizontal=True,
+        key=key,
+        help="문서 근거와 일반 지식을 섞지 않습니다. 기본은 문서 답변 후 「문서 외」보충입니다.",
+    )
+    st.caption(MODE_HELP_KO[normalize_knowledge_mode(mode)])
+    return normalize_knowledge_mode(mode)
 
 
 def process_document(file_bytes: bytes, filename: str):
@@ -100,7 +113,15 @@ def process_document(file_bytes: bytes, filename: str):
 
 
 def get_cached_qa_engine(documents: list, fname: str) -> QAEngine:
-    key = f"qa_engine_{fname}_{len(documents)}"
+    # Bump suffix when QAEngine.answer signature changes so Streamlit
+    # does not keep pre-reload instances missing new kwargs (e.g. knowledge_mode).
+    key = f"qa_engine_v2_{fname}_{len(documents)}"
+    stale = [
+        k for k in list(st.session_state.keys())
+        if k.startswith("qa_engine_") and not k.startswith("qa_engine_v2_")
+    ]
+    for k in stale:
+        del st.session_state[k]
     if key not in st.session_state:
         st.session_state[key] = QAEngine(documents=documents)
     return st.session_state[key]
@@ -189,6 +210,8 @@ def render_analysis_chat(
     use_llm: bool,
     use_streaming: bool,
     ollama_url: str,
+    knowledge_mode: KnowledgeMode = DEFAULT_KNOWLEDGE_MODE,
+    active_filenames: list[str] | None = None,
 ):
     fname = entry["filename"]
     doc_payload = entry["doc_payload"]
@@ -196,7 +219,11 @@ def render_analysis_chat(
     if chat_key not in st.session_state:
         st.session_state[chat_key] = []
 
-    st.caption("질문하세요 — 예: *총 사업비는?*, *이 이슈가 왜 생겼어?*")
+    active = active_filenames or [fname]
+    st.caption(
+        f"질문하세요 — 예: *총 사업비는?*, *이 이슈가 왜 생겼어?*  ·  "
+        f"활성 문서: {', '.join(active)}"
+    )
     with st.container(height=CHAT_SCROLL_HEIGHT, border=False):
         for msg in st.session_state[chat_key]:
             with st.chat_message(msg["role"]):
@@ -231,42 +258,36 @@ def render_analysis_chat(
     ref_ctx = get_reference_context()
     documents = [doc_payload] if len(all_documents) <= 1 else all_documents
 
-    if _should_use_general_llm(q, documents):
-        with st.spinner("일반 답변 생성 중..."):
-            ans = answer_general_question(
-                question=q,
-                model=model_name,
-                ollama_url=ollama_url,
-                use_streaming=use_streaming,
-            )
-    else:
-        qa = get_cached_qa_engine(documents, fname)
-        question = q
-        if ref_ctx:
-            question = f"{q}\n\n[참고자료]\n{ref_ctx[:4000]}"
-        hist = []
-        msgs = st.session_state[chat_key][:-1]
-        for i in range(0, len(msgs) - 1, 2):
-            if (
-                i + 1 < len(msgs)
-                and msgs[i]["role"] == "user"
-                and msgs[i + 1]["role"] == "assistant"
-            ):
-                hist.append({
-                    "question": msgs[i]["content"],
-                    "answer": msgs[i + 1]["content"],
-                })
-        with st.spinner("분석 중..."):
-            ans = qa.answer(
-                question=question,
-                use_llm=use_llm,
-                model=model_name,
-                ollama_url=ollama_url,
-                stream=use_streaming,
-                stage1_model=stage1_model,
-                history=hist[-3:],
-                issues=pending_issues,
-            )
+    qa = get_cached_qa_engine(documents, fname)
+    question = q
+    if ref_ctx and knowledge_mode != "general_only":
+        question = f"{q}\n\n[참고자료]\n{ref_ctx[:4000]}"
+    hist = []
+    msgs = st.session_state[chat_key][:-1]
+    for i in range(0, len(msgs) - 1, 2):
+        if (
+            i + 1 < len(msgs)
+            and msgs[i]["role"] == "user"
+            and msgs[i + 1]["role"] == "assistant"
+        ):
+            hist.append({
+                "question": msgs[i]["content"],
+                "answer": msgs[i + 1]["content"],
+            })
+    # Labeled split answers need full text (no stream) except pure document_only
+    do_stream = bool(use_streaming and knowledge_mode == "document_only")
+    with st.spinner("분석 중..." if knowledge_mode != "general_only" else "일반 설명 생성 중..."):
+        ans = qa.answer(
+            question=question,
+            use_llm=use_llm,
+            model=model_name,
+            ollama_url=ollama_url,
+            stream=do_stream,
+            stage1_model=stage1_model,
+            history=hist[-3:],
+            issues=pending_issues,
+            knowledge_mode=knowledge_mode,
+        )
 
     chart = ans.get("chart_data")
     if ans.get("answer_stream"):
@@ -294,11 +315,18 @@ def render_workspace_qa_chat(
     use_llm: bool,
     use_streaming: bool,
     ollama_url: str,
+    knowledge_mode: KnowledgeMode = DEFAULT_KNOWLEDGE_MODE,
+    active_filenames: list[str] | None = None,
 ):
     chat_key = "workspace_chat_ALL"
     if chat_key not in st.session_state:
         st.session_state[chat_key] = []
-    st.caption("여러 문서를 비교·질문합니다 (읽기 전용).")
+    names = active_filenames or [
+        d.get("filename") or d.get("name") or "?" for d in (all_documents or [])
+    ]
+    st.caption(
+        f"여러 문서를 비교·질문합니다 (읽기 전용).  ·  활성 문서: {', '.join(str(n) for n in names)}"
+    )
     with st.container(height=CHAT_SCROLL_HEIGHT, border=False):
         for msg in st.session_state[chat_key]:
             with st.chat_message(msg["role"]):
@@ -316,19 +344,32 @@ def render_workspace_qa_chat(
         st.rerun()
         return
     qa = get_cached_qa_engine(all_documents, "ALL")
-    with st.spinner("분석 중..."):
+    do_stream = bool(use_streaming and knowledge_mode == "document_only")
+    with st.spinner("분석 중..." if knowledge_mode != "general_only" else "일반 설명 생성 중..."):
         ans = qa.answer(
             question=q,
             use_llm=use_llm,
             model=model_name,
             ollama_url=ollama_url,
-            stream=use_streaming,
+            stream=do_stream,
             stage1_model=stage1_model,
+            knowledge_mode=knowledge_mode,
         )
-    st.session_state[chat_key].append({
-        "role": "assistant",
-        "content": ans.get("answer", "답변 없음"),
-    })
+    chart = ans.get("chart_data")
+    if ans.get("answer_stream"):
+        with st.chat_message("assistant"):
+            reply_text = st.write_stream(ans["answer_stream"])
+        st.session_state[chat_key].append({
+            "role": "assistant",
+            "content": reply_text or "답변 없음",
+            "chart_data": chart.get("data") if chart else None,
+        })
+    else:
+        st.session_state[chat_key].append({
+            "role": "assistant",
+            "content": ans.get("answer") or "답변 없음",
+            "chart_data": chart.get("data") if chart else None,
+        })
     st.rerun()
 
 
@@ -371,6 +412,8 @@ with st.sidebar:
             stage1_model = st.selectbox("질문 이해 모델", small_models, index=0)
         else:
             stage1_model = "gemma3:4b"
+    st.markdown("---")
+    knowledge_mode = render_knowledge_mode_picker(key="knowledge_mode")
     st.markdown("---")
     st.caption(f"백엔드: {get_backend_status().summary()}")
 
@@ -506,6 +549,8 @@ else:
                         use_llm=use_llm,
                         use_streaming=use_streaming,
                         ollama_url=ollama_url,
+                        knowledge_mode=knowledge_mode,
+                        active_filenames=[e["filename"] for e in active_entries],
                     )
                 with tab_all:
                     render_workspace_qa_chat(
@@ -515,6 +560,8 @@ else:
                         use_llm=use_llm,
                         use_streaming=use_streaming,
                         ollama_url=ollama_url,
+                        knowledge_mode=knowledge_mode,
+                        active_filenames=[e["filename"] for e in active_entries],
                     )
 
         render_review_home(

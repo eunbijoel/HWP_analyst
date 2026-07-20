@@ -234,14 +234,49 @@ class QAEngine:
                benchmark: bool = False,
                memory: str | None = None,
                use_memory: bool = True,
-               issues: list | None = None) -> dict:
+               issues: list | None = None,
+               knowledge_mode: str | None = None) -> dict:
         """Rules-first pre-compute → 조건부 Stage1 → Stage2.
 
+        knowledge_mode: document_only | document_plus_general | general_only
+          When set (Product A), answers use labeled document vs general sections.
+          When None, legacy behavior (no split labels / no auto supplement).
         memory: 장기 기억 텍스트. None이면 MemoryStore에서 질문 기준으로 조회.
         use_memory=False 이면 주입 안 함.
         issues: 검토 Issue(객체 또는 dict) 목록. Stage2 issue_section에 주입.
                 LLM 꺼져 있으면 필드 기반 결정적 설명만 반환.
         """
+        from .knowledge_mode import (
+            format_split_answer,
+            normalize_knowledge_mode,
+        )
+
+        kmode = normalize_knowledge_mode(knowledge_mode) if knowledge_mode else None
+        analysis_only = kmode is not None  # Product A: never edit-draft enrich tone
+
+        # General-only: skip document pipeline entirely
+        if kmode == "general_only":
+            from .llm_client import answer_general_question
+            if not use_llm:
+                return {
+                    "answer": format_split_answer(
+                        document_part="",
+                        general_part="일반 설명 모드에는 AI 연결이 필요합니다.",
+                        mode="general_only",
+                    ),
+                    "source": "general_only",
+                    "knowledge_mode": kmode,
+                }
+            out = answer_general_question(
+                question=question.strip(),
+                model=model,
+                ollama_url=ollama_url,
+                use_streaming=False,
+            )
+            out["knowledge_mode"] = kmode
+            out["source"] = out.get("source") or "general_only"
+            return out
+
         enable_stage1 = run_stage1 if run_stage1 is not None else use_llm
         t_start = time.time()
         history = history or []
@@ -321,16 +356,21 @@ class QAEngine:
         if not wants_chart:
             chart_data = None
 
+        # Split modes need full text; stream only for unlabeled legacy or document_only
+        use_stream = stream and kmode in (None, "document_only")
+
         if use_llm:
-            if stream:
+            if use_stream:
                 result = self._llm_answer_stream(
                     question, model, ollama_url, rule_result, pre_computed,
                     history=history, memory=memory, issues=issues,
+                    analysis_only=analysis_only,
                 )
             else:
                 result = self._llm_answer(
                     question, model, ollama_url, rule_result, pre_computed,
                     history=history, memory=memory, issues=issues,
+                    analysis_only=analysis_only,
                 )
             if chart_data:
                 result['chart_data'] = chart_data
@@ -366,6 +406,27 @@ class QAEngine:
 
             result['issues_context'] = [_as_issue_dict(i) for i in issues]
 
+        # Label / split knowledge layers when Product A mode is set
+        if kmode and not result.get("answer_stream"):
+            doc_text = (result.get("answer") or "").strip()
+            general_text = ""
+            if kmode == "document_plus_general" and use_llm and doc_text:
+                from .llm_client import supplement_general_knowledge
+                general_text = supplement_general_knowledge(
+                    question=q,
+                    document_answer=doc_text,
+                    model=model,
+                    ollama_url=ollama_url,
+                )
+            result["answer"] = format_split_answer(
+                document_part=doc_text,
+                general_part=general_text,
+                mode=kmode,
+            )
+            result["knowledge_mode"] = kmode
+        elif kmode:
+            result["knowledge_mode"] = kmode
+
         if benchmark:
             s1_entities = stage1_result.get('entities', []) if stage1_result else []
             s1_metrics = stage1_result.get('metrics', []) if stage1_result else []
@@ -384,6 +445,7 @@ class QAEngine:
                 'rules_pre_hit': bool(rules_pre),
                 'pre_computed_chars': len(pre_computed),
                 'total_elapsed_s': round(time.time() - t_start, 3),
+                'knowledge_mode': kmode,
             }
         return result
 
@@ -1390,7 +1452,8 @@ class QAEngine:
                     history: list = None,
                     include_rule_hint: bool = True,
                     memory: str | None = None,
-                    issues: list | None = None) -> dict:
+                    issues: list | None = None,
+                    analysis_only: bool = False) -> dict:
         context = self._build_context(question)
         rule_hint = rule_result.get('answer', '')
 
@@ -1407,7 +1470,9 @@ class QAEngine:
             history_text = self._format_history(history)
             history_section = f"\n## 이전 대화 (맥락 참고용):\n{history_text}\n"
 
-        prompt_id = "stage2.enrich" if ENRICH_QUESTION.search(question) else "stage2.answer"
+        # Product A analysis: never use enrich (edit-draft) tone
+        use_enrich = (not analysis_only) and bool(ENRICH_QUESTION.search(question))
+        prompt_id = "stage2.enrich" if use_enrich else "stage2.answer"
         prompt = render_prompt(
             prompt_id,
             system_prompt=render_prompt("system.hwp_analyst") if prompt_id == "stage2.answer" else "",
@@ -1460,7 +1525,8 @@ class QAEngine:
                            history: list = None,
                            include_rule_hint: bool = True,
                            memory: str | None = None,
-                           issues: list | None = None) -> dict:
+                           issues: list | None = None,
+                           analysis_only: bool = False) -> dict:
         context = self._build_context(question)
         rule_hint = rule_result.get('answer', '')
 
@@ -1477,7 +1543,8 @@ class QAEngine:
             history_text = self._format_history(history)
             history_section = f"\n## 이전 대화 (맥락 참고용):\n{history_text}\n"
 
-        prompt_id = "stage2.enrich" if ENRICH_QUESTION.search(question) else "stage2.answer"
+        use_enrich = (not analysis_only) and bool(ENRICH_QUESTION.search(question))
+        prompt_id = "stage2.enrich" if use_enrich else "stage2.answer"
         prompt = render_prompt(
             prompt_id,
             system_prompt=render_prompt("system.hwp_analyst") if prompt_id == "stage2.answer" else "",

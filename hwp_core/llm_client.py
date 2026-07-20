@@ -143,7 +143,8 @@ def answer_general_question(
     ollama_url: str,
     use_streaming: bool,
 ) -> dict:
-    """문서 근거형 QA 대신 일반 LLM 답변."""
+    """문서 근거형 QA 대신 일반 LLM 답변 (문서 외)."""
+    from .knowledge_mode import wrap_general_only
     from .prompt_registry import render_prompt
 
     prompt = render_prompt("general.answer", question=question)
@@ -156,7 +157,36 @@ def answer_general_question(
         timeout=120,
     )
     if result.get("error"):
-        return {"answer": f"일반 답변 생성 실패: {result['error']}"}
+        return {"answer": wrap_general_only(f"일반 답변 생성 실패: {result['error']}")}
     if result.get("stream"):
-        return {"answer_stream": result["stream"]}
-    return {"answer": result.get("text") or "답변 생성 실패"}
+        # Caller should prefer non-stream for labeled wrap; expose raw stream
+        return {"answer_stream": result["stream"], "knowledge_layer": "general_only"}
+    text = (result.get("text") or "답변 생성 실패").strip()
+    return {"answer": wrap_general_only(text), "knowledge_layer": "general_only"}
+
+
+def supplement_general_knowledge(
+    question: str,
+    document_answer: str,
+    model: str,
+    ollama_url: str,
+) -> str:
+    """After a document-grounded answer, add a separate general-knowledge supplement."""
+    from .prompt_registry import render_prompt
+
+    prompt = render_prompt(
+        "general.supplement",
+        question=question,
+        document_answer=(document_answer or "")[:4000],
+    )
+    result = generate(
+        prompt, model, ollama_url,
+        stream=False,
+        temperature=0.3,
+        num_predict=600,
+        num_ctx=16384,
+        timeout=90,
+    )
+    if result.get("error"):
+        return ""
+    return (result.get("text") or "").strip()

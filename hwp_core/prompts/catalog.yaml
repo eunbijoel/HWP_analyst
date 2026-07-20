@@ -29,8 +29,13 @@ prompts:
 
   general.answer:
     path: general/answer.v1.md
+    version: "1.1"
+    description: 문서 없는 일반 질의응답 (문서 외 표시)
+
+  general.supplement:
+    path: general/supplement.v1.md
     version: "1.0"
-    description: 문서 없는 일반 질의응답
+    description: 문서 답변 뒤 일반 지식만 분리 보충
 
   grounding.classify_label:
     path: grounding/classify_label.v1.md
