@@ -542,7 +542,59 @@ def _setup_fill_pipeline(sess: Session):
     return target, refs, pipe, ""
 
 
+def _run_completion_planner(sess: Session, command: str) -> str:
+    """Completion Planner: state → gaps → plan → fill tools → pending proposals.
+
+    Complete/fill only. Does not handle analyze, review, ask, or rewrite.
+    """
+    from hwp_core.doc_reasoner import run_completion_planner
+
+    target, refs, pipe, err = _setup_fill_pipeline(sess)
+    if err:
+        return err
+    assert target and pipe
+
+    result = run_completion_planner(
+        pipe,
+        command=command or "이 문서 완성해줘",
+        use_llm=False,
+        model=sess.model,
+        ollama_url=sess.ollama_url,
+    )
+    summary = result.summary or result.message
+    proposals = result.proposals
+    skipped = result.skipped
+
+    if not proposals:
+        if skipped:
+            lines = [summary, "", "근거 없어 비운 사실 칸:"]
+            for s in skipped[:15]:
+                lines.append(
+                    f"· {s.get('label') or s.get('concept_id')}: {s.get('reason')}"
+                )
+            return "\n".join(lines)
+        return summary
+
+    body = _push_fill_proposals(
+        sess,
+        target,
+        refs,
+        proposals,
+        skipped,
+        header=summary,
+    )
+    return body
+
+
+# Compatibility alias
+_run_document_reasoner = _run_completion_planner
+
+
 def _run_named_workflow(sess: Session, workflow_id: str, command: str) -> str:
+    # Institution is an internal Completion Planner tool — not a product surface.
+    if workflow_id == "fill_institution_info":
+        return _run_completion_planner(sess, command)
+
     from hwp_core.workflows.registry import run_workflow
 
     target, refs, pipe, err = _setup_fill_pipeline(sess)
@@ -1197,7 +1249,10 @@ def chat():
     )
 
     reply = ""
-    if decision.action.startswith("workflow:"):
+    if decision.action in ("complete_plan", "reason_complete"):
+        # reason_complete = compatibility alias for Completion Planner
+        reply = _run_completion_planner(sess, user_msg)
+    elif decision.action.startswith("workflow:"):
         wf_id = decision.action.split(":", 1)[1]
         reply = _run_named_workflow(sess, wf_id, user_msg)
     elif decision.action == "fill":

@@ -53,6 +53,7 @@ TASK_CATALOG: list[WorkflowSpec] = [
     ],
     product="B",
     implemented=True,
+    notes="Internal FactFillTool via Completion Planner — not a user-facing chat workflow",
   ),
   WorkflowSpec(
     id="fill_participant_table",

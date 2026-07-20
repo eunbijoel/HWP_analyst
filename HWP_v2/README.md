@@ -72,7 +72,8 @@ HWP_v2/
 | -------------------------------------- | -------------------- |
 | `hwp_core.hwpx_editor.HWPXEditor`      | HWPX XML 편집 · export |
 | `hwp_core.qa_engine.QAEngine`          | 멀티문서 Q&A             |
-| `hwp_core.doc_agent.DocFillPipeline`   | 보완/채우기               |
+| `hwp_core.doc_agent.DocFillPipeline`   | 채우기 엔진               |
+| `hwp_core.doc_reasoner`                | Completion Planner (complete/fill만) |
 | `hwp_core.editing` / `hwp_core.shared` | 편집·공유 레이어            |
 
 
@@ -97,11 +98,17 @@ HWP_v2/
   - `POST /api/select` — `mode: replace|toggle`
   - `POST /api/accept_one` / `POST /api/reject_one` — `change_id`
 
+### DocFill (채우기)
+
+1. **Evidence Fill** (우선): 참고 문서에서 근거를 찾아 제안 · 출처 표시
+2. **Context Fill** (폴백): 참고가 없거나 근거가 없으면 **현재 문서만**으로 초안 · `AI Draft (Generated from current document context)` 표시
+3. 두 모드 모두 실패할 때만 오류 · **자동 반영 없음** (제안 → 검토 → 수락)
+
 ---
 
 ## Notes
 
 - HWPX는 ZIP(`PK…`). 파일로 저장해 한글에서 열기.
-- 채우기 값은 참고 문서에서만 — 임의 생성하지 않음.
+- DocFill은 Evidence → Context 순으로 자동 선택. Context 초안은 수락 전까지 문서에 쓰지 않음.
 - Product A/B 안내는 저장소의 `PRODUCT_B_UX_VALIDATION.md` 참고.
 

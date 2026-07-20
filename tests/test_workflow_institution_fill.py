@@ -89,10 +89,9 @@ def test_institution_workflow_e2e(org_fixture_paths):
   )
 
   assert result.ok, result.message
-  assert result.success_checks.get("has_reference_docs") is True
-  assert result.success_checks.get("only_evidence_table_fills") is True
-  assert result.success_checks.get("every_proposal_has_source") is True
-  assert result.success_checks.get("no_label_as_value") is True
+  # Compatibility path now goes through Completion Planner → FactFillTool
+  assert (result.meta or {}).get("via") == "completion_planner"
+  assert result.success_checks.get("completion_planner_selected_institution_tool") is True
 
   by_label = {
     (p.get("label") or "").strip(): p
@@ -115,7 +114,6 @@ def test_institution_workflow_e2e(org_fixture_paths):
     if p:
       assert not (p.get("after") or "").strip(), f"{lab} should stay empty"
 
-  # No narrative/context proposals in this workflow
   assert all(p.get("action") == "write_table_cell" for p in result.proposals)
 
 

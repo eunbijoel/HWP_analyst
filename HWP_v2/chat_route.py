@@ -23,6 +23,12 @@ except ImportError:  # pragma: no cover
     def match_named_workflow(_message: str):
         return None
 
+try:
+    from hwp_core.doc_reasoner import is_complete_intent
+except ImportError:  # pragma: no cover
+    def is_complete_intent(_message: str) -> bool:
+        return False
+
 WRITE_VERB = re.compile(
     r"(?:수정|바꿔|변경|고쳐|다듬|리라이트|짧게|줄여|간결|"
     r"채우|채워|넣어|기입|삽입|추가|반영|삭제|지워|치환|작성)"
@@ -286,7 +292,14 @@ def decide_chat_route(
             message="문서를 열어 주세요. HWP / HWPX를 여러 개 올릴 수 있습니다.",
         )
 
+    # Vague complete/fill goal → Completion Planner (not analyze/ask/rewrite).
+    if is_complete_intent(t):
+        return ChatRoute(action="complete_plan")
+
+    # Legacy explicit institution phrase → same Completion Planner path.
     wf_id = match_named_workflow(t)
+    if wf_id == "fill_institution_info":
+        return ChatRoute(action="complete_plan")
     if wf_id:
         return ChatRoute(action=f"workflow:{wf_id}")
 
