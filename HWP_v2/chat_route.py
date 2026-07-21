@@ -312,6 +312,9 @@ def decide_chat_route(
         return ChatRoute(action="explain_pending")
 
     if has_selection:
+        # 「계산해서 넣어줘」등 — 선택 칸 계산+채우기 (리라이트 아님)
+        if COMPUTE_THEN_WRITE.search(t):
+            return ChatRoute(action="fill")
         if is_explanatory_question(t):
             return ChatRoute(action="answer_selection")
         if is_explicit_edit_command(t):

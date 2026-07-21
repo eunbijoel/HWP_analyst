@@ -39,6 +39,46 @@ def extract_literal_cell_value(user_msg: str) -> str | None:
     return None
 
 
+def is_calc_question(user_msg: str) -> bool:
+    """선택 칸에 대한 합계·계산 질문인지 (채우기 동사 없이)."""
+    t = (user_msg or "").strip()
+    if not t:
+        return False
+    if re.search(r"(?:채우|채워|넣|기입|반영|작성)", t):
+        return False
+    return bool(re.search(r"(?:계산|산출|구해|합계|총계|소계|얼마)", t))
+
+
+def extract_value_from_recent_chat(chat: list[dict], *, lookback: int = 6) -> str | None:
+    """직전 어시스턴트 답에서 방금 말한 합계/숫자 값을 찾음.
+
+    「국내여비 합계는 30,000입니다」→ 채우기 지시와 이어 쓸 때 사용.
+    """
+    if not chat:
+        return None
+    for msg in reversed(list(chat)[-lookback:]):
+        if (msg.get("role") or "") != "assistant":
+            continue
+        text = (msg.get("content") or "").strip()
+        if not text or text.startswith("선택 칸") or "제안을 만들지 못" in text:
+            continue
+        m = re.search(
+            r"(?:합계|총계|소계|계|결과).{0,16}?"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:원|천원)?",
+            text,
+        )
+        if m:
+            return m.group(1)
+        m = re.search(
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:원|천원)?\s*"
+            r"(?:입니다|이에요|예요|임|이었습니다)",
+            text,
+        )
+        if m:
+            return m.group(1)
+    return None
+
+
 def shorten_locally(text: str, aggressive: bool = False) -> str:
     """LLM 실패 시 문장만 짧게 자르기 (값 날조 없음)."""
     t = re.sub(r"\s+", " ", (text or "").strip())

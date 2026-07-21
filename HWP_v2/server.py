@@ -40,6 +40,8 @@ from cell_ai import (  # noqa: E402
     build_para_prompt,
     detect_cell_intent,
     extract_literal_cell_value,
+    extract_value_from_recent_chat,
+    is_calc_question,
     shorten_locally,
 )
 from chat_route import (  # noqa: E402
@@ -662,6 +664,100 @@ def _run_named_workflow(sess: Session, workflow_id: str, command: str) -> str:
     return _push_fill_proposals(sess, target, refs, proposals, skipped, header=header)
 
 
+def _cell_is_effectively_blank(raw: str) -> bool:
+    t = str(raw or "").strip()
+    if not t or t == "(비어 있음)":
+        return True
+    try:
+        from hwp_core.doc_agent.document_inspector import _is_blank
+        return bool(_is_blank(t))
+    except Exception:
+        return False
+
+
+def _propose_value_on_selected(
+    sess: Session,
+    selected: list[tuple[int, int, int]],
+    value: str,
+    *,
+    context: str,
+) -> str | None:
+    """선택 칸에 값을 제안. 성공 시 사용자 메시지, 실패 시 None."""
+    if not sess.editor or not selected or not str(value or "").strip():
+        return None
+    ok_n = 0
+    last = selected[-1]
+    for t, r, c in selected:
+        try:
+            rows = sess.editor.get_table_as_rows(int(t)) or []
+            raw = ""
+            if 0 <= r < len(rows) and 0 <= c < len(rows[r]):
+                raw = rows[r][c] or ""
+            if raw and not _cell_is_effectively_blank(raw):
+                continue
+        except Exception:
+            pass
+        sess.editor.propose_cell_change(
+            int(t), int(r), int(c), value, context=context,
+        )
+        ok_n += 1
+        last = (t, r, c)
+    if not ok_n:
+        return None
+    sess.editor._bump_preview()
+    t, r, c = last
+    return (
+        f"선택 칸에 「{value}」 제안을 {ok_n}건 올렸습니다.\n"
+        f"→ 표{t + 1} {r + 1}행 {c + 1}열\n"
+        f"({context})\n\n"
+        "항목별 수락/거절 또는 「전체 수락」「전체 거절」을 사용하세요."
+    )
+
+
+def _propose_table_calc_on_selected(
+    sess: Session,
+    selected: list[tuple[int, int, int]],
+) -> str | None:
+    """선택 빈칸을 표 내부 계산으로 바로 제안 (Evidence 파이프라인 우회)."""
+    if not sess.editor or not selected:
+        return None
+    from hwp_core.doc_agent.table_calc_fill import try_table_cell_calculation
+
+    ok: list[tuple[int, int, int, str, str]] = []
+    for t, r, c in selected:
+        try:
+            rows = sess.editor.get_table_as_rows(int(t)) or []
+            raw = ""
+            if 0 <= r < len(rows) and 0 <= c < len(rows[r]):
+                raw = rows[r][c] or ""
+            if raw and not _cell_is_effectively_blank(raw):
+                continue
+        except Exception:
+            continue
+        calc = try_table_cell_calculation(sess.editor, int(t), int(r), int(c))
+        if not calc.ok or not calc.value:
+            continue
+        sess.editor.propose_cell_change(
+            int(t), int(r), int(c), calc.value,
+            context=calc.formula or "표 내부 계산",
+        )
+        ok.append((int(t), int(r), int(c), calc.value, calc.formula or "표 내부 계산"))
+    if not ok:
+        return None
+    sess.editor._bump_preview()
+    # 「합계는 N입니다」형태를 넣어 직후 「채워넣어」가 채팅에서도 값을 찾을 수 있게
+    first_val = ok[0][3]
+    lines = [
+        f"합계는 {first_val}입니다." if len(ok) == 1 else f"계산 결과 {len(ok)}건입니다.",
+        f"표에서 바로 계산해 선택 칸에 제안을 {len(ok)}건 올렸습니다.",
+    ]
+    for t, r, c, val, formula in ok[:8]:
+        lines.append(f"· 표{t + 1} {r + 1}행 {c + 1}열 → {val}  ({formula})")
+    lines.append("")
+    lines.append("항목별 수락/거절 또는 「전체 수락」「전체 거절」을 사용하세요.")
+    return "\n".join(lines)
+
+
 def _blank_fields_for_selected_cells(
     sess: Session,
     selected: list[tuple[int, int, int]],
@@ -735,24 +831,27 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
         [sess.selected_cell] if sess.selected_cell is not None else []
     )
 
-    # 선택 + 「100,000으로 채워」→ Fill 파이프라인 대신 값 직접 제안
-    from cell_ai import extract_literal_cell_value
-    literal = extract_literal_cell_value(command)
-    if selected and literal and sess.editor:
-        ok_n = 0
-        for t, r, c in selected:
-            sess.editor.propose_cell_change(
-                int(t), int(r), int(c), literal, context=f"지시 값 반영: {literal}",
+    # 선택 칸이 있으면: 명시 값 → 표 계산 → 직전 채팅 숫자 순으로 바로 제안
+    # (Evidence 파이프라인과 계산 채팅이 끊기지 않게)
+    if selected and sess.editor:
+        literal = extract_literal_cell_value(command)
+        if literal:
+            direct = _propose_value_on_selected(
+                sess, selected, literal, context=f"지시 값 반영: {literal}",
             )
-            ok_n += 1
-        if ok_n:
-            sess.editor._bump_preview()
-            t, r, c = selected[-1]
-            return (
-                f"선택 칸에 「{literal}」 제안을 {ok_n}건 올렸습니다.\n"
-                f"→ 표{t + 1} {r + 1}행 {c + 1}열\n\n"
-                "항목별 수락/거절 또는 「전체 수락」「전체 거절」을 사용하세요."
+            if direct:
+                return direct
+        calc_reply = _propose_table_calc_on_selected(sess, selected)
+        if calc_reply:
+            return calc_reply
+        chat_val = extract_value_from_recent_chat(sess.chat)
+        if chat_val:
+            direct = _propose_value_on_selected(
+                sess, selected, chat_val,
+                context=f"직전 계산 결과 반영: {chat_val}",
             )
+            if direct:
+                return direct
 
     scope_note = ""
     if selected:
@@ -1281,11 +1380,20 @@ def _apply_selection_rewrite(sess: Session, user_msg: str) -> str:
 
 
 def _answer_selection_question(sess: Session, user_msg: str) -> str:
-    """Selected location(s) + explanatory question → chat answer only."""
-    parts: list[str] = []
+    """Selected location(s) + explanatory question → chat answer only.
+
+    합계·계산 질문이고 선택 칸이 비어 있으면 표 계산으로 답하고 동시에 채우기 제안.
+    """
     cells = list(sess.selected_cells) or (
         [sess.selected_cell] if sess.selected_cell is not None else []
     )
+    if sess.editor and cells and is_calc_question(user_msg):
+        calc_reply = _propose_table_calc_on_selected(sess, cells)
+        if calc_reply:
+            # 첫 줄에 숫자 요약을 넣어 「채워넣어」가 직전 채팅에서 값을 찾을 수 있게
+            return calc_reply
+
+    parts: list[str] = []
     paras = list(sess.selected_paras) or (
         [sess.selected_para] if sess.selected_para is not None else []
     )
