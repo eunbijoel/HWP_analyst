@@ -148,7 +148,23 @@ def test_approved_persists_after_reopen():
   assert rows[2][1].replace(",", "") == "100"
 
 
-def test_same_unit_row_sum_in_total_column():
+def test_row_sum_only_left_contiguous_not_all_numeric_cols():
+  """합계 열은 계획+실행만 — 당년도/집행계/잔액까지 더하면 안 됨."""
+  from hwp_core.doc_agent.fixtures import make_minimal_hwpx
+  from hwp_core.doc_agent.table_calc_fill import try_table_cell_calculation
+  from hwp_core.hwpx_editor import HWPXEditor
+
+  rows = [
+    ["비목분류", "비용명", "계획예산", "실행예산", "합계", "당년도집행", "집행계", "예산잔액"],
+    ["내부인건비", "내부인건비", "120000", "30000", "", "20000", "20000", "130000"],
+  ]
+  ed = HWPXEditor(make_minimal_hwpx(tables=[rows]))
+  calc = try_table_cell_calculation(ed, 0, 1, 4)
+  assert calc.ok
+  assert calc.value.replace(",", "") == "150000"
+  assert len(calc.operands) == 2
+  assert {op.col for op in calc.operands} == {2, 3}
+
   """같은 단위 열만 있을 때 합계 열 → 행 합 계산."""
   proposals, _, _, _, _ = _run_fill([
     ["항목", "당해년도", "차년도", "합계"],

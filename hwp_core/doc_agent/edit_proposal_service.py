@@ -20,6 +20,15 @@ from .table_calc_fill import (
   is_target_derived_cell,
   try_table_cell_calculation,
 )
+from .table_model import (
+  SEM_NUMERIC,
+  SEM_TEXT,
+  build_table_model,
+  clear_table_model_cache,
+  log_fill_proposal,
+  lookup_structurally_aligned_cell,
+  value_matches_column_type,
+)
 from .workspace_retriever import (
   excel_grids_for_insert,
   format_grid_preview,
@@ -506,6 +515,17 @@ def _try_derived_table_calc(
       "location": f"표{table_index + 1} ({op.row},{op.col})",
       "value": op.display,
     } for op in calc.operands]
+    log_fill_proposal(
+      action="propose_calc",
+      target_row=row,
+      target_col=col,
+      source_row=calc.operands[0].row if calc.operands else None,
+      source_col=calc.operands[0].col if calc.operands else None,
+      inferred_type="numeric",
+      reason=calc.formula,
+      value=calc.value,
+      label=lab,
+    )
     proposals.append(EditProposal(
       proposal_id=f"p_{uuid.uuid4().hex[:8]}",
       field_id=fid,
@@ -525,6 +545,8 @@ def _try_derived_table_calc(
         "formula": calc.formula,
         "calc_direction": calc.direction,
         "calc_operands": [op.to_dict() for op in calc.operands],
+        "inferred_type": "numeric",
+        "proposal_reason": calc.formula,
       },
     ))
     fill_traces.append(FieldFillTrace(
@@ -542,6 +564,16 @@ def _try_derived_table_calc(
     return True
 
   reason = calc.reason or SKIP_REASON
+  log_fill_proposal(
+    action="skip_calc",
+    target_row=row,
+    target_col=col,
+    source_row=None,
+    source_col=None,
+    inferred_type="numeric",
+    reason=reason,
+    label=lab,
+  )
   fill_traces.append(FieldFillTrace(
     target_document=target_name,
     location=loc,
@@ -684,48 +716,204 @@ def build_proposals(
         or (cid in FACT_CONCEPTS - TABLE_CONCEPTS)
       )
 
-      # 서식 사실 칸: Evidence only (동의어·전 참고문서 검색)
+      # 서식 사실 칸: Evidence (표 셀은 구조 정합 + 타입 검사)
       if is_form:
         lab = (f.get("label") or "").strip()
-        try_key = f"{cid}:{lab}"
+        t_idx = f.get("table_id")
+        r_idx = f.get("row")
+        c_idx = f.get("column")
+        # 표 좌표가 있으면 라벨 단위 중복 스킵하지 않음 (칸마다 독립)
+        if t_idx is not None and r_idx is not None and c_idx is not None:
+          try_key = f"{t_idx}:{r_idx}:{c_idx}:{lab}"
+        else:
+          try_key = f"{cid}:{lab}"
         if not lab or try_key in form_labels_tried:
           continue
         form_labels_tried.add(try_key)
         gr = get_fill_resolver().ground(lab, f.get("context") or "")
         loc = {
           "field_type": f.get("field_type") or "table_cell",
-          "table_id": f.get("table_id"),
-          "row": f.get("row"),
-          "column": f.get("column"),
+          "table_id": t_idx,
+          "row": r_idx,
+          "column": c_idx,
           "paragraph_id": f.get("paragraph_id"),
           "context": f.get("context") or "",
         }
-        resolved = resolve_fact_field(refs, label=lab, concept_id=cid) if refs else {
-          "expected_value_type": "",
-          "candidate_ranking": [],
-          "rejected_candidates": [],
-          "accepted_candidate": None,
-          "value": "",
-          "sources": [],
-          "final_proposal": None,
-        }
-        val = resolved.get("value") or ""
-        srcs = resolved.get("sources") or []
-        ranked = resolved.get("candidate_ranking") or []
-        rejected = resolved.get("rejected_candidates") or []
-        accepted = resolved.get("accepted_candidate")
-        vtype = resolved.get("expected_value_type") or ""
+
+        val = ""
+        srcs: list[dict] = []
+        ranked: list = []
+        rejected: list = []
+        accepted = None
+        vtype = ""
+        inferred_type = ""
+        proposal_reason = ""
+        src_row = None
+        src_col = None
+
+        # 표 셀: TableModel 타입 + 행·열 의미 정합 Evidence만
+        if (
+          target_doc
+          and target_doc.file_bytes
+          and t_idx is not None
+          and r_idx is not None
+          and c_idx is not None
+        ):
+          from ..hwpx_editor import HWPXEditor
+          clear_table_model_cache()
+          ted = HWPXEditor(target_doc.file_bytes)
+          model = build_table_model(ted, int(t_idx))
+          tcell = model.cell_at(int(r_idx), int(c_idx))
+          inferred_type = (tcell.semantic_type if tcell else "") or SEM_TEXT
+          vtype = "number" if inferred_type == SEM_NUMERIC else "text"
+
+          if tcell and tcell.is_inherited_group_blank:
+            proposal_reason = (
+              f"그룹 라벨 상속 빈칸 → Fill 제외 "
+              f"(inherited={tcell.inherited_group_label!r})"
+            )
+            log_fill_proposal(
+              action="skip_inherited",
+              target_row=int(r_idx),
+              target_col=int(c_idx),
+              source_row=None,
+              source_col=None,
+              inferred_type=inferred_type,
+              reason=proposal_reason,
+              label=lab,
+            )
+            fill_traces.append(FieldFillTrace(
+              target_document=target_name,
+              location=loc,
+              raw_label=lab,
+              concept_id=cid,
+              grounding_confidence=float(f.get("concept_confidence") or 0.0),
+              grounding_method="table_model",
+              expected_value_type=vtype,
+              final_status=STATUS_SKIPPED_NO_EVIDENCE,
+              notes=[proposal_reason],
+            ))
+            skipped_facts.append({
+              "label": lab or cid,
+              "concept_id": cid,
+              "reason": proposal_reason,
+            })
+            continue
+
+          aligned = lookup_structurally_aligned_cell(
+            refs,
+            target_editor=ted,
+            table_index=int(t_idx),
+            row=int(r_idx),
+            col=int(c_idx),
+          )
+          val = aligned.get("value") or ""
+          srcs = aligned.get("sources") or []
+          proposal_reason = aligned.get("reason") or ""
+          src_row = aligned.get("source_row")
+          src_col = aligned.get("source_col")
+          inferred_type = aligned.get("inferred_type") or inferred_type
+
+          # 숫자 표(numeric 열 비중 높음): 구조 정합만 허용.
+          # 라벨|값 서식 표: 구조 정합 실패 시 기존 label Evidence 폴백.
+          numeric_cols = sum(1 for c in model.columns if c.semantic_type == SEM_NUMERIC)
+          is_numeric_grid = numeric_cols >= max(2, len(model.columns) // 2)
+
+          if not val and refs and not is_numeric_grid:
+            resolved = resolve_fact_field(refs, label=lab, concept_id=cid)
+            cand = resolved.get("value") or ""
+            if cand and value_matches_column_type(cand, inferred_type):
+              val = cand
+              srcs = resolved.get("sources") or []
+              ranked = resolved.get("candidate_ranking") or []
+              rejected = resolved.get("rejected_candidates") or []
+              accepted = resolved.get("accepted_candidate")
+              vtype = resolved.get("expected_value_type") or vtype
+              proposal_reason = "label Evidence (form layout)"
+              # parse source coords from location if present
+              if srcs:
+                loc_s = str(srcs[0].get("location") or "")
+                import re as _re
+                m = _re.search(r"행\s*(\d+).*열\s*(\d+)", loc_s)
+                if m:
+                  src_row, src_col = int(m.group(1)) - 1, int(m.group(2)) - 1
+            elif cand:
+              rejected.append({
+                "value": cand,
+                "rejection_reason": f"type_mismatch col={inferred_type}",
+              })
+              proposal_reason = f"후보 타입 불일치 value={cand!r} col={inferred_type}"
+              ranked = resolved.get("candidate_ranking") or []
+
+          if val and not value_matches_column_type(val, inferred_type):
+            rejected.append({
+              "value": val,
+              "rejection_reason": f"type_mismatch col={inferred_type}",
+            })
+            log_fill_proposal(
+              action="skip_type_mismatch",
+              target_row=int(r_idx),
+              target_col=int(c_idx),
+              source_row=src_row,
+              source_col=src_col,
+              inferred_type=inferred_type,
+              reason=f"후보 타입 불일치 value={val!r}",
+              value=val,
+              label=lab,
+            )
+            val = ""
+            srcs = []
+        else:
+          # 비표 서식(라벨|값): 기존 Evidence
+          resolved = resolve_fact_field(refs, label=lab, concept_id=cid) if refs else {
+            "expected_value_type": "",
+            "candidate_ranking": [],
+            "rejected_candidates": [],
+            "accepted_candidate": None,
+            "value": "",
+            "sources": [],
+            "final_proposal": None,
+          }
+          val = resolved.get("value") or ""
+          srcs = resolved.get("sources") or []
+          ranked = resolved.get("candidate_ranking") or []
+          rejected = resolved.get("rejected_candidates") or []
+          accepted = resolved.get("accepted_candidate")
+          vtype = resolved.get("expected_value_type") or ""
+          inferred_type = vtype or SEM_TEXT
+          proposal_reason = "label Evidence" if val else "참고 자료에서 근거를 찾지 못해 비워 둠"
 
         if not val:
-          if ranked:
+          if rejected or ranked:
             status = STATUS_SKIPPED_UNSAFE
-            reason = "모든 후보가 타입 검증에서 거절됨"
+            reason = proposal_reason or "모든 후보가 타입/의미 검증에서 거절됨"
           else:
             status = STATUS_SKIPPED_NO_EVIDENCE
-            reason = "참고 자료에서 근거를 찾지 못해 비워 둠"
+            reason = proposal_reason or "참고 자료에서 근거를 찾지 못해 비워 둠"
+          log_fill_proposal(
+            action="skip_evidence",
+            target_row=int(r_idx) if r_idx is not None else None,
+            target_col=int(c_idx) if c_idx is not None else None,
+            source_row=src_row,
+            source_col=src_col,
+            inferred_type=inferred_type or vtype or "?",
+            reason=reason,
+            label=lab,
+          )
         else:
           status = STATUS_PROPOSED
-          reason = ""
+          reason = proposal_reason or "evidence"
+          log_fill_proposal(
+            action="propose_evidence",
+            target_row=int(r_idx) if r_idx is not None else None,
+            target_col=int(c_idx) if c_idx is not None else None,
+            source_row=src_row,
+            source_col=src_col,
+            inferred_type=inferred_type or vtype or "?",
+            reason=reason,
+            value=str(val).strip(),
+            label=lab,
+          )
 
         fill_traces.append(FieldFillTrace(
           target_document=target_name,
@@ -738,13 +926,13 @@ def build_proposals(
           ),
           grounding_method=str(
             f.get("grounding_method")
-            or (gr.method if gr.grounded else "none")
+            or ("table_align" if t_idx is not None else (gr.method if gr.grounded else "none"))
           ),
           expected_value_type=vtype,
           candidate_ranking=ranked,
           rejected_candidates=rejected,
           accepted_candidate=accepted,
-          final_proposal=resolved.get("final_proposal"),
+          final_proposal={"after": val, "reason": reason} if val else None,
           candidates=ranked,
           selected_value=str(val).strip() if val else None,
           final_status=status,
@@ -770,12 +958,16 @@ def build_proposals(
           label=lab,
           concept_id=cid,
           meta={
-            "table_id": f.get("table_id"),
-            "row": f.get("row"),
-            "column": f.get("column"),
+            "table_id": t_idx,
+            "row": r_idx,
+            "column": c_idx,
             "fill_mode": FILL_EVIDENCE,
             "expected_value_type": vtype,
-            "accepted_rank": (accepted or {}).get("rank"),
+            "inferred_type": inferred_type,
+            "proposal_reason": reason,
+            "source_row": src_row,
+            "source_col": src_col,
+            "accepted_rank": (accepted or {}).get("rank") if isinstance(accepted, dict) else None,
           },
         ))
         continue

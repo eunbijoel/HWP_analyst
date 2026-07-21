@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 from ..concept_resolver import ConceptResolver, normalize_label
 from ..hwpx_editor import HWPXEditor, PLACEHOLDER_RE, PLACEHOLDER_SUBSTR
+from .table_model import SEM_NUMERIC, build_table_model
 from .table_calc_fill import is_derived_header_label
 
 _FILL_ONTOLOGY = Path(__file__).resolve().parent.parent / "ontology" / "doc_fill_concepts.yaml"
@@ -81,8 +82,19 @@ def find_empty_fields(editor: HWPXEditor, document_id: str = "") -> list[Editabl
   fields: list[EditableField] = []
   fields.extend(find_empty_table_cells(editor, document_id=document_id))
   fields.extend(find_form_label_blanks(editor, document_id=document_id))
+  fields.extend(find_numeric_table_blanks(editor, document_id=document_id))
   fields.extend(find_text_section_fields(editor, document_id=document_id))
-  return fields
+  # 표 좌표 중복 제거 (form + numeric 후보)
+  out: list[EditableField] = []
+  seen_tc: set[tuple[int, int, int]] = set()
+  for f in fields:
+    if f.field_type == "table_cell" and f.table_id is not None and f.row is not None and f.column is not None:
+      key = (int(f.table_id), int(f.row), int(f.column))
+      if key in seen_tc:
+        continue
+      seen_tc.add(key)
+    out.append(f)
+  return out
 
 
 FORM_LABEL_RE = re.compile(
@@ -150,10 +162,17 @@ def find_form_label_blanks(editor: HWPXEditor, document_id: str = "") -> list[Ed
     rows = editor.get_table_as_rows(t_idx)
     if not rows:
       continue
+    table_model = build_table_model(editor, t_idx)
     for r_idx, row in enumerate(rows):
       c_idx = 0
       while c_idx < len(row):
         if not _is_blank(str(row[c_idx])):
+          c_idx += 1
+          continue
+
+        # 그룹 라벨 상속 빈칸(비목분류 공백 등)은 미작성 칸이 아님 → Fill 제외
+        cell_m = table_model.cell_at(r_idx, c_idx)
+        if cell_m and cell_m.is_inherited_group_blank:
           c_idx += 1
           continue
 
@@ -240,6 +259,55 @@ def find_form_label_blanks(editor: HWPXEditor, document_id: str = "") -> list[Ed
           style={"span_cols": end - c_idx, "form": True, "factual": not derived_total, "derived_total": derived_total},
         ))
         c_idx = end
+  return fields
+
+
+def find_numeric_table_blanks(editor: HWPXEditor, document_id: str = "") -> list[EditableField]:
+  """숫자 열의 빈 칸 — 표 내부 계산(SUM) 후보. 서식 라벨과 중복되지 않게 추가."""
+  fields: list[EditableField] = []
+  seen: set[tuple[int, int, int]] = set()
+  for t_idx in range(editor.get_table_count()):
+    model = build_table_model(editor, t_idx)
+    if not model.cells or model.header_rows <= 0:
+      continue
+    numeric_n = sum(1 for c in model.columns if c.semantic_type == SEM_NUMERIC)
+    if numeric_n < 2:
+      continue
+    for r in range(model.header_rows, len(model.cells)):
+      for c, cell in enumerate(model.cells[r]):
+        if not cell.is_blank or cell.is_inherited_group_blank:
+          continue
+        if cell.semantic_type != SEM_NUMERIC and not is_derived_header_label(cell.header):
+          # 파생 헤더(합계 등)는 text로 잡힐 수 있어 헤더로도 허용
+          if not any(
+            is_derived_header_label(p) for p in (cell.header_path or [])
+          ):
+            continue
+        key = (t_idx, r, c)
+        if key in seen:
+          continue
+        seen.add(key)
+        label = cell.header or f"열{c + 1}"
+        row_lab = " / ".join(cell.row_path) if cell.row_path else ""
+        fields.append(EditableField(
+          field_id=f"num_{t_idx}_{r}_{c}_{uuid.uuid4().hex[:6]}",
+          field_type="table_cell",
+          label=label,
+          context=f"표{t_idx + 1} / {row_lab} / {label}".strip(" /"),
+          document_id=document_id,
+          table_id=t_idx,
+          row=r,
+          column=c,
+          current_value="",
+          concept_id="form_blank",
+          concept_confidence=0.8,
+          style={
+            "form": True,
+            "factual": False,
+            "numeric_blank": True,
+            "derived_total": is_derived_header_label(label),
+          },
+        ))
   return fields
 
 

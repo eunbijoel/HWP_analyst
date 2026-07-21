@@ -63,7 +63,7 @@ def _classify_header(header: str) -> str:
   if not h:
     return "unknown"
   leaf = h.split("/")[-1].strip()
-  if is_derived_header_label(leaf):
+  if is_derived_header_label(leaf) or _header_looks_derived(h):
     return "derived"
   if _RATIO_RE.search(h):
     return "ratio"
@@ -72,6 +72,20 @@ def _classify_header(header: str) -> str:
   if _AMOUNT_RE.search(h):
     return "amount"
   return "unknown"
+
+
+def _header_looks_derived(header: str) -> bool:
+  """파생 열 보조 신호 — exact 키워드 외 '○○계/잔액' 등."""
+  leaf = _norm_label(header.split("/")[-1] if header else "")
+  if not leaf:
+    return False
+  if leaf in DERIVED_LABELS:
+    return True
+  if leaf.endswith("계") and leaf not in ("연계", "회계", "관계", "체계"):
+    return True
+  if leaf.endswith("잔액") or leaf.endswith("잔고"):
+    return True
+  return False
 
 
 def _get_parsed_table(editor: HWPXEditor, table_index: int) -> ParsedTableGrid:
@@ -180,7 +194,8 @@ def is_target_derived_cell(editor: HWPXEditor, table_index: int, row: int, col: 
     return True
   if col_hdr:
     for part in col_hdr.split("/"):
-      if is_derived_header_label(part.strip()):
+      p = part.strip()
+      if is_derived_header_label(p) or _header_looks_derived(p):
         return True
   return False
 
@@ -201,7 +216,10 @@ def try_table_cell_calculation(
   row_lab = _row_label(rows, row)
   col_hdr = _col_header(parsed, row, col, header_rows)
   row_derived = is_derived_header_label(row_lab)
-  col_derived = any(is_derived_header_label(p.strip()) for p in col_hdr.split("/") if p.strip())
+  col_derived = any(
+    is_derived_header_label(p.strip()) or _header_looks_derived(p.strip())
+    for p in col_hdr.split("/") if p.strip()
+  )
 
   if not row_derived and not col_derived:
     return TableCalcResult(ok=False, reason=SKIP_REASON)
@@ -227,9 +245,33 @@ def try_table_cell_calculation(
       ))
   elif row_derived:
     direction = "col_sum"
-    for r in range(data_start, row):
+    # 소계: 바로 위 파생행(소계/합계/총계) 이후의 연속 데이터 행만.
+    # 그 외(합계/계): 위쪽 소계·합계 행이 있으면 그것만, 없으면 데이터 행 전부.
+    start = data_start
+    for r in range(row - 1, data_start - 1, -1):
       lab = _row_label(rows, r)
       if is_derived_header_label(lab):
+        start = r + 1
+        break
+
+    prefer_subtotals = _norm_label(row_lab) in ("합계", "총계")
+    subtotal_rows: list[int] = []
+    if prefer_subtotals:
+      for r in range(data_start, row):
+        lab = _row_label(rows, r)
+        if _norm_label(lab) in ("소계", "합계") and _norm_label(lab) != _norm_label(row_lab):
+          # 소계만 (같은 레벨 합계 행 제외 — 보통 소계)
+          if _norm_label(lab) == "소계":
+            subtotal_rows.append(r)
+
+    if prefer_subtotals and subtotal_rows:
+      scan_rows = subtotal_rows
+    else:
+      scan_rows = list(range(start, row))
+
+    for r in scan_rows:
+      lab = _row_label(rows, r)
+      if is_derived_header_label(lab) and r not in subtotal_rows:
         continue
       disp = str(rows[r][col]).strip()
       if not disp:
@@ -243,32 +285,39 @@ def try_table_cell_calculation(
       ))
   elif col_derived:
     direction = "row_sum"
-    target_group = _column_group_key(parsed, col, header_rows)
+    # 구조 규칙: 대상 열 바로 왼쪽에서, 파생 헤더/라벨 열을 만나기 전까지의
+    # 연속된 숫자 열만 합산. (같은 행의 모든 숫자를 더하지 않음)
     categories: set[str] = set()
     candidate_cols: list[int] = []
-    for j in range(parsed.num_cols):
-      if j == col:
-        continue
+    for j in range(col - 1, -1, -1):
       if _is_label_column(parsed, j, header_rows, data_start):
-        continue
+        break
       hdr = _col_header(parsed, row, j, header_rows)
-      if _classify_header(hdr) == "derived":
+      if _classify_header(hdr) == "derived" or _header_looks_derived(hdr):
+        break
+      # 비어 있는 중간 열은 구간을 끊지 않고 건너뜀
+      disp = str(rows[row][j]).strip() if j < len(rows[row]) else ""
+      if not disp:
         continue
-      if _column_group_key(parsed, j, header_rows) != target_group and parsed.merges:
-        continue
+      if _parse_number(disp) is None:
+        break
       candidate_cols.append(j)
+
+    candidate_cols.reverse()
+    if not candidate_cols:
+      return TableCalcResult(ok=False, reason=SKIP_REASON)
 
     for j in candidate_cols:
       hdr = _col_header(parsed, row, j, header_rows)
       disp = str(rows[row][j]).strip()
-      if not disp:
-        return TableCalcResult(ok=False, reason=SKIP_REASON)
       val = _parse_number(disp)
       if val is None:
         return TableCalcResult(ok=False, reason=SKIP_REASON)
       cat = _classify_header(hdr)
       categories.add(cat)
-      operands.append(CalcOperand(row=row, col=j, value=val, display=disp, header=hdr or f"열{j+1}"))
+      operands.append(CalcOperand(
+        row=row, col=j, value=val, display=disp, header=hdr or f"열{j+1}",
+      ))
     known = {c for c in categories if c not in ("unknown", "derived")}
     if len(known) > 1:
       return TableCalcResult(ok=False, reason=SKIP_REASON)

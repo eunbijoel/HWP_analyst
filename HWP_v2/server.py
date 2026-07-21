@@ -402,7 +402,9 @@ def _push_fill_proposals(
     header: str,
 ) -> str:
     """Push DocFill proposals to editor pending; return user message."""
-    from hwp_core.doc_agent.edit_proposal_service import AI_DRAFT_MARKER, FILL_CONTEXT, FILL_EVIDENCE
+    from hwp_core.doc_agent.edit_proposal_service import (
+      AI_DRAFT_MARKER, FILL_CALCULATION, FILL_CONTEXT, FILL_EVIDENCE,
+    )
 
     sess.active_id = target.id
     _sync_active(sess)
@@ -410,7 +412,7 @@ def _push_fill_proposals(
     if editor is None:
         return "편집기를 준비하지 못했습니다."
 
-    n_ev = n_ctx = 0
+    n_ev = n_ctx = n_calc = 0
     pushed = 0
     lines: list[str] = []
 
@@ -479,6 +481,10 @@ def _push_fill_proposals(
         if fill_mode == FILL_CONTEXT:
             n_ctx += 1
             tag = AI_DRAFT_MARKER
+        elif fill_mode == FILL_CALCULATION:
+            n_calc += 1
+            formula = (meta.get("formula") or meta.get("proposal_reason") or "").strip()
+            tag = f"계산 · {formula}" if formula else (f"계산 · {src_txt}" if src_txt else "계산")
         else:
             n_ev += 1
             tag = f"Evidence · {src_txt}" if src_txt else "Evidence Fill"
@@ -494,7 +500,7 @@ def _push_fill_proposals(
     editor._bump_preview()
     head = header or (
         f"채우기 제안 {pushed}건을 올렸습니다 "
-        f"(Evidence {n_ev} · Context/AI Draft {n_ctx})."
+        f"(계산 {n_calc} · Evidence {n_ev} · Context/AI Draft {n_ctx})."
     )
     head += (
         "\n자동 반영하지 않았습니다. 항목별 수락/거절 또는 「전체 수락」「전체 거절」을 사용하세요."
@@ -509,8 +515,31 @@ def _push_fill_proposals(
     return body
 
 
+def _slot_current_bytes(slot: DocSlot) -> bytes:
+    """수락·직접 편집이 반영된 최신 HWPX 바이트. Fill은 반드시 이 값을 사용."""
+    if slot.editor is not None:
+        try:
+            return slot.editor.save()
+        except Exception:
+            pass
+    return slot.bytes_data
+
+
+def _sync_slot_bytes_from_editor(slot: Optional[DocSlot]) -> None:
+    """accept 후 슬롯 bytes를 편집기 내용과 동기화."""
+    if not slot or slot.editor is None:
+        return
+    try:
+        slot.bytes_data = slot.editor.save()
+    except Exception:
+        pass
+
+
 def _setup_fill_pipeline(sess: Session):
-    """Return (target, refs, pipe) or raise via error string in tuple."""
+    """Return (target, refs, pipe) or error string in tuple.
+
+    target은 업로드 원본이 아니라 현재 편집기 상태(수락 반영분 포함)를 사용한다.
+    """
     slots = list(sess.docs.values())
     targets = [s for s in slots if s.kind in ("hwp", "hwpx") and s.bytes_data]
     if not targets:
@@ -531,14 +560,18 @@ def _setup_fill_pipeline(sess: Session):
             "HWP만 있으면 변환된 HWPX를 활성으로 선택하세요."
         )
 
+    current = _slot_current_bytes(target)
+    target.bytes_data = current
+
     pipe = DocFillPipeline()
     sess.fill_pipeline = pipe
-    r = pipe.register_target(target.filename, target.bytes_data)
+    r = pipe.register_target(target.filename, current)
     err = r.get("error") or ""
     if err and ("HWPX" in err or "변환" in err or "불가" in err):
         return None, None, None, err
     for ref in refs:
-        pipe.register_reference(ref.filename, ref.bytes_data)
+        ref_bytes = _slot_current_bytes(ref) if ref.editor else ref.bytes_data
+        pipe.register_reference(ref.filename, ref_bytes)
     return target, refs, pipe, ""
 
 
@@ -632,8 +665,10 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
     """활성 HWP(X) = target, 나머지 = 참고.
 
     Evidence Fill → Context Fill. 제안만 pending에 올리고 자동 적용하지 않음.
+    현재 편집기 상태(수락 반영분) 기준으로 아직 비어 있는 칸만 대상으로 한다.
+    표 셀이 선택되어 있으면 그 칸을 우선한다.
     """
-    from hwp_core.doc_agent.edit_proposal_service import FILL_CONTEXT, FILL_EVIDENCE
+    from hwp_core.doc_agent.edit_proposal_service import FILL_CALCULATION, FILL_CONTEXT, FILL_EVIDENCE
 
     target, refs, pipe, err = _setup_fill_pipeline(sess)
     if err:
@@ -645,6 +680,34 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
         data = insp.get("data") or {}
         return insp.get("error") or data.get("error") or "문서를 읽지 못했습니다."
 
+    # 선택 셀이 있으면 해당 좌표만 Fill 후보로 제한
+    selected = list(sess.selected_cells) or (
+        [sess.selected_cell] if sess.selected_cell is not None else []
+    )
+    if selected and pipe.tools.last_fields:
+        sel_set = {(int(t), int(r), int(c)) for t, r, c in selected}
+        scoped = [
+            f for f in pipe.tools.last_fields
+            if f.get("field_type") == "table_cell"
+            and (
+                int(f.get("table_id") or -1),
+                int(f.get("row") or -1),
+                int(f.get("column") or -1),
+            ) in sel_set
+        ]
+        if scoped:
+            pipe.tools.last_fields = scoped
+        else:
+            # 선택 칸은 이미 채워졌거나 Fill 후보가 아님
+            t, r, c = selected[-1]
+            return (
+                f"선택한 칸(표{t + 1} {r + 1}행 {c + 1}열)은 "
+                "지금 Fill 대상이 아닙니다. "
+                "이미 값이 있거나, 그룹 라벨 상속 빈칸이거나, "
+                "표 내부만으로 채울 수 없는 칸일 수 있습니다. "
+                "선택 해제 후 「빈칸 채워줘」로 남은 빈칸을 요청해 보세요."
+            )
+
     out = pipe.run_propose(
         command, use_llm=True, model=sess.model, ollama_url=sess.ollama_url,
     )
@@ -654,6 +717,30 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
     proposals = (out.get("data") or {}).get("proposals") or []
     skipped_facts = (out.get("data") or {}).get("skipped_facts") or []
     fill_trace = (out.get("data") or {}).get("fill_trace") or []
+
+    # 이미 pending인 같은 좌표는 중복 제안하지 않음
+    pending_cells: set[tuple[int, int, int]] = set()
+    if sess.editor:
+        for ch in sess.editor.get_pending_changes():
+            if getattr(ch, "status", "") != "pending":
+                continue
+            if getattr(ch, "change_type", "") == "cell" and ch.table_index is not None:
+                pending_cells.add((int(ch.table_index), int(ch.row), int(ch.col)))
+    if pending_cells:
+        filtered = []
+        for p in proposals:
+            meta = p.get("meta") or {}
+            if p.get("action") == "write_table_cell":
+                key = (
+                    int(meta.get("table_id") or -1),
+                    int(meta.get("row") or -1),
+                    int(meta.get("column") or -1),
+                )
+                if key in pending_cells:
+                    continue
+            filtered.append(p)
+        proposals = filtered
+
     if fill_trace and os.environ.get("DOCFILL_DEBUG"):
         try:
             from hwp_core.doc_agent.fill_trace import save_fill_trace
@@ -672,22 +759,24 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
     if not proposals:
         if skipped_facts:
             lines = [
-                "사실 칸(기관·주소·전화·이메일 등)은 참고 근거가 없어 비워 두었습니다. "
-                "추측으로 채우지 않습니다.",
+                "남은 빈칸에 대해 계산/근거를 확정하지 못해 비워 두었습니다.",
             ]
             for s in skipped_facts[:15]:
                 lines.append(f"· {s.get('label') or s.get('concept_id')}: {s.get('reason')}")
-            if not refs:
-                lines.append("참고 문서를 추가한 뒤 다시 「채워줘」를 요청해 주세요.")
+            if selected:
+                lines.insert(
+                    0,
+                    "선택한 칸을 우선 시도했습니다.",
+                )
             return "\n".join(lines)
         ref_note = (
             f"참고({', '.join(r.filename for r in refs)})와 "
             if refs else ""
         )
         return (
-            f"「{target.filename}」에서 {ref_note}Evidence Fill과 Context Fill을 "
-            "모두 시도했지만 반영할 초안을 만들지 못했습니다. "
-            "빈칸·섹션 라벨을 확인하거나 참고 문서를 추가해 주세요."
+            f"「{target.filename}」에서 {ref_note}"
+            "아직 비어 있는 칸 중 새로 채울 제안을 만들지 못했습니다. "
+            "이미 수락한 칸은 다시 제안하지 않습니다."
         )
 
     return _push_fill_proposals(
@@ -1315,6 +1404,7 @@ def accept_all():
         "role": "assistant",
         "content": f"✅ AI 제안 {n}건을 문서에 반영했습니다.",
     })
+    _sync_slot_bytes_from_editor(_active(sess))
     return jsonify({"accepted": n, **_state(sess)})
 
 
@@ -1347,6 +1437,7 @@ def accept_one():
         "role": "assistant",
         "content": f"✅ 수락 · {ch.location}: 「{show}」",
     })
+    _sync_slot_bytes_from_editor(_active(sess))
     return jsonify({"accepted": 1, **_state(sess)})
 
 
