@@ -39,6 +39,7 @@ from cell_ai import (  # noqa: E402
     build_cell_prompt,
     build_para_prompt,
     detect_cell_intent,
+    extract_literal_cell_value,
     shorten_locally,
 )
 from chat_route import (  # noqa: E402
@@ -661,15 +662,65 @@ def _run_named_workflow(sess: Session, workflow_id: str, command: str) -> str:
     return _push_fill_proposals(sess, target, refs, proposals, skipped, header=header)
 
 
+def _blank_fields_for_selected_cells(
+    sess: Session,
+    selected: list[tuple[int, int, int]],
+) -> list[dict]:
+    """선택 칸이 inspector 후보에 없어도, 실제 비어 있으면 Fill 필드로 만든다."""
+    if not sess.editor or not selected:
+        return []
+    out: list[dict] = []
+    for t, r, c in selected:
+        try:
+            rows = sess.editor.get_table_as_rows(int(t))
+        except Exception:
+            continue
+        if not rows or r < 0 or r >= len(rows) or c < 0 or c >= len(rows[r]):
+            continue
+        raw = str(rows[r][c] or "").strip()
+        # 미리보기 placeholder
+        if raw and raw not in ("(비어 있음)",):
+            from hwp_core.doc_agent.document_inspector import _is_blank
+            if not _is_blank(raw):
+                continue
+        header = ""
+        for hr in range(min(3, r)):
+            if c < len(rows[hr]) and str(rows[hr][c]).strip():
+                header = str(rows[hr][c]).strip()
+                break
+        if not header and rows and c < len(rows[0]):
+            header = str(rows[0][c]).strip() or f"열{c + 1}"
+        row_lab = ""
+        if rows[r]:
+            for j in range(min(2, len(rows[r]))):
+                tlab = str(rows[r][j]).strip()
+                if tlab and tlab not in ("(비어 있음)",):
+                    row_lab = tlab
+                    break
+        out.append({
+            "field_id": f"sel_{t}_{r}_{c}",
+            "field_type": "table_cell",
+            "label": header or row_lab or f"칸({r},{c})",
+            "context": f"표{t + 1} / {row_lab} / {header}".strip(" /"),
+            "document_id": "",
+            "table_id": int(t),
+            "row": int(r),
+            "column": int(c),
+            "current_value": "",
+            "concept_id": "form_blank",
+            "concept_confidence": 0.85,
+            "style": {"form": True, "factual": False, "numeric_blank": True, "from_selection": True},
+        })
+    return out
+
+
 def _run_workspace_fill(sess: Session, command: str) -> str:
     """활성 HWP(X) = target, 나머지 = 참고.
 
     Evidence Fill → Context Fill. 제안만 pending에 올리고 자동 적용하지 않음.
     현재 편집기 상태(수락 반영분) 기준으로 아직 비어 있는 칸만 대상으로 한다.
-    표 셀이 선택되어 있으면 그 칸을 우선한다.
+    표 셀이 선택되어 있으면 그 칸을 우선하되, 후보가 아니면 남은 빈칸 전체로 폴백한다.
     """
-    from hwp_core.doc_agent.edit_proposal_service import FILL_CALCULATION, FILL_CONTEXT, FILL_EVIDENCE
-
     target, refs, pipe, err = _setup_fill_pipeline(sess)
     if err:
         return err
@@ -680,14 +731,34 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
         data = insp.get("data") or {}
         return insp.get("error") or data.get("error") or "문서를 읽지 못했습니다."
 
-    # 선택 셀이 있으면 해당 좌표만 Fill 후보로 제한
     selected = list(sess.selected_cells) or (
         [sess.selected_cell] if sess.selected_cell is not None else []
     )
-    if selected and pipe.tools.last_fields:
+
+    # 선택 + 「100,000으로 채워」→ Fill 파이프라인 대신 값 직접 제안
+    from cell_ai import extract_literal_cell_value
+    literal = extract_literal_cell_value(command)
+    if selected and literal and sess.editor:
+        ok_n = 0
+        for t, r, c in selected:
+            sess.editor.propose_cell_change(
+                int(t), int(r), int(c), literal, context=f"지시 값 반영: {literal}",
+            )
+            ok_n += 1
+        if ok_n:
+            sess.editor._bump_preview()
+            t, r, c = selected[-1]
+            return (
+                f"선택 칸에 「{literal}」 제안을 {ok_n}건 올렸습니다.\n"
+                f"→ 표{t + 1} {r + 1}행 {c + 1}열\n\n"
+                "항목별 수락/거절 또는 「전체 수락」「전체 거절」을 사용하세요."
+            )
+
+    scope_note = ""
+    if selected:
         sel_set = {(int(t), int(r), int(c)) for t, r, c in selected}
         scoped = [
-            f for f in pipe.tools.last_fields
+            f for f in (pipe.tools.last_fields or [])
             if f.get("field_type") == "table_cell"
             and (
                 int(f.get("table_id") or -1),
@@ -695,17 +766,18 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
                 int(f.get("column") or -1),
             ) in sel_set
         ]
+        if not scoped:
+            scoped = _blank_fields_for_selected_cells(sess, selected)
         if scoped:
             pipe.tools.last_fields = scoped
-        else:
-            # 선택 칸은 이미 채워졌거나 Fill 후보가 아님
             t, r, c = selected[-1]
-            return (
-                f"선택한 칸(표{t + 1} {r + 1}행 {c + 1}열)은 "
-                "지금 Fill 대상이 아닙니다. "
-                "이미 값이 있거나, 그룹 라벨 상속 빈칸이거나, "
-                "표 내부만으로 채울 수 없는 칸일 수 있습니다. "
-                "선택 해제 후 「빈칸 채워줘」로 남은 빈칸을 요청해 보세요."
+            scope_note = f"선택 칸(표{t + 1} {r + 1}행 {c + 1}열) 우선. "
+        else:
+            # 선택이 Fill 불가면 막지 않고 남은 빈칸 전체 진행
+            t, r, c = selected[-1]
+            scope_note = (
+                f"선택 칸(표{t + 1} {r + 1}행 {c + 1}열)은 채울 대상이 아니어서 "
+                "남은 빈칸 전체를 시도합니다. "
             )
 
     out = pipe.run_propose(
@@ -759,27 +831,24 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
     if not proposals:
         if skipped_facts:
             lines = [
-                "남은 빈칸에 대해 계산/근거를 확정하지 못해 비워 두었습니다.",
+                (scope_note or "")
+                + "남은 빈칸에 대해 계산/근거를 확정하지 못해 비워 두었습니다.",
             ]
             for s in skipped_facts[:15]:
                 lines.append(f"· {s.get('label') or s.get('concept_id')}: {s.get('reason')}")
-            if selected:
-                lines.insert(
-                    0,
-                    "선택한 칸을 우선 시도했습니다.",
-                )
             return "\n".join(lines)
         ref_note = (
             f"참고({', '.join(r.filename for r in refs)})와 "
             if refs else ""
         )
         return (
-            f"「{target.filename}」에서 {ref_note}"
+            (scope_note or "")
+            + f"「{target.filename}」에서 {ref_note}"
             "아직 비어 있는 칸 중 새로 채울 제안을 만들지 못했습니다. "
             "이미 수락한 칸은 다시 제안하지 않습니다."
         )
 
-    return _push_fill_proposals(
+    body = _push_fill_proposals(
         sess,
         target,
         refs,
@@ -787,6 +856,9 @@ def _run_workspace_fill(sess: Session, command: str) -> str:
         skipped_facts,
         header="",
     )
+    if scope_note:
+        return scope_note.rstrip() + "\n" + body
+    return body
 
 
 def _explain_pending(sess: Session) -> str:
@@ -1088,6 +1160,14 @@ def _rewrite_one_cell(sess: Session, user_msg: str, t: int, r: int, c: int) -> t
         old = rows[r][c] or ""
     loc = f"{r + 1}행 {c + 1}열"
 
+    # 「100,000으로 작성/채워」— LLM 없이 명시 값 직접 제안
+    literal = extract_literal_cell_value(user_msg)
+    if literal is not None:
+        sess.editor.propose_cell_change(
+            t, r, c, literal, context=f"지시 값 반영: {literal}",
+        )
+        return True, f"{loc}에 「{literal}」 입력"
+
     prompt = build_cell_prompt(
         filename=sess.filename, t=t, r=r, c=c, old=old,
         user_msg=user_msg, intent=intent, row_hint=_row_hint(sess.editor, t, r),
@@ -1110,6 +1190,13 @@ def _rewrite_one_cell(sess: Session, user_msg: str, t: int, r: int, c: int) -> t
             summary = "축약"
         else:
             return False, f"{loc}: 수정문을 만들지 못함"
+
+    # 지시 숫자와 무관한 행 라벨이 나오면 거절
+    hint = _row_hint(sess.editor, t, r)
+    rw = (rewritten or "").strip()
+    if rw and hint and rw in hint.replace(" ", "") and not re.search(r"[0-9]", rw):
+        return False, f"{loc}: 모델이 행 라벨「{rw}」을 값으로 넣어 거절함. 숫자/값을 명시해 주세요."
+
     sess.editor.propose_cell_change(t, r, c, rewritten, context=summary)
     return True, f"{loc} {summary or '수정'}"
 
