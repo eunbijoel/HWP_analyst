@@ -1489,7 +1489,7 @@ class QAEngine:
         try:
             llm_result = _llm_generate(
                 prompt, model, ollama_url,
-                temperature=0.2, num_predict=2048, num_ctx=32768, timeout=180,
+                temperature=0.2, num_predict=8192, num_ctx=32768, timeout=300,
             )
             elapsed = time.time() - start_time
 
@@ -1562,8 +1562,8 @@ class QAEngine:
         try:
             llm_result = _llm_generate(
                 prompt, model, ollama_url,
-                stream=True, temperature=0.2, num_predict=2048,
-                num_ctx=32768, timeout=180,
+                stream=True, temperature=0.2, num_predict=8192,
+                num_ctx=32768, timeout=300,
             )
 
             if llm_result.get('error'):
